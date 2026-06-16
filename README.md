@@ -1,265 +1,324 @@
-# TeleCodex
+# teleco
 
-TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex thread alive from your phone, streams agent responses and tool output in real time, and lets you hand the thread back to the CLI whenever you want.
+teleco connects Telegram to Codex app-server so you can run Codex sessions from a private Telegram bot. It is designed for a personal developer workstation: Telegram provides the remote control surface, while Codex runs on the machine that has your repository, tools, and Codex authentication state.
 
-## Features
+This project is based on [TeleCodex](https://github.com/benedict2310/telecodex) by Benedict Evert and remains licensed under the MIT License.
 
-- **Per-context sessions** — each Telegram chat or forum topic gets its own independent Codex session with separate thread, model, and busy state
-- **Streaming responses** — agent text edits in-place as Codex generates it
-- **Full tool visibility** — shell commands, file changes, web searches, MCP calls, and error items shown with configurable verbosity
-- **Live plan display** — Codex's todo list rendered as a separate message and updated as steps complete
-- **Voice transcription** — send a voice message or audio file; TeleCodex transcribes it (local parakeet-coreml or OpenAI Whisper) and forwards the text to Codex
-- **Image input** — send a photo (with optional caption) to pass screenshots or images directly to Codex
-- **File ingest & artifacts** — send a document to stage it for Codex; generated files are delivered back as Telegram documents
-- **Session browser** — `/sessions` lists recent threads from `~/.codex`, grouped by workspace; tap to switch
-- **Telegram login** — `/login` authenticates against the Codex CLI via device auth flow, no terminal needed
-- **Launch profiles** — `/launch_profiles` selects the sandbox + approval mode for new or reattached threads in the current Telegram context (`/launch` remains an alias)
-- **Model picker** — `/model` shows available models and lets you switch for new threads
-- **Reasoning effort** — `/effort` lets you dial from `minimal` to `xhigh` for new threads
-- **Optional message reactions** — 👀 while processing, 👍 on success when enabled; silently degrades in chats without reaction support
-- **Friendly errors** — common SDK and network errors are translated to actionable messages with command hints
-- **Token usage** — session token totals shown on `/session`, with optional per-turn footer in replies
-- **Handback flow** — `/handback` prints a ready-to-run `codex resume <id>` command (copied to clipboard on macOS)
-- **User allowlist** — only configured Telegram user IDs can interact with the bot
-- **Docker-friendly** — workspace auto-detected (`/workspace` in containers, `cwd` otherwise)
+## Highlights
 
-## Prerequisites
+- Stream Codex replies back to Telegram while work is in progress.
+- Use Codex app-server as the primary runtime for turns, tool events, approvals, token usage, and compact.
+- Reinforce compaction with a two-stage flow: app-server native compact followed by Codex CLI PTY `/compact`.
+- Detect Codex auto-compaction events and optionally run the PTY compact reinforcement after the turn finishes.
+- Keep Telegram `typing` status active during long Codex turns.
+- Show tool activity as separate Telegram messages, including shell commands and file-change summaries.
+- Send text, voice, images, and documents into the active Codex session.
+- Browse the workspace directly from Telegram with file, tree, view, find, and grep commands.
+- Run multiple isolated bot instances from one source checkout using separate `.env.*` files.
+- Keep compatibility with existing `telecodex-*` service helpers and `TELECODEX_*` environment variable names.
+- Run as a Linux user systemd service with lifecycle notifications and service update commands.
+- Mirror final Codex responses to a configured Telegram channel when needed.
+- Use launch profiles to switch Codex model, sandbox, approval policy, and reasoning level.
 
-- Node.js 22+
-- A Telegram bot token from [@BotFather](https://t.me/BotFather)
-- The Codex CLI installed and authenticated on the host:
-  - API key auth: set `CODEX_API_KEY`
-  - ChatGPT login: `codex login` on the machine, or use `/login` from Telegram
-- *(Optional)* `ffmpeg` — required for local voice transcription via parakeet-coreml
-- *(Optional)* `OPENAI_API_KEY` — enables OpenAI Whisper as a voice transcription fallback
+## Requirements
 
-## Setup
+- Node.js 20 or newer.
+- pnpm 11 or newer.
+- A Telegram bot token from `@BotFather`.
+- Your numeric Telegram user ID.
+- Codex authentication on the host machine, or a `CODEX_API_KEY` if you choose API-key based auth.
 
-1. Install dependencies:
-   ```bash
-   npm install
-   ```
+For best results, install common developer tools such as `git`, `rg`, `fd`, `tree`, `fzf`, and any language-specific tools your projects require. When teleco runs on the host, Codex can use the same tools that are available in your terminal.
 
-2. Copy the example environment file:
-   ```bash
-   cp .env.example .env
-   ```
+## Runtime Architecture
 
-3. Fill in `.env`:
+teleco is a Telegram control plane for Codex running on the same machine as your repositories. Telegram receives prompts, progress, tool activity, approvals, and final replies. Codex still runs locally through the Codex app-server and CLI session files under your Codex home.
 
-   | Variable | Required | Description |
-   |---|---|---|
-   | `TELEGRAM_BOT_TOKEN` | ✅ | Bot token from @BotFather |
-   | `TELEGRAM_ALLOWED_USER_IDS` | ✅ | Comma-separated Telegram user IDs |
-   | `CODEX_API_KEY` | — | API key for Codex (alternative to ChatGPT login) |
-   | `CODEX_MODEL` | — | Default model, e.g. `gpt-5.4`, `o3` |
-   | `CODEX_SANDBOX_MODE` | — | `read-only`, `workspace-write` *(default)*, `danger-full-access` |
-   | `CODEX_APPROVAL_POLICY` | — | `never` *(default)*, `on-request`, `on-failure`, `untrusted` |
-   | `CODEX_LAUNCH_PROFILES_JSON` | — | Optional JSON array of named launch profiles for `/launch_profiles` |
-   | `CODEX_DEFAULT_LAUNCH_PROFILE` | — | Default launch profile id (defaults to `default`) |
-   | `ENABLE_UNSAFE_LAUNCH_PROFILES` | — | Set to `true` to allow extra `danger-full-access` launch profiles |
-   | `TOOL_VERBOSITY` | — | `all`, `summary` *(default)*, `errors-only`, `none` |
-   | `SHOW_TURN_TOKEN_USAGE` | — | Show the per-turn `in/cached/out` footer in final replies (`false` by default) |
-   | `MAX_FILE_SIZE` | — | Max upload size in bytes (default `20971520` = 20 MB) |
-   | `ENABLE_TELEGRAM_LOGIN` | — | Allow `/login` and `/logout` from Telegram (`true` by default) |
-   | `ENABLE_TELEGRAM_REACTIONS` | — | Enable Telegram emoji reactions like 👀 / 👍 (`false` by default) |
-   | `OPENAI_API_KEY` | — | Enables OpenAI Whisper voice transcription fallback |
+The recommended runtime path is:
 
-4. Start the bot:
-   ```bash
-   npm run dev
-   ```
+```text
+Telegram bot -> teleco Node.js service -> Codex app-server -> local workspace/tools
+                                                |
+                                                +-> Codex CLI PTY for compact reinforcement
+```
+
+App-server is used for normal turns, tool/file-change streaming, approval requests, account/rate-limit status, and native compact. The CLI PTY path is used only where terminal parity matters, especially after compaction.
+
+## Quick Start
+
+```bash
+pnpm install
+cp .env.example .env
+$EDITOR .env
+pnpm run dev
+```
+
+Required `.env` values:
+
+```bash
+TELEGRAM_BOT_TOKEN=123456:telegram-token
+TELEGRAM_ALLOWED_USER_IDS=123456789
+```
+
+If you already use Codex CLI on this machine, leave `CODEX_API_KEY` empty so teleco can use the existing Codex auth state. If you do not use Codex CLI auth, set `CODEX_API_KEY` explicitly.
+
+## Environment Configuration
+
+Important options are documented in `.env.example`.
+
+Common settings:
+
+- `TELEGRAM_BOT_TOKEN`: Telegram bot token from `@BotFather`.
+- `TELEGRAM_ALLOWED_USER_IDS`: comma-separated list of Telegram users allowed to control the bot.
+- `TELEGRAM_CHANNEL_ID`: optional channel or supergroup chat ID for copied final replies.
+- `CODEX_MODEL`: default Codex model slug.
+- `CODEX_SANDBOX_MODE`: `read-only`, `workspace-write`, or `danger-full-access`.
+- `CODEX_APPROVAL_POLICY`: `never`, `on-request`, `on-failure`, or `untrusted`.
+- `CODEX_DEFAULT_LAUNCH_PROFILE`: default launch profile ID.
+- `ENABLE_UNSAFE_LAUNCH_PROFILES`: exposes the built-in `Restrict` and `Full` profiles when set to `true`.
+- `TOOL_VERBOSITY`: `all`, `summary`, `errors-only`, or `none`.
+- `ENABLE_LIFECYCLE_NOTIFICATIONS`: sends start and stop notifications.
+- `ENABLE_TELEGRAM_LOGIN`: enables `/login` and `/logout` from Telegram.
+- `ENABLE_CODEX_APP_SERVER_RUNTIME`: recommended `true`; set `false` only for the legacy SDK fallback.
+- `AUTO_COMPACT_ENABLED`: enables teleco automatic compact checks.
+- `AUTO_COMPACT_CONTEXT_THRESHOLD`: context usage ratio or percentage that triggers auto compact, for example `0.80` or `80`.
+- `AUTO_COMPACT_AFTER_CODEX_AUTO_COMPACT`: when Codex auto-compacts during a turn, run CLI PTY compact reinforcement after the turn.
+- `AUTO_COMPACT_AFTER_EVERY_TURN`: check the threshold after every turn. This does not compact every turn by itself.
+- `AUTO_COMPACT_COOLDOWN_TURNS` and `AUTO_COMPACT_COOLDOWN_MINUTES`: cooldown for threshold-based auto compact.
+
+`TELECODEX_INSTANCE` is normally set by the service unit. Leave it empty in `.env` files unless you are running teleco manually and need to force an instance name.
+
+## Development Commands
+
+```bash
+pnpm run dev      # Run from TypeScript with tsx
+pnpm run build    # Compile TypeScript into dist/
+pnpm start        # Run compiled dist/index.js
+pnpm test         # Run the Vitest test suite
+```
+
+## Host User Service
+
+For a personal development machine, the host service mode is usually better than Docker because Codex can use your real terminal tools, repositories, and auth state.
+
+Linux uses a user systemd service. macOS uses a user LaunchAgent.
+
+macOS LaunchAgent setup:
+
+```bash
+scripts/telecodex-launchd.sh bin-install
+scripts/telecodex-launchd.sh install
+scripts/telecodex-launchd.sh start
+```
+
+Useful macOS commands:
+
+```bash
+telecodex-launchd list
+telecodex-launchd status
+telecodex-launchd logs default
+telecodex-launchd restart
+telecodex-launchd update
+```
+
+See `docs/macos-service.md` for macOS-specific LaunchAgent details.
+
+Linux systemd setup:
+
+Install the service helper and a single-instance user service:
+
+```bash
+scripts/telecodex-service.sh bin-install
+scripts/telecodex-service.sh install
+scripts/telecodex-service.sh start
+```
+
+Useful service commands:
+
+```bash
+telecodex-service list
+telecodex-service status
+telecodex-service logs default
+telecodex-service restart
+telecodex-service update
+```
+
+The update command installs dependencies, builds the project, and restarts the selected service. During an update, teleco writes a lock file under `.telecodex/` so another update does not start on top of it.
+
+If systemd cannot find `node`, edit the user service environment or PATH so it can see the same Node.js installation used by your shell.
+
+## Multi-Bot Instances
+
+teleco supports multiple bot instances from one checkout. Each instance uses its own environment file and systemd unit.
+
+Single-instance mode:
+
+```text
+.env -> telecodex.service -> TELECODEX_INSTANCE=default
+```
+
+Multi-instance mode:
+
+```text
+.env.first  -> telecodex@first.service
+.env.second -> telecodex@second.service
+.env.third  -> telecodex@third.service
+```
+
+Create and manage instances:
+
+```bash
+telecodex-service add first
+telecodex-service add second
+telecodex-service add third
+telecodex-service list
+telecodex-service start first
+telecodex-service restart --all
+telecodex-service update first
+telecodex-service update --all
+telecodex-service logs second
+telecodex-service remove third
+```
+
+When `.env.*` files exist, commands that can affect running services require either an explicit instance name or `--all`. This avoids accidentally updating, stopping, or restarting the wrong bot.
+
+`.env.default` is deprecated. Use `.env` for single-instance mode, or `.env.<instance>` for multi-instance mode.
 
 ## Telegram Commands
 
 | Command | Description |
-|---|---|
-| `/start` | Welcome & status (concise for returning users) |
-| `/help` | Grouped command reference |
-| `/new` | Start a fresh thread (workspace picker if multiple workspaces) |
-| `/session` | Current thread ID, workspace, model, effort, and token totals |
-| `/sessions` | Browse recent threads grouped by workspace; tap to switch |
-| `/switch <id>` | Switch directly to a thread by ID |
-| `/retry` | Resend the last prompt |
-| `/abort` | Cancel the current turn |
-| `/launch_profiles` | Select launch profile for new or reattached threads (`/launch` alias kept) |
-| `/model` | View and change the model |
-| `/effort` | Set reasoning effort: `minimal` · `low` · `medium` · `high` · `xhigh` |
-| `/auth` | Check authentication status |
-| `/login` | Start Codex device-auth flow from Telegram |
-| `/logout` | Sign out of Codex |
-| `/voice` | Check voice transcription backend status |
-| `/handback` | Print `codex resume <id>` for CLI handoff |
-| `/attach <id>` | Bind an existing Codex thread to this forum topic |
+| --- | --- |
+| `/start` | Show the welcome message and current connection summary. |
+| `/help` | Show command help. |
+| `/new` | Start a new Codex session for the current Telegram context. |
+| `/status` | Show session, model, profile, queue, and workspace status. |
+| `/doctor` | Check the service runtime environment, PATH, tools, git/auth state, and approval bridge support. |
+| `/locks` | Show known Git and teleco runtime lock files without removing them. |
+| `/compact` | Run two-stage context compaction for the current thread. |
+| `/compact status` | Show compact availability and current context information. |
+| `/stop` | Abort the active Codex turn as quickly as possible. |
+| `/retry` | Retry the last prompt. |
+| `/steer <prompt>` | Send steering instructions into the active Codex turn. |
+| `/queue <prompt>` | Queue a prompt after the active turn. |
+| `/queue clear` | Clear queued prompts. |
+| `/queue pop <n>` | Remove queued prompt number `n`. |
+| `/think` | Show reasoning options as buttons. |
+| `/think <level>` | Set the reasoning level directly. |
+| `/model` | Show available model controls. |
+| `/model <slug>` | Set the Codex model. |
+| `/launch_profiles` | Show launch profiles. |
+| `/launch <profile>` | Apply a launch profile. |
+| `/auth` | Show authentication status. |
+| `/login` | Start Telegram-driven Codex login when enabled. |
+| `/logout` | Clear Telegram-driven login state when enabled. |
+| `/voice` | Toggle voice input handling. |
+| `/attach` | Show attachment guidance. |
+| `/handback` | Show handback guidance for continuing locally. |
+| `/files [path]` | List files under a workspace path. |
+| `/tree [path]` | Show a workspace tree. |
+| `/find <query>` | Find files by name. |
+| `/view <path>` | Read a workspace file. |
+| `/grep <query>` | Search text in the workspace. |
+| `/update` | Trigger a service update for the current instance. |
+| `/service_update` | Alias for `/update`. |
 
-### Voice, image & file input
+Plain text messages are sent to Codex as prompts. Replying to a bot message keeps the conversation attached to the same Telegram context.
 
-- **Voice / audio** — send any voice message or audio file; TeleCodex transcribes it and sends the result to Codex
-- **Photos** — send a photo with an optional caption; the image is forwarded to Codex as visual input
-- **Documents** — send a file (with optional caption); TeleCodex stages it in the workspace, runs Codex, and delivers any generated files back as Telegram documents
+## Sessions, Workspaces, and State
 
-### Tool verbosity
+teleco stores one active Codex session per Telegram context. In private chats the context is the chat ID. In topic-enabled chats, the context can include the topic ID. This keeps independent conversations from mixing.
 
-| Mode | What you see |
-|---|---|
-| `all` | Every tool start, streaming output, and result |
-| `summary` *(default)* | A short grouped footer such as `Tools used: 3x bash, 2x subagents, web_fetch` |
-| `errors-only` | Only failed tool calls |
-| `none` | Silent |
+Workspace browsing commands operate on the configured workspace root. They are implemented by teleco itself, not by Telegram, so they can work even before you ask Codex to inspect files.
 
-Per-turn token usage is hidden by default. Set `SHOW_TURN_TOKEN_USAGE=true` if you want the `in / cached / out` footer appended to final replies.
+Runtime metadata is stored under `.telecodex/`:
 
-### Launch profiles
-
-- TeleCodex always provides a built-in `default` profile synthesized from `CODEX_SANDBOX_MODE` and `CODEX_APPROVAL_POLICY`
-- Built-in Telegram-visible presets are:
-  - `Default`
-  - `Read Only`
-  - `Review`
-  - `Full Access` when `ENABLE_UNSAFE_LAUNCH_PROFILES=true`
-- `Workspace Write` is not listed separately because it is already the default behavior in the shipped config
-- Optional extra profiles can be configured with `CODEX_LAUNCH_PROFILES_JSON`, for example:
-  ```json
-  [
-    { "id": "readonly", "label": "Read Only", "sandboxMode": "read-only", "approvalPolicy": "never" },
-    { "id": "review", "label": "Review", "sandboxMode": "workspace-write", "approvalPolicy": "on-request" }
-  ]
-  ```
-- `/launch_profiles` changes only future thread creation or reattachment in the current chat/topic context; it does not mutate an already active thread in place
-- Extra `danger-full-access` profiles are blocked unless `ENABLE_UNSAFE_LAUNCH_PROFILES=true`
-- Selecting a `danger-full-access` profile from Telegram requires an explicit confirmation step
-
-## Multi-Session Architecture
-
-Each Telegram chat or forum topic is identified by a **context key** — the chat ID alone for private chats, or `chatId:threadId` for forum topics. This means every topic in a supergroup gets its own independent Codex session.
-
-The `SessionRegistry` maps context keys to `CodexSessionService` instances:
-
-```
-┌───────────────────┐      ┌───────────────────────────────┐
-│ Private Chat A     │─────▶│ CodexSessionService (thread X) │
-│ key: "111"         │      └───────────────────────────────┘
-├───────────────────┤      ┌───────────────────────────────┐
-│ Group B / Topic 1  │─────▶│ CodexSessionService (thread Y) │
-│ key: "222:1"       │      └───────────────────────────────┘
-├───────────────────┤      ┌───────────────────────────────┐
-│ Group B / Topic 2  │─────▶│ CodexSessionService (thread Z) │
-│ key: "222:2"       │      └───────────────────────────────┘
-└───────────────────┘
+```text
+.telecodex/contexts.json              # single/default instance
+.telecodex/<instance>/contexts.json   # named instance
+.telecodex/service-update.lock        # update lock
 ```
 
-- **First message** in a context → creates a new `CodexSessionService` → starts a new Codex thread
-- **Subsequent messages** → same context key → same session → conversation continues
-- **`/new`** → replaces the thread within the same context (optionally picking a workspace first)
-- **`/sessions`** → lists all Codex threads from `~/.codex`, lets you switch within the current context
-- **`/attach <id>`** → resumes a specific Codex CLI thread (useful for picking up work started in the terminal)
+Do not commit `.telecodex/`, `.env`, Codex credentials, Telegram tokens, or API keys.
 
-Session metadata (thread ID, workspace, launch profile, model, effort) is persisted to `.telecodex/contexts.json` and restored on restart so threads survive bot reboots.
+## Context Compact and Auto Compact
 
-Each context has independent busy-state tracking, so a running prompt in one topic doesn't block another.
+Manual `/compact` uses two stages:
 
-## Handoff: Telegram → CLI
-
-1. Run `/handback` in Telegram
-2. TeleCodex replies with:
-   ```bash
-   cd '/path/to/project' && codex resume 'thread-abc123'
-   ```
-3. Paste and run in your terminal
-
-On macOS the command is also copied to the clipboard automatically.
-
-## Architecture
-
-```
-Telegram ←→ Grammy bot (auto-retry, HTML formatting, inline keyboards)
-                |
-                v
-        SessionRegistry  ──→  per-context CodexSessionService instances
-                |
-                ├── @openai/codex-sdk  ──→  spawns Codex CLI subprocess
-                │     └── ThreadEvents (agent text, commands, file changes,
-                │                       MCP calls, web searches, todo lists,
-                │                       reasoning, errors, token usage)
-                ├── CodexStateReader  ──→  ~/.codex/state_*.sqlite  (threads)
-                │                    ──→  ~/.codex/models_cache.json (models)
-                ├── CodexAuth        ──→  codex login/logout subprocess
-                ├── Attachments      ──→  .telecodex/inbox/<turnId>/ (staged files)
-                ├── Artifacts        ──→  .telecodex/outbox/<turnId>/ (generated files)
-                └── VoiceTranscriber  ──→  parakeet-coreml (local)
-                                     ──→  OpenAI Whisper (cloud fallback)
+```text
+1. app-server native compact on the active thread
+2. Codex CLI PTY `codex resume <thread>` followed by `/compact`
 ```
 
-## Project Layout
+The second stage is intentional. It helps keep the CLI-backed session aligned with what you would expect from an interactive Codex terminal session.
 
+Auto compact has two triggers:
+
+- Codex app-server emits a context compaction event during a turn.
+- teleco sees context usage at or above `AUTO_COMPACT_CONTEXT_THRESHOLD` after a turn.
+
+`AUTO_COMPACT_AFTER_EVERY_TURN=true` means “check after every turn.” It does not mean “compact after every turn.” If the threshold is not reached, no compact is run.
+
+Incoming Telegram prompts are queued while compact is running.
+
+## Launch Profiles and Safety
+
+Launch profiles let you switch Codex behavior without editing `.env` each time. Profiles can define model, sandbox mode, approval policy, reasoning level, and a safety policy.
+
+Built-in profiles include normal workspace-write operation and safer read-only/review modes. The `Restrict` and `Full` profiles use `danger-full-access` and are hidden unless `ENABLE_UNSAFE_LAUNCH_PROFILES=true`.
+
+For unattended service operation, `CODEX_APPROVAL_POLICY=never` is recommended. Use stronger permissions only on trusted machines and trusted repositories.
+
+## Tool Activity and Telegram Formatting
+
+Codex tool activity can be shown separately from final assistant replies. This avoids long, concatenated progress messages and makes Telegram output easier to read on mobile.
+
+Set `TOOL_VERBOSITY` to control how much tool detail is sent:
+
+```bash
+TOOL_VERBOSITY=summary
 ```
-TeleCodex/
-├── src/
-│   ├── index.ts           — startup, signal handling, polling loop
-│   ├── bot.ts             — Telegram bot, all commands and handlers
-│   ├── bot-ui.ts          — pure render helpers (/help, /start, session labels)
-│   ├── codex-launch.ts    — launch profile parsing, validation, and formatting
-│   ├── codex-session.ts   — CodexSessionService wrapping the SDK
-│   ├── codex-state.ts     — SQLite reader for thread/model discovery
-│   ├── codex-auth.ts      — Codex CLI auth (login status, device auth, logout)
-│   ├── session-registry.ts — per-context session map with persistence
-│   ├── context-key.ts     — Telegram chat/topic → context key derivation
-│   ├── attachments.ts     — file staging (sanitization, size limits)
-│   ├── artifacts.ts       — generated file collection and Telegram delivery
-│   ├── error-messages.ts  — SDK/network error → user-friendly translation
-│   ├── voice.ts           — voice transcription (parakeet / Whisper)
-│   ├── config.ts          — environment loading and validation
-│   └── format.ts          — Markdown → Telegram HTML conversion
-├── test/                  — 15 test files, 180+ tests (vitest)
-├── .env.example
-├── Dockerfile
-├── docker-compose.yml
-├── tsconfig.json
-└── vitest.config.ts
-```
+
+Long shell commands are formatted as code blocks when possible. File changes, shell usage, and other tool summaries are labeled so they are easier to scan in Telegram.
+
+See `docs/runtime-architecture.md` and `docs/terminal-parity.md` for the deeper runtime model and the remaining differences from an interactive Codex terminal session.
 
 ## Docker
 
-```bash
-docker compose up --build
-```
+Docker support is available, but it is not the recommended default for a personal workstation. A container needs its own tools, filesystem mounts, and Codex auth/session path.
 
-The compose file:
-- loads environment from `.env`
-- mounts `~/.codex` for auth state and persisted threads
-- mounts `./workspace` as `/workspace`
-- runs as a non-root user
+Docker has two Ubuntu-based variants:
 
-## Development
+- `Dockerfile` + `docker-compose.yml`: normal image with Node, pnpm, Codex CLI, and required runtime dependencies.
+- `Dockerfile.local` + `docker-compose.local.yml`: tool-rich image with common developer CLI tools.
+
+Typical Docker values:
 
 ```bash
-npm run dev      # run with tsx (no build step)
-npm run build    # compile TypeScript
-npm test         # run vitest
+CODEX_HOME_DIR=${HOME}/.codex
+TELECODEX_WORKSPACE_DIR=/path/to/workspace
+TELECODEX_CONTAINER_WORKSPACE=/workspace
 ```
 
-## Release Automation
+Use `docker compose up -d` for the normal image.
 
-TeleCodex does not yet use the TelePi npm release pipeline, but the exact Trusted Publishing process has been documented so it can be adopted here.
+Use `docker compose -f docker-compose.local.yml up -d` when Codex should have extra tools such as `rg`, `fd`, `fzf`, `jq`, `sqlite3`, `tree`, `bat`, `tokei`, `ast-grep`, `gron`, `yq`, `websocat`, `tcping`, and `zoxide` preinstalled.
 
-See:
-- `docs/npm-trusted-publishing.md`
+Do not bake credentials into the image. Mount `CODEX_HOME_DIR` or provide secrets through your deployment environment.
 
-That playbook covers:
-- making the package publishable on npm
-- adding a tag-driven GitHub Actions workflow
-- configuring npm Trusted Publishing
-- the maintainer release flow (`npm version ...` + `git push --follow-tags`)
+See `docs/docker-ubuntu.md` for the Ubuntu container layout and smoke checks.
+
+Use Docker when isolation matters more than direct access to the host developer environment.
+
+## Troubleshooting
+
+- Bot does not respond: check `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USER_IDS`, and service logs.
+- `/stop` feels delayed: make sure you are running a version with background Codex turn handling, then inspect `telecodex-service logs <instance>`.
+- Auto compact does not run: confirm `ENABLE_CODEX_APP_SERVER_RUNTIME=true`, `AUTO_COMPACT_ENABLED=true`, and check `/status` for context usage availability.
+- Codex cannot access files: confirm the service user can read the workspace path.
+- Codex cannot find tools: install the tools on the host, or update the systemd PATH.
+- Multi-instance command is refused: specify an instance name or pass `--all`.
+- Channel messages do not arrive: confirm `TELEGRAM_CHANNEL_ID` and that the bot can post to the channel.
 
 ## Security Notes
 
-- Only users in `TELEGRAM_ALLOWED_USER_IDS` can interact with the bot
-- Default sandbox mode is `workspace-write` — Codex can read and write within the working directory
-- Use `danger-full-access` only if you fully trust the user and the host environment
-- The built-in `Full Access` profile and any extra `danger-full-access` launch profiles are opt-in via `ENABLE_UNSAFE_LAUNCH_PROFILES=true`
-- Default approval policy is `never` — suited for headless/automated use
-- `/launch_profiles` only selects from validated configured profiles; Telegram users cannot submit arbitrary sandbox or approval values
-- `CODEX_API_KEY` (agent auth) and `OPENAI_API_KEY` (voice transcription) are separate credentials
-- `/login` and `/logout` can be disabled by setting `ENABLE_TELEGRAM_LOGIN=false`
-- Files uploaded via Telegram are sanitized (name, size, type) before staging in the workspace
-- All Markdown output is sanitized before being sent as Telegram HTML
+teleco can give a Telegram account remote access to Codex running on your machine. Keep the bot private, restrict `TELEGRAM_ALLOWED_USER_IDS`, avoid committing secrets, and be careful with `danger-full-access` profiles.

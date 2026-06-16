@@ -12,6 +12,7 @@ export interface ContextMetadata {
   workspace: string;
   model?: string;
   reasoningEffort?: string;
+  fastMode?: boolean;
   launchProfileId?: string;
   updatedAt: number;
 }
@@ -23,7 +24,7 @@ export class SessionRegistry {
   private onRemoveCallback?: (contextKey: TelegramContextKey) => void;
 
   constructor(private readonly config: TeleCodexConfig) {
-    this.persistPath = path.join(config.workspace, ".telecodex", "contexts.json");
+    this.persistPath = getContextPersistPath(config.workspace);
     this.loadPersistedMetadata();
   }
 
@@ -42,6 +43,7 @@ export class SessionRegistry {
       workspace: meta?.workspace,
       model: meta?.model,
       reasoningEffort: meta?.reasoningEffort,
+      fastMode: meta?.fastMode,
       launchProfileId,
       deferThreadStart: options?.deferThreadStart && !meta?.threadId,
       resumeThreadId: meta?.threadId ?? undefined,
@@ -71,6 +73,7 @@ export class SessionRegistry {
       workspace: info.workspace,
       model: info.model,
       reasoningEffort: info.reasoningEffort,
+      fastMode: info.fastMode || undefined,
       launchProfileId: info.nextLaunchProfileId ?? info.launchProfileId,
       updatedAt: Date.now(),
     });
@@ -133,6 +136,15 @@ export class SessionRegistry {
       // Silently ignore load errors.
     }
   }
+}
+
+function getContextPersistPath(workspace: string): string {
+  const instance = process.env.TELECODEX_INSTANCE?.trim();
+  if (!instance || instance === "default") {
+    return path.join(workspace, ".telecodex", "contexts.json");
+  }
+
+  return path.join(workspace, ".telecodex", instance, "contexts.json");
 }
 
 function resolveLaunchProfileId(

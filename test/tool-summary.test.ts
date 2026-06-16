@@ -1,4 +1,4 @@
-import { formatToolSummaryLine, formatTurnUsageLine, summarizeToolName } from "../src/bot.js";
+import { formatToolDisplayLabel, formatToolSummaryLine, formatTurnUsageLine, summarizeToolName } from "../src/bot.js";
 
 describe("tool summary formatting", () => {
   it("normalizes raw tool names into compact summary categories", () => {
@@ -20,6 +20,27 @@ describe("tool summary formatting", () => {
     expect(formatToolSummaryLine(toolCounts)).toBe(
       "Tools used: 3x bash, 2x subagents, web_fetch",
     );
+  });
+
+  it("formats tool display labels by kind", () => {
+    expect(formatToolDisplayLabel("/bin/bash")).toEqual({
+      icon: "💻",
+      title: "Shell command",
+      kind: "bash",
+      detail: "/bin/bash",
+    });
+    expect(formatToolDisplayLabel("file_change")).toEqual({
+      icon: "📝",
+      title: "File change",
+      kind: "file_change",
+      detail: "workspace edits",
+    });
+    expect(formatToolDisplayLabel("mcp:codex_apps/spawn_agent")).toEqual({
+      icon: "🧩",
+      title: "MCP tool",
+      kind: "mcp",
+      detail: "codex_apps/spawn_agent",
+    });
   });
 
   it("keeps the turn usage line format stable when enabled", () => {

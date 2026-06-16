@@ -1,0 +1,14 @@
+.git
+.codex
+.env
+.env.*
+.telecodex/*
+!.telecodex/docker-empty-auth.json
+node_modules
+dist
+coverage
+tmp
+todo
+workspace
+*.log
+*.tsbuildinfo

@@ -47,7 +47,7 @@ const mockState = vi.hoisted(() => {
     return thread;
   };
 
-  const Codex = vi.fn().mockImplementation((options: any) => {
+  const Codex = vi.fn().mockImplementation(function (options: any) {
     createdCodexOptions.push(options);
 
     const instance = {
@@ -901,6 +901,62 @@ describe("CodexSessionService", () => {
     await service.prompt("hello", callbacks);
 
     expect(thread.runStreamed).toHaveBeenCalledWith("hello", expect.objectContaining({ signal: expect.any(AbortSignal) }));
+  });
+
+  it("prepends restrict safety instructions for restrict launch profiles", async () => {
+    const service = await CodexSessionService.create(
+      createConfig({
+        launchProfiles: [
+          createLaunchProfile({
+            id: "restrict",
+            label: "Restrict",
+            sandboxMode: "danger-full-access",
+            approvalPolicy: "never",
+            safetyPolicy: "restrict",
+          }),
+        ],
+        defaultLaunchProfileId: "restrict",
+      }),
+    );
+    const thread = mockState.createdThreads[0];
+    const callbacks = createCallbacks();
+
+    await service.prompt("delete logs", callbacks);
+
+    expect(thread.runStreamed).toHaveBeenCalledWith(
+      expect.stringContaining("TeleCodex launch safety policy: restrict."),
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+    expect(thread.runStreamed.mock.calls[0]?.[0]).toContain("delete logs");
+    expect(thread.runStreamed.mock.calls[0]?.[0]).toContain("Do not run root or sudo commands");
+  });
+
+  it("prepends full safety instructions for full launch profiles", async () => {
+    const service = await CodexSessionService.create(
+      createConfig({
+        launchProfiles: [
+          createLaunchProfile({
+            id: "full",
+            label: "Full",
+            sandboxMode: "danger-full-access",
+            approvalPolicy: "never",
+            safetyPolicy: "full",
+          }),
+        ],
+        defaultLaunchProfileId: "full",
+      }),
+    );
+    const thread = mockState.createdThreads[0];
+    const callbacks = createCallbacks();
+
+    await service.prompt("install package", callbacks);
+
+    expect(thread.runStreamed).toHaveBeenCalledWith(
+      expect.stringContaining("TeleCodex launch safety policy: full."),
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+    expect(thread.runStreamed.mock.calls[0]?.[0]).toContain("install package");
+    expect(thread.runStreamed.mock.calls[0]?.[0]).toContain("Root or sudo commands are pre-authorized");
   });
 
   it("handback clears the active thread and returns thread id plus workspace", async () => {

@@ -14,20 +14,47 @@ export function renderHelpMessage(): DualText {
       title: "💬 Session",
       commands: [
         ["/new", "Start a new thread"],
+        ["/status", "Codex auth & session status"],
+        ["/doctor", "Check runtime environment"],
+        ["/locks", "Show runtime lock files"],
+        ["/reconnect", "Reconnect Codex app-server"],
+        ["/compact", "Compact current Codex context"],
         ["/session", "Current thread details"],
         ["/sessions", "Browse & switch threads"],
+        ["/switch <id>", "Switch to a thread by ID"],
         ["/attach", "Bind a Codex thread to this topic"],
         ["/handback", "Hand thread back to Codex CLI"],
         ["/abort", "Cancel current operation"],
+        ["/stop", "Cancel current operation"],
+        ["/approvals", "List pending approvals"],
         ["/retry", "Resend the last prompt"],
+        ["/queue", "View or add queued prompts"],
+        ["/steer", "Steer the active Codex turn"],
+        ["/ask <prompt>", "Send command-looking text as prompt"],
+        ["/prompt <prompt>", "Alias for /ask"],
       ],
     },
     {
       title: "🤖 Model",
       commands: [
-        ["/launch_profiles", "Select launch profile"],
-        ["/model", "View & change model"],
-        ["/effort", "Set reasoning effort"],
+        ["/permission", "Select runtime permission profile"],
+        ["/profile", "Alias for /permission"],
+        ["/launch_profiles", "Alias for /permission"],
+        ["/model", "Select model"],
+        ["/think", "Select thinking effort"],
+        ["/fast", "Toggle Codex fast mode"],
+      ],
+    },
+    {
+      title: "🧭 Workspace",
+      commands: [
+        ["/files [path]", "List files"],
+        ["/tree [path] [depth]", "Show directory tree"],
+        ["/find <query> [path]", "Find files by name"],
+        ["/search <query> [path]", "Search files quickly"],
+        ["/view <path> [start:end]", "View file contents"],
+        ["/sendfile <path>", "Send file as attachment"],
+        ["/grep <text> [path]", "Search text"],
       ],
     },
     {
@@ -44,6 +71,11 @@ export function renderHelpMessage(): DualText {
         ["/start", "Welcome & status"],
         ["/help", "This reference"],
         ["/voice", "Voice transcription status"],
+        ["/update", "Update current service instance"],
+        ["/service_update", "Alias for update"],
+        ["/restart", "Restart current service"],
+        ["/force_restart", "Alias for /restart"],
+        ["/service_restart", "Alias for /restart"],
       ],
     },
   ];
@@ -69,6 +101,17 @@ export function renderHelpMessage(): DualText {
     plainLines.pop();
   }
 
+  htmlLines.push(
+    "",
+    "<b>⚠️ Slash/path note</b>",
+    "Text starting with <code>/</code> is treated as a Telegram command. For paths, use <code>/view &lt;path&gt;</code>, <code>/sendfile &lt;path&gt;</code>, or send a sentence such as <code>Use this path: /home/me/project</code>. Use <code>/ask &lt;prompt&gt;</code> to send command-looking text to Codex.",
+  );
+  plainLines.push(
+    "",
+    "⚠️ Slash/path note",
+    "Text starting with / is treated as a Telegram command. For paths, use /view <path>, /sendfile <path>, or send a sentence such as Use this path: /home/me/project. Use /ask <prompt> to send command-looking text to Codex.",
+  );
+
   return {
     html: htmlLines.join("\n"),
     plain: plainLines.join("\n"),
@@ -80,20 +123,28 @@ export function renderHelpMessage(): DualText {
  */
 export function renderWelcomeFirstTime(authWarning?: string): DualText {
   const htmlLines = [
-    "<b>👋 TeleCodex is ready.</b>",
+    "<b>👋 Welcome to TeleCodex.</b>",
+    "<i>Your Telegram bridge to Codex is connected and ready.</i>",
     "",
-    "Send a message to start chatting with Codex.",
-    "You can also send voice notes, photos, or documents.",
+    "Send a message here and Codex will work in this project workspace.",
+    "You can also send voice notes, screenshots, or documents.",
     "",
-    "Type /help for all commands.",
+    "Good first commands:",
+    "<code>/status</code> check connection",
+    "<code>/new</code> start fresh",
+    "<code>/help</code> show all commands",
   ];
   const plainLines = [
-    "👋 TeleCodex is ready.",
+    "👋 Welcome to TeleCodex.",
+    "Your Telegram bridge to Codex is connected and ready.",
     "",
-    "Send a message to start chatting with Codex.",
-    "You can also send voice notes, photos, or documents.",
+    "Send a message here and Codex will work in this project workspace.",
+    "You can also send voice notes, screenshots, or documents.",
     "",
-    "Type /help for all commands.",
+    "Good first commands:",
+    "/status check connection",
+    "/new start fresh",
+    "/help show all commands",
   ];
 
   if (authWarning) {
@@ -115,8 +166,22 @@ export function renderWelcomeReturning(
 ): DualText {
   const label = isTopicSession ? "TeleCodex (topic session)" : "TeleCodex";
 
-  const htmlLines = [`<b>👋 ${escapeHTML(label)}</b>`, "", sessionHtml];
-  const plainLines = [`👋 ${label}`, "", sessionPlain];
+  const htmlLines = [
+    `<b>👋 Welcome back to ${escapeHTML(label)}.</b>`,
+    "<i>Connected and ready for the next turn.</i>",
+    "",
+    sessionHtml,
+    "",
+    "Send a message, or use <code>/new</code> for a fresh thread.",
+  ];
+  const plainLines = [
+    `👋 Welcome back to ${label}.`,
+    "Connected and ready for the next turn.",
+    "",
+    sessionPlain,
+    "",
+    "Send a message, or use /new for a fresh thread.",
+  ];
 
   if (authWarning) {
     htmlLines.push("", `⚠️ ${escapeHTML(authWarning)}`);

@@ -13,18 +13,27 @@ describe("bot-ui", () => {
       const { html, plain } = renderHelpMessage();
       expect(html).toContain("Session");
       expect(html).toContain("Model");
+      expect(html).toContain("Workspace");
       expect(html).toContain("Auth");
       expect(html).toContain("Utility");
       expect(plain).toContain("/new");
+      expect(plain).toContain("/status");
       expect(plain).toContain("/help");
       expect(plain).toContain("/retry");
+      expect(plain).toContain("/queue");
+      expect(plain).toContain("/steer");
+      expect(plain).toContain("/stop");
       expect(plain).toContain("/launch_profiles");
+      expect(plain).toContain("/files");
+      expect(plain).toContain("/grep");
+      expect(plain).toContain("/update");
+      expect(plain).toContain("/service_update");
     });
 
-    it("lists all 16 commands", () => {
+    it("lists all 28 commands", () => {
       const { plain } = renderHelpMessage();
       const commandMatches = plain.match(/\/\w+/g) ?? [];
-      expect(commandMatches.length).toBe(16);
+      expect(commandMatches.length).toBe(28);
     });
 
     it("returns valid HTML with bold tags", () => {
@@ -37,7 +46,8 @@ describe("bot-ui", () => {
   describe("renderWelcomeFirstTime", () => {
     it("shows welcome without auth warning", () => {
       const { html, plain } = renderWelcomeFirstTime();
-      expect(html).toContain("TeleCodex is ready");
+      expect(html).toContain("Welcome to TeleCodex");
+      expect(plain).toContain("connected and ready");
       expect(plain).toContain("/help");
       expect(html).not.toContain("⚠️");
     });

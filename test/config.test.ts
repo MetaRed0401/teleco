@@ -27,6 +27,7 @@ describe("loadConfig", () => {
     delete process.env.MAX_FILE_SIZE;
     delete process.env.ENABLE_TELEGRAM_LOGIN;
     delete process.env.ENABLE_TELEGRAM_REACTIONS;
+    delete process.env.ENABLE_LIFECYCLE_NOTIFICATIONS;
     delete process.env.container;
   });
 
@@ -101,6 +102,7 @@ describe("loadConfig", () => {
       showTurnTokenUsage: false,
       enableTelegramLogin: true,
       enableTelegramReactions: false,
+      enableLifecycleNotifications: false,
     });
   });
 
@@ -144,6 +146,7 @@ describe("loadConfig", () => {
     expect(config.showTurnTokenUsage).toBe(false);
     expect(config.enableTelegramLogin).toBe(true);
     expect(config.enableTelegramReactions).toBe(false);
+    expect(config.enableLifecycleNotifications).toBe(false);
     expect(config.workspace).toBe(process.cwd());
   });
 
@@ -281,6 +284,30 @@ describe("loadConfig", () => {
     expect(config.enableTelegramReactions).toBe(false);
   });
 
+  it("parses ENABLE_LIFECYCLE_NOTIFICATIONS boolean values", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+
+    const truthyValues = ["true", "1", "yes"];
+    const falsyValues = ["false", "0", "no"];
+
+    for (const value of truthyValues) {
+      process.env.ENABLE_LIFECYCLE_NOTIFICATIONS = value;
+      const config = loadConfig();
+      expect(config.enableLifecycleNotifications).toBe(true);
+    }
+
+    for (const value of falsyValues) {
+      process.env.ENABLE_LIFECYCLE_NOTIFICATIONS = value;
+      const config = loadConfig();
+      expect(config.enableLifecycleNotifications).toBe(false);
+    }
+
+    delete process.env.ENABLE_LIFECYCLE_NOTIFICATIONS;
+    const config = loadConfig();
+    expect(config.enableLifecycleNotifications).toBe(false);
+  });
+
   it("parses SHOW_TURN_TOKEN_USAGE boolean values", () => {
     process.env.TELEGRAM_BOT_TOKEN = "bot-token";
     process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
@@ -370,11 +397,20 @@ describe("loadConfig", () => {
         unsafe: false,
       },
       {
-        id: "full-access",
-        label: "Full Access",
+        id: "restrict",
+        label: "Restrict",
         sandboxMode: "danger-full-access",
         approvalPolicy: "never",
         unsafe: true,
+        safetyPolicy: "restrict",
+      },
+      {
+        id: "full",
+        label: "Full",
+        sandboxMode: "danger-full-access",
+        approvalPolicy: "never",
+        unsafe: true,
+        safetyPolicy: "full",
       },
       {
         id: "danger-full",

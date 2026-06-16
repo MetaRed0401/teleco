@@ -7,7 +7,19 @@ export function escapeHTML(text: string): string {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+type FormatOptions = {
+  streaming?: boolean;
+};
+
 export function formatTelegramHTML(markdown: string): string {
+  return formatTelegramHTMLInternal(markdown);
+}
+
+export function formatStreamingTelegramHTML(markdown: string): string {
+  return formatTelegramHTMLInternal(closeStreamingCodeFence(markdown), { streaming: true });
+}
+
+function formatTelegramHTMLInternal(markdown: string, options: FormatOptions = {}): string {
   if (!markdown) {
     return "";
   }
@@ -18,6 +30,9 @@ export function formatTelegramHTML(markdown: string): string {
 
   let text = extractCodeBlocks(escaped, codeBlocks);
   text = extractInlineCode(text, inlineCode);
+  if (options.streaming) {
+    text = formatHeadings(text);
+  }
   text = formatBold(text);
   text = formatItalic(text);
   text = formatLinks(text);
@@ -26,6 +41,15 @@ export function formatTelegramHTML(markdown: string): string {
   text = restorePlaceholders(text, CODE_BLOCK_PREFIX, CODE_BLOCK_SUFFIX, codeBlocks);
 
   return text;
+}
+
+function closeStreamingCodeFence(markdown: string): string {
+  const fenceMatches = markdown.match(/```/g);
+  if (!fenceMatches || fenceMatches.length % 2 === 0) {
+    return markdown;
+  }
+
+  return markdown.endsWith("\n") ? `${markdown}\`\`\`` : `${markdown}\n\`\`\``;
 }
 
 function extractCodeBlocks(text: string, codeBlocks: string[]): string {
@@ -94,6 +118,12 @@ function formatItalic(text: string): string {
     /(?<![\w*])\*(?!\s)([^*\n]*?\S)\*(?![\w*])/g,
     "<i>$1</i>",
   );
+}
+
+function formatHeadings(text: string): string {
+  return text.replace(/^(#{1,6})[ \t]+(.+)$/gm, (_match, _level: string, title: string) => {
+    return `<b>${title}</b>`;
+  });
 }
 
 function formatLinks(text: string): string {

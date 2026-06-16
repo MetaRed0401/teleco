@@ -269,6 +269,7 @@ describe("codex-state", () => {
         models: [
           { slug: "gpt-5.4", display_name: "GPT-5.4" },
           { slug: "secret", display_name: "Secret", visibility: "hidden" },
+          { slug: "auto-review", display_name: "Auto Review", visibility: "hide" },
           { slug: "o3", display_name: "o3", visibility: "public" },
         ],
       }),

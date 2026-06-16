@@ -2,9 +2,9 @@ services:
   telecodex:
     build:
       context: .
-      dockerfile: Dockerfile
-    image: telecodex:latest
-    container_name: telecodex
+      dockerfile: Dockerfile.local
+    image: telecodex:local
+    container_name: telecodex-local
     restart: unless-stopped
     init: true
     env_file:
@@ -14,10 +14,10 @@ services:
       TELEGRAM_CHANNEL_ID: ${TELEGRAM_CHANNEL_ID:-}
     volumes:
       # Mount Codex state while masking auth.json so credentials are not exposed in the container.
-      - ${CODEX_HOME_DIR:-./.codex}:/home/telecodex/.codex:rw
+      - ${CODEX_HOME_DIR:-${HOME}/.codex}:/home/telecodex/.codex:rw
       - ./.telecodex/docker-empty-auth.json:/home/telecodex/.codex/auth.json:ro
       # Workspace visible to Codex inside the container.
-      - ${TELECODEX_WORKSPACE_DIR:-./workspace}:${TELECODEX_CONTAINER_WORKSPACE:-/workspace}:rw
+      - ${TELECODEX_WORKSPACE_DIR:-${HOME}}:${TELECODEX_CONTAINER_WORKSPACE:-/workspace}:rw
       # Optional: enable git over SSH when needed.
       # - ${SSH_AUTH_SOCK:-/run/host-services/ssh-auth.sock}:/ssh-agent:ro
     # environment:
@@ -26,5 +26,5 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    mem_limit: 1g
-    cpus: 1.0
+    mem_limit: 2g
+    cpus: 2.0

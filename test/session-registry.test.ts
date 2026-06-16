@@ -142,6 +142,7 @@ describe("SessionRegistry", () => {
   beforeEach(() => {
     mockFsState.reset();
     mockSessionState.reset();
+    delete process.env.TELECODEX_INSTANCE;
     mockSessionState.create.mockImplementation(async (config: TeleCodexConfig, options?: {
       workspace?: string;
       model?: string;
@@ -162,6 +163,28 @@ describe("SessionRegistry", () => {
         unsafeLaunch: false,
       }),
     );
+  });
+
+  it("uses an instance-specific metadata file for non-default instances", () => {
+    process.env.TELECODEX_INSTANCE = "first";
+    const config = createConfig();
+    const registry = new SessionRegistry(config);
+    const session = createMockSession({
+      threadId: "thread-first",
+      workspace: config.workspace,
+      model: "o3",
+      launchProfileId: "default",
+      launchProfileLabel: "Default",
+      launchProfileBehavior: "workspace-write / approval never",
+      sandboxMode: "workspace-write",
+      approvalPolicy: "never",
+      unsafeLaunch: false,
+    });
+
+    registry.updateMetadata("123", session as never);
+
+    const persistPath = path.join(config.workspace, ".telecodex", "first", "contexts.json");
+    expect(mockFsState.files.get(persistPath)).toContain("thread-first");
   });
 
   it("returns the same session instance for the same context key", async () => {

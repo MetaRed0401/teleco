@@ -1,5 +1,6 @@
 export type CodexSandboxMode = "read-only" | "workspace-write" | "danger-full-access";
 export type CodexApprovalPolicy = "never" | "on-request" | "on-failure" | "untrusted";
+export type CodexSafetyPolicy = "restrict" | "full";
 
 export interface CodexLaunchProfile {
   id: string;
@@ -7,6 +8,7 @@ export interface CodexLaunchProfile {
   sandboxMode: CodexSandboxMode;
   approvalPolicy: CodexApprovalPolicy;
   unsafe: boolean;
+  safetyPolicy?: CodexSafetyPolicy;
 }
 
 export const DEFAULT_LAUNCH_PROFILE_ID = "default";
@@ -24,6 +26,7 @@ export function createLaunchProfile(input: {
   label: string;
   sandboxMode: CodexSandboxMode;
   approvalPolicy: CodexApprovalPolicy;
+  safetyPolicy?: CodexSafetyPolicy;
 }): CodexLaunchProfile {
   return {
     ...input,
@@ -66,10 +69,18 @@ export function createBuiltinLaunchProfiles(
   if (options?.includeFullAccess) {
     profiles.push(
       createLaunchProfile({
-        id: "full-access",
-        label: "Full Access",
+        id: "restrict",
+        label: "Restrict",
         sandboxMode: "danger-full-access",
         approvalPolicy: "never",
+        safetyPolicy: "restrict",
+      }),
+      createLaunchProfile({
+        id: "full",
+        label: "Full",
+        sandboxMode: "danger-full-access",
+        approvalPolicy: "never",
+        safetyPolicy: "full",
       }),
     );
   }
@@ -101,7 +112,11 @@ export function findLaunchProfile(
   if (!profileId) {
     return undefined;
   }
-  return profiles.find((profile) => profile.id === profileId);
+  const exactMatch = profiles.find((profile) => profile.id === profileId);
+  if (exactMatch) {
+    return exactMatch;
+  }
+  return profiles.find((profile) => profile.id === normalizeLaunchProfileId(profileId));
 }
 
 export function formatLaunchProfileBehavior(profile: Pick<CodexLaunchProfile, "sandboxMode" | "approvalPolicy">): string {
@@ -156,7 +171,25 @@ function parseLaunchProfileEntry(entry: unknown, index: number): CodexLaunchProf
     label: rawLabel,
     sandboxMode: rawSandboxMode,
     approvalPolicy: rawApprovalPolicy,
+    safetyPolicy: readOptionalSafetyPolicy(entry, index),
   });
+}
+
+function normalizeLaunchProfileId(profileId: string): string {
+  return profileId === "full-access" ? "full" : profileId;
+}
+
+function readOptionalSafetyPolicy(entry: object, index: number): CodexSafetyPolicy | undefined {
+  const value = Reflect.get(entry, "safetyPolicy");
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value === "restrict" || value === "full") {
+    return value;
+  }
+  throw new Error(
+    `Invalid CODEX_LAUNCH_PROFILES_JSON entry at index ${index}: unsupported safetyPolicy "${String(value)}"`,
+  );
 }
 
 function readStringField(entry: object, field: string, index: number): string {

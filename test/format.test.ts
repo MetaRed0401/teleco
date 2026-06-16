@@ -1,4 +1,4 @@
-import { escapeHTML, formatTelegramHTML } from "../src/format.js";
+import { escapeHTML, formatStreamingTelegramHTML, formatTelegramHTML } from "../src/format.js";
 
 describe("escapeHTML", () => {
   it("escapes HTML entities", () => {
@@ -85,5 +85,19 @@ describe("formatTelegramHTML", () => {
   it("handles multi-line blockquotes", () => {
     const result = formatTelegramHTML("> line one\n> line two\nnot quoted");
     expect(result).toBe("<blockquote>line one\nline two</blockquote>\nnot quoted");
+  });
+});
+
+describe("formatStreamingTelegramHTML", () => {
+  it("renders an unfinished fenced code block as a temporary code block", () => {
+    const input = "```ts\nconst x = 1 < 2;";
+    expect(formatStreamingTelegramHTML(input)).toBe(
+      '<pre><code class="language-ts">const x = 1 &lt; 2;\n</code></pre>',
+    );
+  });
+
+  it("formats headings during streaming without changing final markdown behavior", () => {
+    expect(formatStreamingTelegramHTML("# Title\n\nBody")).toBe("<b>Title</b>\n\nBody");
+    expect(formatTelegramHTML("# Title\n\nBody")).toBe("# Title\n\nBody");
   });
 });

@@ -1,6 +1,6 @@
 # Story 02: File Ingest And Artifact Delivery
 
-TeleCodex currently supports text, voice/audio transcription, and photos, but not the broader file workflow that serious remote coding requires. Users need to send logs, patches, repro archives, PDFs, and source files into a turn, and they need generated artifacts back out. This story adds a practical file pipeline without waiting for arbitrary binary support from the Codex SDK input surface.
+TeleCodex currently supports text, voice/audio transcription, and photos, but not the broader file workflow that serious remote coding requires. Users need to send logs, patches, repro archives, PDFs, and source files into a turn, and they need generated artifacts back out. This story adds a practical file pipeline without depending on arbitrary binary support from the Codex runtime input surface.
 
 ## Architecture Context And Reuse Guidance
 
@@ -93,5 +93,4 @@ OpenAI constraint to respect:
 
 - Decide whether archives should be unpacked in this story or deferred. The default should be "no unpacking unless explicitly configured" to avoid security surprises.
 - Telegram has message and upload size constraints; artifact sending needs a fallback path for oversize outputs.
-- If the Codex SDK later adds a first-class local-file input type, this story should still keep the workspace staging model because artifact return remains valuable.
-
+- If the Codex runtime later adds a broader first-class local-file input type, this story should still keep the workspace staging model because artifact return remains valuable.

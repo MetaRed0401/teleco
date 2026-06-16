@@ -1,6 +1,6 @@
 # Story 05: Launch Profiles And Safety Controls
 
-TeleCodex already supports `sandboxMode` and `approvalPolicy` through global environment defaults, but operators cannot change how Codex is launched per Telegram context. This story adds named launch profiles and a Telegram picker so an allowed user can choose between safe, read-only, and explicitly unsafe launch modes without editing `.env` or restarting the bot. The implementation must preserve the current SDK-based architecture, keep legacy env variables working, and add clear safety rails around any profile that uses `danger-full-access`.
+TeleCodex already supports `sandboxMode` and `approvalPolicy` through global environment defaults, but operators cannot change how Codex is launched per Telegram context. This story adds named launch profiles and a Telegram picker so an allowed user can choose between safe, read-only, and explicitly unsafe launch modes without editing `.env` or restarting the bot. The implementation must preserve the current app-server runtime architecture, keep legacy env variables working, and add clear safety rails around any profile that uses `danger-full-access`.
 
 ## Architecture Context And Reuse Guidance
 
@@ -185,7 +185,7 @@ Security pass requirements:
 - Stale or forged callback data cannot activate a profile that is not currently pending and configured.
 - If unsafe launch profiles are disabled, TeleCodex does not expose extra dangerous profiles in Telegram.
 - If a saved launch profile is removed from config, TeleCodex falls back to the configured default profile rather than failing deep in session creation.
-- The implementation remains SDK-based and does not add a separate Codex CLI execution path just for launch modes.
+- The implementation remains app-server based and does not add a separate Codex CLI execution path just for launch modes.
 - Tests cover config parsing, session wiring, persistence, UI selection flow, and unsafe-profile security checks.
 
 ## Risks And Open Questions

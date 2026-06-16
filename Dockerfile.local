@@ -1,14 +1,26 @@
 # syntax=docker/dockerfile:1.7
 
+# Local/operator image for this environment.
+# The public Dockerfile intentionally stays minimal. Add workstation parity tools here.
+
 ARG NODE_MAJOR=22
 ARG PNPM_VERSION=11.5.3
 ARG CODEX_CLI_VERSION=0.139.0
+ARG YQ_VERSION=4.49.2
+ARG GRON_VERSION=0.7.1
+ARG WEBSOCAT_VERSION=1.14.0
+ARG TOKEI_VERSION=12.1.2
 
 FROM ubuntu:24.04 AS base
 
 ARG NODE_MAJOR
 ARG PNPM_VERSION
 ARG CODEX_CLI_VERSION
+ARG YQ_VERSION
+ARG GRON_VERSION
+ARG WEBSOCAT_VERSION
+ARG TOKEI_VERSION
+ARG TARGETARCH
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -19,19 +31,27 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
       bash \
+      bat \
       ca-certificates \
       curl \
+      fd-find \
+      fzf \
       git \
       gnupg \
+      jq \
       make \
       g++ \
       openssh-client \
       pkg-config \
       procps \
       python3 \
+      ripgrep \
       sqlite3 \
       tini \
+      tree \
+      unzip \
       xz-utils \
+      zoxide \
     && install -d -m 0755 /etc/apt/keyrings \
     && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
       | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
@@ -41,7 +61,24 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends nodejs \
     && corepack enable \
     && corepack prepare "pnpm@${PNPM_VERSION}" --activate \
-    && npm install -g "@openai/codex@${CODEX_CLI_VERSION}" \
+    && npm install -g "@openai/codex@${CODEX_CLI_VERSION}" @ast-grep/cli \
+    && ln -sf /usr/bin/fdfind /usr/local/bin/fd \
+    && ln -sf /usr/bin/batcat /usr/local/bin/bat \
+    && case "${TARGETARCH:-amd64}" in \
+      amd64) yq_arch=amd64; gron_arch=amd64; websocat_arch=x86_64-unknown-linux-musl; tokei_arch=x86_64-unknown-linux-gnu ;; \
+      arm64) yq_arch=arm64; gron_arch=arm64; websocat_arch=aarch64-unknown-linux-musl; tokei_arch=aarch64-unknown-linux-gnu ;; \
+      *) echo "Unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_${yq_arch}" -o /usr/local/bin/yq \
+    && chmod +x /usr/local/bin/yq \
+    && curl -fsSL "https://github.com/tomnomnom/gron/releases/download/v${GRON_VERSION}/gron-linux-${gron_arch}-${GRON_VERSION}.tgz" \
+      | tar -xz -C /usr/local/bin gron \
+    && curl -fsSL "https://github.com/vi/websocat/releases/download/v${WEBSOCAT_VERSION}/websocat.${websocat_arch}" -o /usr/local/bin/websocat \
+    && chmod +x /usr/local/bin/websocat \
+    && curl -fsSL "https://github.com/XAMPPRocky/tokei/releases/download/v${TOKEI_VERSION}/tokei-${tokei_arch}.tar.gz" \
+      | tar -xz -C /usr/local/bin tokei \
+    && curl -fsSL https://raw.githubusercontent.com/pouriyajamshidi/tcping/master/tcping -o /usr/local/bin/tcping \
+    && chmod +x /usr/local/bin/tcping \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
@@ -75,7 +112,13 @@ COPY --from=build --chown=telecodex:telecodex /app/dist ./dist
 USER telecodex
 
 RUN codex --version >/dev/null \
-    && codex app-server --help >/dev/null
+    && codex app-server --help >/dev/null \
+    && fd --version >/dev/null \
+    && rg --version >/dev/null \
+    && bat --version >/dev/null \
+    && jq --version >/dev/null \
+    && yq --version >/dev/null \
+    && tokei --version >/dev/null
 
 ENTRYPOINT ["tini", "--"]
 CMD ["node", "dist/index.js"]

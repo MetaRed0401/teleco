@@ -8,7 +8,8 @@ dist/
 .env
 
 # Runtime state
-.telecodex/
+.telecodex/*
+!.telecodex/docker-empty-auth.json
 telecodex.log
 
 # Runtime workspace (Docker mount)
@@ -16,6 +17,7 @@ workspace/
 
 # Agent tooling (local dev only)
 agent-tools/
+todo/
 
 # macOS
 .DS_Store
@@ -25,6 +27,28 @@ agent-tools/
 .idea/
 *.swp
 *.swo
+.memory
+.codex
+.agents
+project.type
 
 # Test coverage
 coverage/
+
+.env.*
+!.env.example
+
+tmp
+
+# Local task notes
+[Tt][Oo][Dd][Oo]*
+[Tt][Aa][Ss][Kk][Ss]*
+
+*local*
+Dockerfile.local
+docker-compose.local.yml
+
+# Tracked Docker local operator files
+!Dockerfile.local
+!docker-compose.local.yml
+!.telecodex/docker-empty-auth.json

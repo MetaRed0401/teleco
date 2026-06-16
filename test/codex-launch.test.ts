@@ -1,6 +1,7 @@
 import {
   createBuiltinLaunchProfiles,
   createDefaultLaunchProfile,
+  findLaunchProfile,
   formatLaunchProfileBehavior,
   formatLaunchProfileLabel,
   isUnsafeLaunchProfile,
@@ -97,6 +98,36 @@ describe("codex-launch", () => {
     ).toThrow('unsupported approvalPolicy "sometimes"');
   });
 
+  it("parses and validates optional safety policies", () => {
+    expect(
+      parseLaunchProfilesJson(
+        JSON.stringify([
+          {
+            id: "restrict",
+            label: "Restrict",
+            sandboxMode: "danger-full-access",
+            approvalPolicy: "never",
+            safetyPolicy: "restrict",
+          },
+        ]),
+      )[0],
+    ).toMatchObject({ safetyPolicy: "restrict" });
+
+    expect(() =>
+      parseLaunchProfilesJson(
+        JSON.stringify([
+          {
+            id: "bad",
+            label: "Bad",
+            sandboxMode: "danger-full-access",
+            approvalPolicy: "never",
+            safetyPolicy: "maybe",
+          },
+        ]),
+      ),
+    ).toThrow('unsupported safetyPolicy "maybe"');
+  });
+
   it("formats profile labels and behavior", () => {
     const profile = createDefaultLaunchProfile("workspace-write", "never");
 
@@ -157,11 +188,20 @@ describe("codex-launch", () => {
         unsafe: false,
       },
       {
-        id: "full-access",
-        label: "Full Access",
+        id: "restrict",
+        label: "Restrict",
         sandboxMode: "danger-full-access",
         approvalPolicy: "never",
         unsafe: true,
+        safetyPolicy: "restrict",
+      },
+      {
+        id: "full",
+        label: "Full",
+        sandboxMode: "danger-full-access",
+        approvalPolicy: "never",
+        unsafe: true,
+        safetyPolicy: "full",
       },
     ]);
   });
@@ -169,5 +209,14 @@ describe("codex-launch", () => {
   it("classifies danger-full-access as unsafe", () => {
     expect(isUnsafeLaunchProfile("danger-full-access")).toBe(true);
     expect(isUnsafeLaunchProfile("workspace-write")).toBe(false);
+  });
+
+  it("treats legacy full-access id as an alias for full when no exact match exists", () => {
+    const profiles = createBuiltinLaunchProfiles(createDefaultLaunchProfile("workspace-write", "never"), {
+      includeFullAccess: true,
+    });
+
+    expect(findLaunchProfile(profiles, "full-access")?.id).toBe("full");
+    expect(findLaunchProfile([{ ...profiles.at(-1)!, id: "full-access" }], "full-access")?.id).toBe("full-access");
   });
 });

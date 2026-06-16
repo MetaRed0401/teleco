@@ -19,6 +19,7 @@ export interface TeleCodexConfig {
   telegramBotToken: string;
   telegramAllowedUserIds: number[];
   telegramAllowedUserIdSet: Set<number>;
+  telegramChannelId?: number;
   workspace: string;
   maxFileSize: number;
   codexApiKey?: string;
@@ -32,6 +33,17 @@ export interface TeleCodexConfig {
   showTurnTokenUsage: boolean;
   enableTelegramLogin: boolean;
   enableTelegramReactions: boolean;
+  telegramReactionProcessingEmoji?: string;
+  telegramReactionSuccessEmoji?: string;
+  telegramReactionFailureEmoji?: string;
+  enableLifecycleNotifications: boolean;
+  enableCodexAppServerRuntime: boolean;
+  autoCompactEnabled: boolean;
+  autoCompactContextThreshold: number;
+  autoCompactAfterCodexAutoCompact: boolean;
+  autoCompactAfterEveryTurn: boolean;
+  autoCompactCooldownTurns: number;
+  autoCompactCooldownMinutes: number;
 }
 
 export function loadConfig(): TeleCodexConfig {
@@ -39,6 +51,7 @@ export function loadConfig(): TeleCodexConfig {
 
   const telegramBotToken = requireEnv("TELEGRAM_BOT_TOKEN");
   const telegramAllowedUserIds = parseAllowedUserIds(requireEnv("TELEGRAM_ALLOWED_USER_IDS"));
+  const telegramChannelId = parseOptionalTelegramChatId(optionalString(process.env.TELEGRAM_CHANNEL_ID));
   const workspace = resolveWorkspace();
   const maxFileSize = parseMaxFileSize(optionalString(process.env.MAX_FILE_SIZE));
   const codexApiKey = optionalString(process.env.CODEX_API_KEY);
@@ -66,11 +79,56 @@ export function loadConfig(): TeleCodexConfig {
     optionalString(process.env.ENABLE_TELEGRAM_REACTIONS),
     false,
   );
+  const telegramReactionProcessingEmoji = parseOptionalEmojiEnv(
+    optionalString(process.env.TELEGRAM_REACTION_PROCESSING_EMOJI),
+    "👀",
+  );
+  const telegramReactionSuccessEmoji = parseOptionalEmojiEnv(
+    optionalString(process.env.TELEGRAM_REACTION_SUCCESS_EMOJI),
+    "👍",
+  );
+  const telegramReactionFailureEmoji = parseOptionalEmojiEnv(
+    optionalString(process.env.TELEGRAM_REACTION_FAILURE_EMOJI),
+    undefined,
+  );
+  const enableLifecycleNotifications = parseBooleanEnv(
+    optionalString(process.env.ENABLE_LIFECYCLE_NOTIFICATIONS),
+    false,
+  );
+  const enableCodexAppServerRuntime = parseBooleanEnv(
+    optionalString(process.env.ENABLE_CODEX_APP_SERVER_RUNTIME),
+    true,
+  );
+  const autoCompactEnabled = parseBooleanEnv(optionalString(process.env.AUTO_COMPACT_ENABLED), true);
+  const autoCompactContextThreshold = parseRatioEnv(
+    optionalString(process.env.AUTO_COMPACT_CONTEXT_THRESHOLD),
+    0.8,
+    "AUTO_COMPACT_CONTEXT_THRESHOLD",
+  );
+  const autoCompactAfterCodexAutoCompact = parseBooleanEnv(
+    optionalString(process.env.AUTO_COMPACT_AFTER_CODEX_AUTO_COMPACT),
+    true,
+  );
+  const autoCompactAfterEveryTurn = parseBooleanEnv(
+    optionalString(process.env.AUTO_COMPACT_AFTER_EVERY_TURN),
+    false,
+  );
+  const autoCompactCooldownTurns = parseIntegerEnv(
+    optionalString(process.env.AUTO_COMPACT_COOLDOWN_TURNS),
+    3,
+    "AUTO_COMPACT_COOLDOWN_TURNS",
+  );
+  const autoCompactCooldownMinutes = parseIntegerEnv(
+    optionalString(process.env.AUTO_COMPACT_COOLDOWN_MINUTES),
+    10,
+    "AUTO_COMPACT_COOLDOWN_MINUTES",
+  );
 
   return {
     telegramBotToken,
     telegramAllowedUserIds,
     telegramAllowedUserIdSet: new Set(telegramAllowedUserIds),
+    telegramChannelId,
     workspace,
     maxFileSize,
     codexApiKey,
@@ -84,15 +142,32 @@ export function loadConfig(): TeleCodexConfig {
     showTurnTokenUsage,
     enableTelegramLogin,
     enableTelegramReactions,
+    telegramReactionProcessingEmoji,
+    telegramReactionSuccessEmoji,
+    telegramReactionFailureEmoji,
+    enableLifecycleNotifications,
+    enableCodexAppServerRuntime,
+    autoCompactEnabled,
+    autoCompactContextThreshold,
+    autoCompactAfterCodexAutoCompact,
+    autoCompactAfterEveryTurn,
+    autoCompactCooldownTurns,
+    autoCompactCooldownMinutes,
   };
 }
 
 /**
  * Workspace is derived automatically:
+ * - TELECODEX_WORKSPACE: explicit override
  * - In Docker: /workspace (the mount point)
  * - Outside Docker: process.cwd()
  */
 function resolveWorkspace(): string {
+  const explicitWorkspace = optionalString(process.env.TELECODEX_WORKSPACE);
+  if (explicitWorkspace) {
+    return path.resolve(explicitWorkspace);
+  }
+
   if (isRunningInDocker()) {
     return "/workspace";
   }
@@ -172,6 +247,19 @@ function parseAllowedUserIds(raw: string): number[] {
   return ids;
 }
 
+function parseOptionalTelegramChatId(raw: string | undefined): number | undefined {
+  if (!raw) {
+    return undefined;
+  }
+
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed === 0) {
+    throw new Error(`Invalid Telegram chat id in TELEGRAM_CHANNEL_ID: ${raw}`);
+  }
+
+  return parsed;
+}
+
 function parseBooleanEnv(raw: string | undefined, defaultValue: boolean): boolean {
   if (!raw) {
     return defaultValue;
@@ -189,6 +277,19 @@ function parseBooleanEnv(raw: string | undefined, defaultValue: boolean): boolea
   return defaultValue;
 }
 
+function parseOptionalEmojiEnv(raw: string | undefined, defaultValue: string | undefined): string | undefined {
+  if (!raw) {
+    return defaultValue;
+  }
+
+  const lower = raw.toLowerCase();
+  if (lower === "none" || lower === "off" || lower === "false" || lower === "disabled") {
+    return undefined;
+  }
+
+  return raw;
+}
+
 function parseMaxFileSize(raw: string | undefined): number {
   if (!raw) {
     return 20 * 1024 * 1024;
@@ -201,6 +302,40 @@ function parseMaxFileSize(raw: string | undefined): number {
   }
 
   return parsed;
+}
+
+function parseIntegerEnv(raw: string | undefined, defaultValue: number, name: string): number {
+  if (!raw) {
+    return defaultValue;
+  }
+
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    console.warn(`Invalid ${name} value: "${raw}". Falling back to ${defaultValue}.`);
+    return defaultValue;
+  }
+
+  return parsed;
+}
+
+function parseRatioEnv(raw: string | undefined, defaultValue: number, name: string): number {
+  if (!raw) {
+    return defaultValue;
+  }
+
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    console.warn(`Invalid ${name} value: "${raw}". Falling back to ${defaultValue}.`);
+    return defaultValue;
+  }
+
+  const ratio = parsed > 1 ? parsed / 100 : parsed;
+  if (ratio > 1) {
+    console.warn(`Invalid ${name} value: "${raw}". Falling back to ${defaultValue}.`);
+    return defaultValue;
+  }
+
+  return ratio;
 }
 
 function parseSandboxMode(raw: string | undefined): CodexSandboxMode {
