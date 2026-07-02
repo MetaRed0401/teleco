@@ -1,4 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { accessSync, constants, existsSync, realpathSync } from "node:fs";
+import path from "node:path";
 
 export type AppServerMessage = Record<string, unknown>;
 export type AppServerNotification = { method: string; params?: unknown };
@@ -40,30 +42,37 @@ export class CodexAppServerClient {
       return;
     }
 
+    const resolvedCodexCli = resolveCodexCliPath();
     this.closedReason = undefined;
     this.stdoutBuffer = "";
-    this.child = spawn("codex", ["app-server", "--listen", "stdio://"], {
+    const child = spawn(resolvedCodexCli.command, ["app-server", "--listen", "stdio://"], {
       cwd: this.options.cwd,
       env: {
         ...process.env,
+        PATH: resolvedCodexCli.path,
         TERM: process.env.TERM === "dumb" || !process.env.TERM ? "xterm-256color" : process.env.TERM,
       },
       stdio: ["pipe", "pipe", "pipe"],
     });
+    this.child = child;
 
-    this.child.stdout.on("data", (chunk: Buffer) => this.handleStdout(chunk));
-    this.child.stderr.on("data", (chunk: Buffer) => {
+    child.stdout.on("data", (chunk: Buffer) => this.handleStdout(chunk));
+    child.stderr.on("data", (chunk: Buffer) => {
       this.stderrBuffer = trimTail(this.stderrBuffer + chunk.toString("utf8"), 6000);
     });
-    this.child.on("exit", (code, signal) => {
-      this.closedReason = `Codex app-server exited (${code ?? signal}).`;
-      const error = new Error(this.closedReason);
-      for (const [id, pending] of this.pending) {
-        clearTimeout(pending.timer);
-        pending.reject(error);
-        this.pending.delete(id);
+    child.on("error", (error) => {
+      this.closedReason = formatSpawnFailure(error, resolvedCodexCli, this.options.cwd);
+      this.failPending(new Error(this.closedReason));
+      if (this.child === child) {
+        this.child = null;
       }
-      this.child = null;
+    });
+    child.on("exit", (code, signal) => {
+      this.closedReason ??= `Codex app-server exited (${code ?? signal}).`;
+      this.failPending(new Error(this.closedReason));
+      if (this.child === child) {
+        this.child = null;
+      }
     });
   }
 
@@ -144,13 +153,17 @@ export class CodexAppServerClient {
 
   close(): void {
     this.closedReason = "Codex app-server client closed.";
-    for (const [id, pending] of this.pending) {
-      clearTimeout(pending.timer);
-      pending.reject(new Error("Codex app-server client closed."));
-      this.pending.delete(id);
-    }
+    this.failPending(new Error("Codex app-server client closed."));
     this.child?.kill("SIGTERM");
     this.child = null;
+  }
+
+  private failPending(error: Error): void {
+    for (const [id, pending] of this.pending) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+      this.pending.delete(id);
+    }
   }
 
   private handleStdout(chunk: Buffer): void {
@@ -261,6 +274,103 @@ function defaultServerRequestResult(method: string): unknown {
     return { input: null };
   }
   return { decision: "cancel" };
+}
+
+function resolveCodexCliPath(): { command: string; path: string; checked: string[] } {
+  const pathValue = buildCodexCliPath();
+  const checked: string[] = [];
+
+  for (const dir of pathValue.split(path.delimiter)) {
+    if (!dir) {
+      continue;
+    }
+    const candidate = path.join(dir, "codex");
+    checked.push(candidate);
+    if (isExecutable(candidate)) {
+      return { command: resolveRealPath(candidate), path: pathValue, checked };
+    }
+  }
+
+  return { command: "codex", path: pathValue, checked };
+}
+
+function buildCodexCliPath(): string {
+  const home = process.env.HOME;
+  const candidates = [
+    process.env.PATH,
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+    home ? path.join(home, ".local", "bin") : undefined,
+    home ? path.join(home, "bin") : undefined,
+    home ? path.join(home, ".bun", "bin") : undefined,
+    home ? path.join(home, ".npm-global", "bin") : undefined,
+  ];
+
+  const seen = new Set<string>();
+  const parts: string[] = [];
+  for (const candidate of candidates) {
+    for (const dir of (candidate ?? "").split(path.delimiter)) {
+      if (!dir || seen.has(dir)) {
+        continue;
+      }
+      seen.add(dir);
+      parts.push(dir);
+    }
+  }
+  return parts.join(path.delimiter);
+}
+
+function resolveRealPath(filePath: string): string {
+  try {
+    return realpathSync(filePath);
+  } catch {
+    return filePath;
+  }
+}
+
+function isExecutable(filePath: string): boolean {
+  try {
+    if (!existsSync(filePath)) {
+      return false;
+    }
+    accessSync(filePath, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function formatSpawnFailure(
+  error: unknown,
+  resolved: { command: string; path: string; checked: string[] },
+  cwd: string,
+): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const checked = resolved.checked.slice(0, 20).map((item) => {
+    try {
+      return `${item} -> ${realpathSync(item)}`;
+    } catch {
+      return item;
+    }
+  });
+
+  return [
+    `Failed to start Codex app-server: ${message}`,
+    `command: ${resolved.command}`,
+    `cwd: ${cwd}`,
+    `cwd PATH: ${resolved.path}`,
+    process.env.HOME ? `HOME: ${process.env.HOME}` : undefined,
+    process.env.SHELL ? `SHELL: ${process.env.SHELL}` : undefined,
+    checked.length > 0 ? `checked: ${checked.join(", ")}` : undefined,
+    "Install Codex CLI in a standard Homebrew/user bin path or set TELECODEX_LAUNCHD_PATH for the LaunchAgent.",
+  ]
+    .filter((line): line is string => Boolean(line))
+    .join("\n");
 }
 
 function formatUnknown(value: unknown): string {

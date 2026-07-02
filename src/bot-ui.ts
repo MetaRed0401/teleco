@@ -43,6 +43,9 @@ export function renderHelpMessage(): DualText {
         ["/model", "Select model"],
         ["/think", "Select thinking effort"],
         ["/fast", "Toggle Codex fast mode"],
+        ["/formatting", "Select Telegram output format"],
+        ["/pretty", "Compatibility shell for old pretty mode"],
+        ["/streaming", "Configure Telegram streaming UX"],
       ],
     },
     {

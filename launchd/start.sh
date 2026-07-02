@@ -20,7 +20,6 @@ if [[ ! -f "${ENV_PATH}" ]]; then
   exit 66
 fi
 
-export PATH="${TELECODEX_LAUNCHD_PATH:-/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${HOME}/.local/bin:${HOME}/bin}"
 export TELECODEX_INSTANCE="${INSTANCE}"
 
 cd "${REPO_DIR}"
@@ -28,5 +27,6 @@ set -a
 # shellcheck disable=SC1090
 source "${ENV_PATH}"
 set +a
+export PATH="${TELECODEX_LAUNCHD_PATH:-/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${HOME}/.local/bin:${HOME}/bin}"
 
 exec /usr/bin/env node dist/index.js

@@ -142,6 +142,9 @@ describe("SessionRegistry", () => {
   beforeEach(() => {
     mockFsState.reset();
     mockSessionState.reset();
+    mockFsState.directories.add("/workspace/base");
+    mockFsState.directories.add("/workspace/a");
+    mockFsState.directories.add("/workspace/b");
     delete process.env.TELECODEX_INSTANCE;
     mockSessionState.create.mockImplementation(async (config: TeleCodexConfig, options?: {
       workspace?: string;
@@ -329,6 +332,41 @@ describe("SessionRegistry", () => {
     expect(warnSpy).toHaveBeenCalledWith(
       'Unknown persisted launch profile "missing" for 123. Falling back to default.',
     );
+  });
+
+  it("drops a persisted thread when its workspace no longer exists", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const config = createConfig();
+    const persistPath = path.join(config.workspace, ".telecodex", "contexts.json");
+    mockFsState.files.set(
+      persistPath,
+      JSON.stringify([
+        {
+          contextKey: "123",
+          threadId: "thread-a",
+          workspace: "/workspace/missing",
+          model: "o4-mini",
+          launchProfileId: "readonly",
+          updatedAt: 10,
+        },
+      ]),
+    );
+
+    const registry = new SessionRegistry(config);
+    await registry.getOrCreate("123");
+
+    expect(mockSessionState.create).toHaveBeenCalledWith(config, {
+      workspace: "/workspace/base",
+      model: "o4-mini",
+      reasoningEffort: undefined,
+      launchProfileId: "readonly",
+      resumeThreadId: undefined,
+    });
+    expect(warnSpy).toHaveBeenCalledWith(
+      'Persisted workspace "/workspace/missing" for 123 does not exist. Falling back to /workspace/base.',
+    );
+    expect(mockFsState.files.get(persistPath)).toContain('"threadId": null');
+    expect(mockFsState.files.get(persistPath)).toContain('"workspace": "/workspace/base"');
   });
 
   it("updates metadata and lists contexts sorted by newest first", async () => {

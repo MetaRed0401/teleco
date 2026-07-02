@@ -295,6 +295,29 @@ env_value() {
   done <"${env_path}"
 }
 
+workspace_for_instance() {
+  local instance="$1"
+  local env_path workspace
+  env_path="$(env_path_for_instance "${instance}")"
+  workspace="$(env_value "${env_path}" "TELECODEX_WORKSPACE")"
+  if [[ -n "${workspace}" ]]; then
+    printf '%s\n' "${workspace}"
+    return
+  fi
+  printf '%s\n' "${REPO_DIR}"
+}
+
+log_file_for_instance() {
+  local instance="$1"
+  local workspace
+  workspace="$(workspace_for_instance "${instance}")"
+  if [[ "${instance}" == "default" ]]; then
+    printf '%s/.telecodex/service.log\n' "${workspace}"
+    return
+  fi
+  printf '%s/.telecodex/%s/service.log\n' "${workspace}" "${instance}"
+}
+
 list_command() {
   print_mode_summary
   section "TeleCodex instances"
@@ -536,7 +559,19 @@ service_command() {
     section "${action^} ${instance}"
     if [[ "${action}" == "logs" ]]; then
       detail "Press Ctrl-C to stop following logs."
-      run_cmd journalctl --user -u "$(service_name_for_instance "${instance}")" -f
+      local log_file
+      log_file="$(log_file_for_instance "${instance}")"
+      local journal_probe
+      journal_probe="$(journalctl --user -u "$(service_name_for_instance "${instance}")" -n 1 --no-pager 2>&1 || true)"
+      if [[ "${journal_probe}" != *"No journal files were found."* ]]; then
+        run_cmd journalctl --user -u "$(service_name_for_instance "${instance}")" -f
+      elif [[ -f "${log_file}" ]]; then
+        detail "User journal is unavailable; following file log: ${log_file}"
+        run_cmd tail -F "${log_file}"
+      else
+        detail "User journal is unavailable and file log does not exist yet: ${log_file}"
+        detail "Start or restart the instance, then retry logs."
+      fi
     else
       run_user_systemctl "${action}" "$(service_name_for_instance "${instance}")"
     fi

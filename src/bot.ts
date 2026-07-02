@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { readFile, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -45,7 +45,7 @@ import {
   type CodexLaunchProfile,
 } from "./codex-launch.js";
 import { getThread, type CodexThreadRecord } from "./codex-state.js";
-import type { TeleCodexConfig, ToolVerbosity } from "./config.js";
+import type { FinalResponseMode, ResponsePreviewMode, TeleCodexConfig, ToolActivityMode, ToolVerbosity } from "./config.js";
 import { contextKeyFromCtx, isTopicContextKey, parseContextKey, type TelegramContextKey } from "./context-key.js";
 import { friendlyErrorText } from "./error-messages.js";
 import { escapeHTML, formatStreamingTelegramHTML, formatTelegramHTML } from "./format.js";
@@ -61,6 +61,18 @@ import {
   updateServiceOperationMarkerPid,
 } from "./service-operation-marker.js";
 import { SessionRegistry } from "./session-registry.js";
+import {
+  formatTelegramResponseFormatLabel,
+  formatTelegramPrettyModeLabel,
+  isTelegramResponseFormat,
+  isTelegramPrettyMode,
+  renderRichMessageCandidates,
+  TELEGRAM_RESPONSE_FORMAT_OPTIONS,
+  TELEGRAM_PRETTY_MODE_OPTIONS,
+  type RichMessageCandidate,
+  type TelegramPrettyMode,
+  type TelegramResponseFormat,
+} from "./telegram-formatting.js";
 import { getAvailableBackends, transcribeAudio } from "./voice.js";
 import {
   findWorkspaceFiles,
@@ -74,7 +86,7 @@ import {
 } from "./workspace-browser.js";
 
 const TELEGRAM_MESSAGE_LIMIT = 4000;
-const EDIT_DEBOUNCE_MS = 1500;
+const EDIT_DEBOUNCE_MS = 800;
 const TOOL_UPDATE_DEBOUNCE_MS = 1200;
 const TYPING_INTERVAL_MS = 4500;
 const LONG_RUNNING_FIRST_NOTICE_MS = 3 * 60 * 1000;
@@ -87,12 +99,13 @@ const RESPONSE_HEADER = "💬 Response";
 const DEFAULT_REASONING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh"];
 const MAX_AUDIO_FILE_SIZE = 25 * 1024 * 1024;
 const MAX_PROMPT_QUEUE_SIZE = 5;
+const REPLY_CONTEXT_LIMIT = 500;
 const KEYBOARD_PAGE_SIZE = 6;
 const NOOP_PAGE_CALLBACK_DATA = "noop_page";
 const LAUNCH_PROFILES_COMMAND = "/launch_profiles";
 
 type TelegramChatId = number | string;
-type TelegramParseMode = "HTML";
+type TelegramParseMode = "HTML" | "MarkdownV2";
 type TelegramReaction = NonNullable<Parameters<Context["api"]["setMessageReaction"]>[2]>[number];
 type TelegramReactionEmoji = Extract<TelegramReaction, { type: "emoji" }>["emoji"];
 type KeyboardItem = { label: string; callbackData: string };
@@ -128,11 +141,16 @@ type ToolState = {
   lastUpdateMs?: number;
 };
 
-type AutoCompactReason = "codex-auto" | "threshold";
+type AutoCompactReason = "threshold";
 
 type AutoCompactState = {
   turnsSinceLastCompact: number;
   lastCompactAtMs?: number;
+};
+
+type StreamingSettingButton = KeyboardItem & {
+  category: "response" | "tool" | "final";
+  value: ResponsePreviewMode | ToolActivityMode | FinalResponseMode;
 };
 
 type TextOptions = {
@@ -150,6 +168,11 @@ type RenderedText = {
 
 type RenderedChunk = RenderedText & {
   sourceText: string;
+};
+
+type RichRenderedChunk = {
+  sourceText: string;
+  candidates: RichMessageCandidate[];
 };
 
 function paginateKeyboard(items: KeyboardItem[], page: number, prefix: string): InlineKeyboard {
@@ -200,6 +223,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   const pendingModelButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingEffortButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingFastButtons = new Map<TelegramContextKey, KeyboardItem[]>();
+  const pendingFormattingButtons = new Map<TelegramContextKey, KeyboardItem[]>();
+  const pendingPrettyButtons = new Map<TelegramContextKey, KeyboardItem[]>();
+  const pendingStreamingButtons = new Map<TelegramContextKey, StreamingSettingButton[]>();
   const pendingApprovals = new Map<string, PendingApproval>();
   const lastPromptInput = new Map<TelegramContextKey, CodexPromptInput>();
   const promptQueues = new Map<TelegramContextKey, QueuedPrompt[]>();
@@ -214,6 +240,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     pendingLaunchButtons.delete(key);
     pendingUnsafeLaunchConfirmations.delete(key);
     pendingFastButtons.delete(key);
+    pendingFormattingButtons.delete(key);
+    pendingPrettyButtons.delete(key);
+    pendingStreamingButtons.delete(key);
     lastPromptInput.delete(key);
     promptQueues.delete(key);
     autoCompactStates.delete(key);
@@ -428,12 +457,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return { shouldCompact: false };
     }
 
-    if (codexAutoCompactObserved && config.autoCompactAfterCodexAutoCompact) {
-      return {
-        shouldCompact: true,
-        reason: "codex-auto",
-        detail: "Codex auto compact was observed during this turn.",
-      };
+    if (codexAutoCompactObserved) {
+      return { shouldCompact: false };
     }
 
     if (!config.autoCompactAfterEveryTurn && isAutoCompactCooldownActive(contextKey)) {
@@ -459,8 +484,6 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
   const formatAutoCompactReason = (reason: AutoCompactReason | undefined): string => {
     switch (reason) {
-      case "codex-auto":
-        return "Codex auto compact event";
       case "threshold":
         return "context threshold";
       default:
@@ -721,15 +744,29 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const busyState = getBusyState(contextKey);
     busyState.processing = true;
     console.log(
-      `Prompt started instance=${instanceName} context=${contextKey} chat=${chatId} workspace=${session.getCurrentWorkspace()} input=${summarizePromptForLog(userInput)}`,
+      `Prompt started instance=${instanceName} context=${redactLogId(contextKey)} chat=${redactLogId(chatId)} workspace=${session.getCurrentWorkspace()} input=${summarizePromptForLog(userInput)}`,
     );
 
     const abortKeyboard = new InlineKeyboard().text("⏹ Abort", `codex_abort:${contextKey}`);
-    const toolVerbosity: ToolVerbosity = config.toolVerbosity;
+    const responsePreviewMode = registry.getResponsePreviewMode(contextKey);
+    const toolActivityMode = registry.getToolActivityMode(contextKey);
+    const finalResponseMode = registry.getFinalResponseMode(contextKey);
+    const toolVerbosity: ToolVerbosity = toolActivityModeToVerbosity(toolActivityMode);
     const channelChatId = config.telegramChannelId;
+    const prettyModeForTurn = registry.getPrettyMode(contextKey);
     const toolStates = new Map<string, ToolState>();
     const toolCounts = new Map<string, number>();
     const assistantSegments: string[] = [];
+    const draftChatId =
+      responsePreviewMode === "draft" &&
+      typeof chatId === "number" &&
+      ctx.chat?.type === "private" &&
+      messageThreadId === undefined
+        ? chatId
+        : undefined;
+    const draftId = draftChatId !== undefined ? buildTelegramDraftId(ctx.update.update_id) : undefined;
+    let draftStreamingFailed = false;
+    let lastDraftText = "";
     let accumulatedText = "";
     let responseMessageId: number | undefined;
     let responseMessagePromise: Promise<void> | undefined;
@@ -739,6 +776,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     let isFlushing = false;
     let flushPending = false;
     let finalized = false;
+    let textDeltaQueue: Promise<void> = Promise.resolve();
+    let segmentCommitQueue: Promise<void> = Promise.resolve();
     let planMessageId: number | undefined;
     let lastRenderedPlan = "";
     let planMessageSending = false;
@@ -851,6 +890,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         }
         await safeEditMessage(bot, chatId, longRunningStatusMessageId, rendered.html, {
           fallbackText: rendered.plain,
+          messageThreadId,
         });
       }
 
@@ -915,6 +955,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         void safeEditMessage(bot, chatId, current.messageId, running.text, {
           parseMode: running.parseMode,
           fallbackText: running.fallbackText,
+          messageThreadId,
         }).catch((error) => {
           console.error(`Failed to update tool output for ${current.toolName}`, error);
         });
@@ -932,11 +973,15 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return renderStreamingMarkdownChunkWithinLimit(previewText);
     };
 
+    const isDraftStreamingActive = (): boolean =>
+      draftChatId !== undefined && draftId !== undefined && !draftStreamingFailed && !finalized;
+
     const resetResponseState = (): void => {
       accumulatedText = "";
       responseMessageId = undefined;
       responseMessagePromise = undefined;
       lastRenderedText = "";
+      lastDraftText = "";
       lastEditAt = 0;
       isFlushing = false;
       flushPending = false;
@@ -965,6 +1010,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     };
 
     const ensureResponseMessage = async (): Promise<void> => {
+      if (isDraftStreamingActive()) {
+        return;
+      }
       if (responseMessageId) {
         return;
       }
@@ -995,11 +1043,42 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       }
     };
 
+    const flushDraftResponse = async (force = false): Promise<void> => {
+      if (!isDraftStreamingActive() || draftChatId === undefined || draftId === undefined) {
+        return;
+      }
+
+      const now = Date.now();
+      if (!force && now - lastEditAt < EDIT_DEBOUNCE_MS) {
+        return;
+      }
+
+      const nextText = renderPreview();
+      const draftText = nextText.text || nextText.fallbackText;
+      if (!draftText || draftText === lastDraftText) {
+        return;
+      }
+
+      try {
+        await sendTelegramDraft(bot.api, draftChatId, draftId, nextText);
+        lastDraftText = draftText;
+        lastRenderedText = draftText;
+        lastEditAt = Date.now();
+      } catch (error) {
+        draftStreamingFailed = true;
+        console.warn(`Telegram draft streaming disabled for this turn: ${formatError(error)}`);
+      }
+    };
+
     const flushResponse = async (force = false): Promise<void> => {
       if (!accumulatedText) {
         return;
       }
       if (!responseMessageId) {
+        if (isDraftStreamingActive()) {
+          await flushDraftResponse(force);
+          return;
+        }
         await ensureResponseMessage();
         return;
       }
@@ -1024,6 +1103,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
           parseMode: nextText.parseMode,
           fallbackText: nextText.fallbackText,
           replyMarkup: abortKeyboard,
+          messageThreadId,
         });
         lastRenderedText = nextText.text;
         lastEditAt = Date.now();
@@ -1070,6 +1150,30 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       await removeAbortKeyboardFrom(responseMessageId);
     };
 
+    const discardResponsePreview = async (): Promise<void> => {
+      if (!responseMessageId) {
+        return;
+      }
+
+      const messageId = responseMessageId;
+      responseMessageId = undefined;
+      try {
+        await bot.api.deleteMessage(chatId, messageId);
+      } catch (error) {
+        if (!isMessageToDeleteNotFoundError(error)) {
+          console.error("Failed to delete Telegram response preview", error);
+        }
+      }
+    };
+
+    const waitForTextDeltaQueue = async (): Promise<void> => {
+      try {
+        await textDeltaQueue;
+      } catch (error) {
+        console.error("Failed to process queued text delta", error);
+      }
+    };
+
     const deliverRenderedChunks = async (chunks: RenderedChunk[]): Promise<void> => {
       if (chunks.length === 0) {
         return;
@@ -1080,6 +1184,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         await safeEditMessage(bot, chatId, responseMessageId, firstChunk.text, {
           parseMode: firstChunk.parseMode,
           fallbackText: firstChunk.fallbackText,
+          messageThreadId,
         });
         await removeAbortKeyboard();
       } else {
@@ -1100,24 +1205,83 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       }
     };
 
-    const closeCurrentAssistantSegment = async (): Promise<void> => {
+    const deliverRichRenderedChunks = async (chunks: RichRenderedChunk[]): Promise<void> => {
+      if (chunks.length === 0) {
+        return;
+      }
+
+      const [firstChunk, ...remainingChunks] = chunks;
+      if (responseMessageId) {
+        await editRichMessage(bot, chatId, responseMessageId, firstChunk.candidates, {
+          messageThreadId,
+        });
+        await removeAbortKeyboard();
+      } else {
+        const message = await sendRichMessage(bot.api, chatId, firstChunk.candidates, {
+          messageThreadId,
+        });
+        responseMessageId = message.message_id;
+      }
+
+      for (const chunk of remainingChunks) {
+        await sendRichMessage(bot.api, chatId, chunk.candidates, {
+          messageThreadId,
+        });
+      }
+    };
+
+    const commitCurrentAssistantSegment = async (): Promise<void> => {
       const segmentText = formatResponseSegment(accumulatedText).trim();
       if (!segmentText) {
         return;
       }
 
+      accumulatedText = "";
       clearFlushTimer();
+
       if (responseMessagePromise) {
         try {
           await responseMessagePromise;
         } catch {
-          // Fall back to sending the finalized segment below.
+          // If a transient preview failed, send the committed segment as a fresh message below.
         }
       }
 
-      await deliverRenderedChunks(splitMarkdownForTelegram(segmentText));
+      await deliverRichRenderedChunks(
+        splitRichMarkdownForTelegram(segmentText, registry.getResponseFormat(contextKey)),
+      );
       assistantSegments.push(segmentText);
       resetResponseState();
+    };
+
+    const waitForSegmentCommitQueue = async (): Promise<void> => {
+      try {
+        await segmentCommitQueue;
+      } catch (error) {
+        console.error("Failed to commit queued assistant segment", error);
+      }
+    };
+
+    const commitAssistantSegmentAtToolBoundary = async (toolName: string): Promise<void> => {
+      const textDeltaQueueAtBoundary = textDeltaQueue;
+      const commitTask = segmentCommitQueue
+        .catch((error) => {
+          console.error("Previous assistant segment commit failed", error);
+        })
+        .then(async () => {
+          try {
+            await textDeltaQueueAtBoundary;
+          } catch (error) {
+            console.error("Failed to process text delta before assistant segment commit", error);
+          }
+          await commitCurrentAssistantSegment();
+        })
+        .catch((error) => {
+          console.error(`Failed to commit assistant segment before tool ${toolName}`, error);
+        });
+
+      segmentCommitQueue = commitTask;
+      await commitTask;
     };
 
     const mirrorFinalResponseToChannel = async (text: string): Promise<void> => {
@@ -1139,6 +1303,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     };
 
     const finalizeResponse = async (): Promise<void> => {
+      if (finalized) {
+        return;
+      }
+      await waitForTextDeltaQueue();
+      await waitForSegmentCommitQueue();
       if (finalized) {
         return;
       }
@@ -1167,7 +1336,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         const plainText = "✅ Done";
 
         if (responseMessageId) {
-          await safeEditMessage(bot, chatId, responseMessageId, html, { fallbackText: plainText });
+          await safeEditMessage(bot, chatId, responseMessageId, html, { fallbackText: plainText, messageThreadId });
           await removeAbortKeyboard();
         } else {
           await safeReply(ctx, html, { fallbackText: plainText });
@@ -1176,64 +1345,67 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         return;
       }
 
-      await deliverRenderedChunks(splitMarkdownForTelegram(finalText));
+      if (finalResponseMode === "send") {
+        await discardResponsePreview();
+      }
+      await deliverRichRenderedChunks(
+        splitRichMarkdownForTelegram(finalText, registry.getResponseFormat(contextKey)),
+      );
       await mirrorFinalResponseToChannel([...assistantSegments, finalText].join("\n\n"));
     };
 
     const callbacks: CodexSessionCallbacks = {
-      onTextDelta: (delta: string, metadata) => {
-        if (metadata?.startsNewMessage && accumulatedText.trim()) {
-          const previousResponseMessageId = responseMessageId;
-          clearFlushTimer();
-          void removeAbortKeyboardFrom(previousResponseMessageId).catch((error) => {
-            console.error("Failed to clear Abort button before starting next agent message", error);
-          });
-          accumulatedText = "";
-          responseMessageId = undefined;
-          responseMessagePromise = undefined;
-          lastRenderedText = "";
-          lastEditAt = 0;
-          isFlushing = false;
-          flushPending = false;
-        }
+      onTextDelta: (delta: string, _metadata) => {
+        textDeltaQueue = textDeltaQueue
+          .catch((error) => {
+            console.error("Previous text delta processing failed", error);
+          })
+          .then(async () => {
+            accumulatedText += delta;
+            if (!hasResponseBody()) {
+              return;
+            }
 
-        accumulatedText += delta;
-        if (!hasResponseBody()) {
-          return;
-        }
+            if (responsePreviewMode === "off") {
+              return;
+            }
 
-        if (!responseMessageId) {
-          void ensureResponseMessage()
-            .then(() => {
+            if (responsePreviewMode === "draft") {
+              await flushDraftResponse();
+              return;
+            }
+
+            if (!responseMessageId) {
+              await ensureResponseMessage();
               scheduleFlush();
-            })
-            .catch((error) => {
-              console.error("Failed to send initial Telegram response message", error);
-            });
-          return;
-        }
+              return;
+            }
 
-        scheduleFlush();
+            scheduleFlush();
+          });
       },
       onToolStart: (toolName: string, toolCallId: string) => {
         if (toolVerbosity === "summary") {
           toolCounts.set(toolName, (toolCounts.get(toolName) ?? 0) + 1);
+          void commitAssistantSegmentAtToolBoundary(toolName);
           return;
         }
 
         if (toolVerbosity === "none") {
+          void commitAssistantSegmentAtToolBoundary(toolName);
           return;
         }
 
         toolStates.set(toolCallId, { toolName, partialResult: "", lastUpdateMs: Date.now() });
-        if (toolVerbosity !== "all") {
+        if (toolVerbosity !== "all" && toolVerbosity !== "new") {
+          void commitAssistantSegmentAtToolBoundary(toolName);
           return;
         }
 
         const messageText = renderToolStartMessage(toolName);
 
         void (async () => {
-          await closeCurrentAssistantSegment();
+          await commitAssistantSegmentAtToolBoundary(toolName);
           const message = await sendTextMessage(bot.api, chatId, messageText.text, {
             parseMode: messageText.parseMode,
             fallbackText: messageText.fallbackText,
@@ -1246,11 +1418,14 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
           state.messageId = message.message_id;
           state.lastUpdateMs = Date.now();
-          scheduleToolUpdate(toolCallId);
+          if (toolVerbosity === "all") {
+            scheduleToolUpdate(toolCallId);
+          }
           if (state.finalStatus) {
             await safeEditMessage(bot, chatId, state.messageId, state.finalStatus.text, {
               parseMode: state.finalStatus.parseMode,
               fallbackText: state.finalStatus.fallbackText,
+              messageThreadId,
             });
           }
         })().catch((error) => {
@@ -1258,7 +1433,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         });
       },
       onToolUpdate: (toolCallId: string, partialResult: string) => {
-        if (toolVerbosity === "none" || toolVerbosity === "summary") {
+        if (toolVerbosity === "none" || toolVerbosity === "summary" || toolVerbosity === "new") {
           return;
         }
 
@@ -1302,9 +1477,15 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
           return;
         }
 
+        if (toolActivityMode === "compact" && !isError) {
+          void bot.api.deleteMessage(chatId, state.messageId).catch(() => undefined);
+          return;
+        }
+
         void safeEditMessage(bot, chatId, state.messageId, state.finalStatus.text, {
           parseMode: state.finalStatus.parseMode,
           fallbackText: state.finalStatus.fallbackText,
+          messageThreadId,
         }).catch((error) => {
           console.error(`Failed to update tool message for ${state.toolName}`, error);
         });
@@ -1334,7 +1515,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
               planMessageSending = false;
             });
         } else {
-          void safeEditMessage(bot, chatId, planMessageId, rendered, { parseMode: "HTML" }).catch((err) => {
+          void safeEditMessage(bot, chatId, planMessageId, rendered, { parseMode: "HTML", messageThreadId }).catch((err) => {
             console.error("Failed to update plan message", err);
           });
         }
@@ -1402,6 +1583,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       finishActiveOperation(config, activeOperationId, "completed");
       activeOperationFinished = true;
       markAutoCompactTurnCompleted(contextKey);
+      if (codexAutoCompactObserved) {
+        markAutoCompactCompleted(contextKey);
+      }
       const autoCompact = getAutoCompactDecision(contextKey, session, codexAutoCompactObserved);
       if (autoCompact.shouldCompact) {
         await runTwoStageCompact(ctx, contextKey, session, {
@@ -1413,18 +1597,23 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       }
       const info = session.getInfo();
       console.log(
-        `Prompt completed instance=${instanceName} context=${contextKey} thread=${info.threadId ?? "none"} durationMs=${Date.now() - promptStartedAt}`,
+        `Prompt completed instance=${instanceName} context=${redactLogId(contextKey)} thread=${info.threadId ?? "none"} durationMs=${Date.now() - promptStartedAt}`,
       );
     } catch (error) {
       finishActiveOperation(config, activeOperationId, isAbortLikeError(error) ? "aborted" : "failed");
       activeOperationFinished = true;
       console.error(
-        `Prompt failed instance=${instanceName} context=${contextKey} durationMs=${Date.now() - promptStartedAt}: ${formatError(error)}`,
+        `Prompt failed instance=${instanceName} context=${redactLogId(contextKey)} durationMs=${Date.now() - promptStartedAt}: ${formatError(error)}`,
       );
       stopTyping();
       await closeLongRunningStatus();
       clearAllToolUpdateTimers();
+      if (prettyModeForTurn === "once") {
+        registry.setPrettyMode(contextKey, "off", session);
+      }
       clearFlushTimer();
+      await waitForTextDeltaQueue();
+      await waitForSegmentCommitQueue();
       if (responseMessagePromise) {
         try {
           await responseMessagePromise;
@@ -2933,6 +3122,270 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     });
   });
 
+  bot.command("formatting", async (ctx) => {
+    const chatId = ctx.chat?.id;
+    if (!chatId) {
+      return;
+    }
+
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      return;
+    }
+
+    const { contextKey, session } = contextSession;
+    const requestedFormat = normalizeFormattingCommandArg(commandArgs(ctx, "formatting"));
+
+    if (requestedFormat) {
+      if (!isTelegramResponseFormat(requestedFormat)) {
+        const plainText = "Usage: /formatting rich-message|markdown|html|plain";
+        await safeReply(ctx, `<code>${escapeHTML(plainText)}</code>`, { fallbackText: plainText });
+        return;
+      }
+
+      if (isBusy(contextKey)) {
+        await safeReply(ctx, escapeHTML("Cannot change response formatting while a prompt is running."), {
+          fallbackText: "Cannot change response formatting while a prompt is running.",
+        });
+        return;
+      }
+
+      const selectedFormat = registry.setResponseFormat(contextKey, requestedFormat, session);
+      updateSessionMetadata(contextKey, session);
+      await safeReply(ctx, renderFormattingStatusHTML(selectedFormat), {
+        fallbackText: renderFormattingStatusPlain(selectedFormat),
+      });
+      return;
+    }
+
+    const currentFormat = registry.getResponseFormat(contextKey);
+    const formattingButtons = buildFormattingButtons(currentFormat);
+    pendingFormattingButtons.set(contextKey, formattingButtons);
+    const keyboard = paginateKeyboard(formattingButtons, 0, "formatting");
+    await safeReply(ctx, renderFormattingStatusHTML(currentFormat), {
+      fallbackText: renderFormattingStatusPlain(currentFormat),
+      replyMarkup: keyboard,
+    });
+  });
+
+  bot.command("pretty", async (ctx) => {
+    const chatId = ctx.chat?.id;
+    if (!chatId) {
+      return;
+    }
+
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      return;
+    }
+
+    const { contextKey, session } = contextSession;
+    const requestedMode = commandArgs(ctx, "pretty").toLowerCase();
+
+    if (requestedMode) {
+      if (requestedMode !== "status" && !isTelegramPrettyMode(requestedMode)) {
+        const plainText = "Usage: /pretty on|off|once|status";
+        await safeReply(ctx, `<code>${escapeHTML(plainText)}</code>`, { fallbackText: plainText });
+        return;
+      }
+
+      if (isBusy(contextKey) && requestedMode !== "status") {
+        await safeReply(ctx, escapeHTML("Cannot change pretty mode while a prompt is running."), {
+          fallbackText: "Cannot change pretty mode while a prompt is running.",
+        });
+        return;
+      }
+
+      const selectedMode =
+        requestedMode === "status" ? registry.getPrettyMode(contextKey) : registry.setPrettyMode(contextKey, requestedMode, session);
+      if (requestedMode !== "status") {
+        updateSessionMetadata(contextKey, session);
+      }
+      await safeReply(ctx, renderPrettyStatusHTML(selectedMode), {
+        fallbackText: renderPrettyStatusPlain(selectedMode),
+      });
+      return;
+    }
+
+    const currentMode = registry.getPrettyMode(contextKey);
+    const prettyButtons = buildPrettyButtons(currentMode);
+    pendingPrettyButtons.set(contextKey, prettyButtons);
+    const keyboard = paginateKeyboard(prettyButtons, 0, "pretty");
+    await safeReply(ctx, renderPrettyStatusHTML(currentMode), {
+      fallbackText: renderPrettyStatusPlain(currentMode),
+      replyMarkup: keyboard,
+    });
+  });
+
+  const renderStreamingStatusPlain = (contextKey: TelegramContextKey): string => {
+    const response = registry.getResponsePreviewMode(contextKey);
+    const tool = registry.getToolActivityMode(contextKey);
+    const final = registry.getFinalResponseMode(contextKey);
+    return [
+      "Telegram streaming UX",
+      `Response preview: ${response}`,
+      `Tool activity: ${tool}`,
+      `Final response: ${final}`,
+      "",
+      "Defaults: response off, tool compact, final send",
+      "Commands:",
+      "/streaming response off|edit|draft",
+      "/streaming tool off|compact|verbose|errors-only",
+      "/streaming final send|edit",
+    ].join("\n");
+  };
+
+  const renderStreamingStatusHTML = (contextKey: TelegramContextKey): string => {
+    const response = registry.getResponsePreviewMode(contextKey);
+    const tool = registry.getToolActivityMode(contextKey);
+    const final = registry.getFinalResponseMode(contextKey);
+    return [
+      "<b>Telegram streaming UX</b>",
+      `<b>Response preview:</b> <code>${escapeHTML(response)}</code>`,
+      `<b>Tool activity:</b> <code>${escapeHTML(tool)}</code>`,
+      `<b>Final response:</b> <code>${escapeHTML(final)}</code>`,
+      "",
+      "<b>Defaults:</b> <code>response off</code> · <code>tool compact</code> · <code>final send</code>",
+      "<code>/streaming response off|edit|draft</code>",
+      "<code>/streaming tool off|compact|verbose|errors-only</code>",
+      "<code>/streaming final send|edit</code>",
+    ].join("\n");
+  };
+
+  const buildStreamingButtons = (contextKey: TelegramContextKey): StreamingSettingButton[] => {
+    const response = registry.getResponsePreviewMode(contextKey);
+    const tool = registry.getToolActivityMode(contextKey);
+    const final = registry.getFinalResponseMode(contextKey);
+    return [
+      ...(["off", "edit", "draft"] as const).map((value) => ({
+        category: "response" as const,
+        value,
+        label: `Response ${value}${response === value ? " ✓" : ""}`,
+        callbackData: `streaming_response_${value}`,
+      })),
+      ...(["off", "compact", "verbose", "errors-only"] as const).map((value) => ({
+        category: "tool" as const,
+        value,
+        label: `Tool ${value}${tool === value ? " ✓" : ""}`,
+        callbackData: `streaming_tool_${value}`,
+      })),
+      ...(["send", "edit"] as const).map((value) => ({
+        category: "final" as const,
+        value,
+        label: `Final ${value}${final === value ? " ✓" : ""}`,
+        callbackData: `streaming_final_${value}`,
+      })),
+    ];
+  };
+
+  const buildStreamingMainKeyboard = (): InlineKeyboard => {
+    return new InlineKeyboard()
+      .text("Response preview", "streaming_category_response")
+      .row()
+      .text("Tool activity", "streaming_category_tool")
+      .row()
+      .text("Final response", "streaming_category_final");
+  };
+
+  const buildStreamingCategoryKeyboard = (
+    buttons: StreamingSettingButton[],
+    category: StreamingSettingButton["category"],
+  ): InlineKeyboard => {
+    const keyboard = new InlineKeyboard();
+    buttons
+      .filter((button) => button.category === category)
+      .forEach((button) => {
+        keyboard.text(button.label, button.callbackData).row();
+      });
+    keyboard.text("← Streaming settings", "streaming_back");
+    return keyboard;
+  };
+
+  const renderStreamingCategoryHTML = (
+    contextKey: TelegramContextKey,
+    category: StreamingSettingButton["category"],
+  ): string => {
+    const current =
+      category === "response"
+        ? registry.getResponsePreviewMode(contextKey)
+        : category === "tool"
+          ? registry.getToolActivityMode(contextKey)
+          : registry.getFinalResponseMode(contextKey);
+    const title =
+      category === "response"
+        ? "Response preview"
+        : category === "tool"
+          ? "Tool activity"
+          : "Final response";
+    return [
+      `<b>${escapeHTML(title)}</b>`,
+      `<b>Current:</b> <code>${escapeHTML(current)}</code>`,
+      "",
+      category === "response"
+        ? "Controls transient assistant text previews. Tool boundaries commit completed assistant segments as normal Response messages."
+        : undefined,
+      category === "tool" ? "Controls temporary tool progress messages and output previews." : undefined,
+      category === "final" ? "Controls how the final remaining assistant segment is delivered." : undefined,
+    ]
+      .filter((line): line is string => line !== undefined)
+      .join("\n");
+  };
+
+  const renderStreamingCategoryPlain = (
+    contextKey: TelegramContextKey,
+    category: StreamingSettingButton["category"],
+  ): string => stripHTML(renderStreamingCategoryHTML(contextKey, category));
+
+  bot.command("streaming", async (ctx) => {
+    const chatId = ctx.chat?.id;
+    if (!chatId) {
+      return;
+    }
+
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      return;
+    }
+
+    const { contextKey, session } = contextSession;
+    const rawArgs = commandArgs(ctx, "streaming").toLowerCase();
+
+    if (rawArgs) {
+      const update = parseStreamingModeArgs(rawArgs);
+      if (!update) {
+        const plainText = [
+          "Usage:",
+          "/streaming response off|edit|draft",
+          "/streaming tool off|compact|verbose|errors-only",
+          "/streaming final send|edit",
+        ].join("\n");
+        await safeReply(ctx, `<pre>${escapeHTML(plainText)}</pre>`, { fallbackText: plainText });
+        return;
+      }
+
+      if (isBusy(contextKey)) {
+        await safeReply(ctx, escapeHTML("Cannot change streaming mode while a prompt is running."), {
+          fallbackText: "Cannot change streaming mode while a prompt is running.",
+        });
+        return;
+      }
+
+      registry.setStreamingModes(contextKey, update, session);
+      updateSessionMetadata(contextKey, session);
+      await safeReply(ctx, renderStreamingStatusHTML(contextKey), {
+        fallbackText: renderStreamingStatusPlain(contextKey),
+      });
+      return;
+    }
+
+    const streamingButtons = buildStreamingButtons(contextKey);
+    pendingStreamingButtons.set(contextKey, streamingButtons);
+    await safeReply(ctx, renderStreamingStatusHTML(contextKey), {
+      fallbackText: renderStreamingStatusPlain(contextKey),
+      replyMarkup: buildStreamingMainKeyboard(),
+    });
+  });
+
   bot.callbackQuery(NOOP_PAGE_CALLBACK_DATA, async (ctx) => {
     await ctx.answerCallbackQuery();
   });
@@ -2948,6 +3401,13 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   handlePageCallback(/^model_page_(\d+)$/, "model", pendingModelButtons, "Expired, run /model again");
   handlePageCallback(/^effort_page_(\d+)$/, "effort", pendingEffortButtons, "Expired, run /think again");
   handlePageCallback(/^fast_page_(\d+)$/, "fast", pendingFastButtons, "Expired, run /fast again");
+  handlePageCallback(
+    /^formatting_page_(\d+)$/,
+    "formatting",
+    pendingFormattingButtons,
+    "Expired, run /formatting again",
+  );
+  handlePageCallback(/^pretty_page_(\d+)$/, "pretty", pendingPrettyButtons, "Expired, run /pretty again");
 
   bot.callbackQuery(/^codex_abort:(.+)$/, async (ctx) => {
     const contextKey = ctx.match?.[1];
@@ -3476,6 +3936,168 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
   });
 
+  bot.callbackQuery(/^formatting_([a-z0-9_-]+)$/, async (ctx) => {
+    const chatId = ctx.chat?.id;
+    const messageId = ctx.callbackQuery.message?.message_id;
+    const formatOption = ctx.match?.[1];
+
+    if (!chatId || !messageId || !formatOption || !isTelegramResponseFormat(formatOption)) {
+      return;
+    }
+
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      return;
+    }
+
+    const { contextKey, session } = contextSession;
+    const buttons = pendingFormattingButtons.get(contextKey);
+    if (!buttons || !buttons.some((button) => button.callbackData === `formatting_${formatOption}`)) {
+      await ctx.answerCallbackQuery({ text: "Expired, run /formatting again" });
+      return;
+    }
+
+    if (isBusy(contextKey)) {
+      await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: `Formatting: ${formatTelegramResponseFormatLabel(formatOption)}` });
+    pendingFormattingButtons.delete(contextKey);
+    const selectedFormat = registry.setResponseFormat(contextKey, formatOption, session);
+    updateSessionMetadata(contextKey, session);
+    await safeEditMessage(bot, chatId, messageId, renderFormattingStatusHTML(selectedFormat), {
+      fallbackText: renderFormattingStatusPlain(selectedFormat),
+    });
+  });
+
+  bot.callbackQuery(/^pretty_([a-z0-9_-]+)$/, async (ctx) => {
+    const chatId = ctx.chat?.id;
+    const messageId = ctx.callbackQuery.message?.message_id;
+    const prettyOption = ctx.match?.[1];
+
+    if (!chatId || !messageId || !prettyOption || (prettyOption !== "status" && !isTelegramPrettyMode(prettyOption))) {
+      return;
+    }
+
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      return;
+    }
+
+    const { contextKey, session } = contextSession;
+    const buttons = pendingPrettyButtons.get(contextKey);
+    if (!buttons || !buttons.some((button) => button.callbackData === `pretty_${prettyOption}`)) {
+      await ctx.answerCallbackQuery({ text: "Expired, run /pretty again" });
+      return;
+    }
+
+    if (isBusy(contextKey) && prettyOption !== "status") {
+      await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
+      return;
+    }
+
+    const selectedMode =
+      prettyOption === "status" ? registry.getPrettyMode(contextKey) : registry.setPrettyMode(contextKey, prettyOption, session);
+    if (prettyOption !== "status") {
+      pendingPrettyButtons.delete(contextKey);
+      updateSessionMetadata(contextKey, session);
+    }
+    await ctx.answerCallbackQuery({ text: formatTelegramPrettyModeLabel(selectedMode) });
+    await safeEditMessage(bot, chatId, messageId, renderPrettyStatusHTML(selectedMode), {
+      fallbackText: renderPrettyStatusPlain(selectedMode),
+    });
+  });
+
+  bot.callbackQuery(/^streaming_category_(response|tool|final)$/, async (ctx) => {
+    const chatId = ctx.chat?.id;
+    const messageId = ctx.callbackQuery.message?.message_id;
+    const category = ctx.match?.[1] as StreamingSettingButton["category"] | undefined;
+
+    if (!chatId || !messageId || !category) {
+      return;
+    }
+
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      return;
+    }
+
+    const { contextKey } = contextSession;
+    const buttons = buildStreamingButtons(contextKey);
+    pendingStreamingButtons.set(contextKey, buttons);
+    await ctx.answerCallbackQuery();
+    await safeEditMessage(bot, chatId, messageId, renderStreamingCategoryHTML(contextKey, category), {
+      fallbackText: renderStreamingCategoryPlain(contextKey, category),
+      replyMarkup: buildStreamingCategoryKeyboard(buttons, category),
+    });
+  });
+
+  bot.callbackQuery("streaming_back", async (ctx) => {
+    const chatId = ctx.chat?.id;
+    const messageId = ctx.callbackQuery.message?.message_id;
+    if (!chatId || !messageId) {
+      return;
+    }
+
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      return;
+    }
+
+    const { contextKey } = contextSession;
+    pendingStreamingButtons.set(contextKey, buildStreamingButtons(contextKey));
+    await ctx.answerCallbackQuery();
+    await safeEditMessage(bot, chatId, messageId, renderStreamingStatusHTML(contextKey), {
+      fallbackText: renderStreamingStatusPlain(contextKey),
+      replyMarkup: buildStreamingMainKeyboard(),
+    });
+  });
+
+  bot.callbackQuery(/^streaming_(response|tool|final)_([a-z0-9-]+)$/, async (ctx) => {
+    const chatId = ctx.chat?.id;
+    const messageId = ctx.callbackQuery.message?.message_id;
+    const category = ctx.match?.[1] as StreamingSettingButton["category"] | undefined;
+    const value = ctx.match?.[2];
+
+    if (!chatId || !messageId || !category || !value) {
+      return;
+    }
+
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      return;
+    }
+
+    const { contextKey, session } = contextSession;
+    const buttons = pendingStreamingButtons.get(contextKey);
+    if (!buttons || !buttons.some((button) => button.callbackData === `streaming_${category}_${value}`)) {
+      await ctx.answerCallbackQuery({ text: "Expired, run /streaming again" });
+      return;
+    }
+
+    if (isBusy(contextKey)) {
+      await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
+      return;
+    }
+
+    const update = streamingModeUpdate(category, value);
+    if (!update) {
+      await ctx.answerCallbackQuery({ text: "Invalid mode" });
+      return;
+    }
+
+    registry.setStreamingModes(contextKey, update, session);
+    updateSessionMetadata(contextKey, session);
+    const updatedButtons = buildStreamingButtons(contextKey);
+    pendingStreamingButtons.set(contextKey, updatedButtons);
+    await ctx.answerCallbackQuery({ text: "Streaming updated" });
+    await safeEditMessage(bot, chatId, messageId, renderStreamingCategoryHTML(contextKey, category), {
+      fallbackText: renderStreamingCategoryPlain(contextKey, category),
+      replyMarkup: buildStreamingCategoryKeyboard(updatedButtons, category),
+    });
+  });
+
   bot.on("message:text", async (ctx) => {
     const userText = ctx.message.text.trim();
     if (!userText) {
@@ -3493,8 +4115,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
 
     const { contextKey, session } = contextSession;
+    const promptText = addReplyContext(ctx, userText);
     if (getBusyState(contextKey).compacting) {
-      const queued = enqueuePrompt(contextKey, ctx, ctx.chat.id, userText);
+      const queued = enqueuePrompt(contextKey, ctx, ctx.chat.id, promptText);
       if (!queued) {
         await safeReply(ctx, escapeHTML(`Queue is full (${MAX_PROMPT_QUEUE_SIZE}/${MAX_PROMPT_QUEUE_SIZE}).`), {
           fallbackText: `Queue is full (${MAX_PROMPT_QUEUE_SIZE}/${MAX_PROMPT_QUEUE_SIZE}).`,
@@ -3509,8 +4132,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return;
     }
 
-    lastPromptInput.set(contextKey, userText);
-    runPromptInBackground(ctx, contextKey, ctx.chat.id, session, userText);
+    lastPromptInput.set(contextKey, promptText);
+    runPromptInBackground(ctx, contextKey, ctx.chat.id, session, promptText);
   });
 
   bot.on(["message:voice", "message:audio"], async (ctx) => {
@@ -3572,8 +4195,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return;
     }
 
-    lastPromptInput.set(contextKey, transcript);
-    runPromptInBackground(ctx, contextKey, chatId, session, transcript);
+    const promptText = addReplyContext(ctx, transcript);
+    lastPromptInput.set(contextKey, promptText);
+    runPromptInBackground(ctx, contextKey, chatId, session, promptText);
   });
 
   bot.on("message:photo", async (ctx) => {
@@ -3615,10 +4239,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
 
     const caption = ctx.message.caption?.trim();
+    const promptText = addReplyContext(ctx, caption ?? "");
     const promptInput: { text?: string; imagePaths: string[] } = { imagePaths: [tempFilePath] };
-    if (caption) {
-      promptInput.text = caption;
-      lastPromptInput.set(contextKey, caption);
+    if (promptText) {
+      promptInput.text = promptText;
+      lastPromptInput.set(contextKey, promptText);
     }
     runPromptInBackground(ctx, contextKey, chatId, session, promptInput, async () => {
       await unlink(tempFilePath).catch(() => {});
@@ -3706,9 +4331,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       stagedFileInstructions: buildFileInstructions([stagedFile], outDir),
     };
     const caption = ctx.message.caption?.trim();
-    if (caption) {
-      promptInput.text = caption;
-      lastPromptInput.set(contextKey, caption);
+    const promptText = addReplyContext(ctx, caption ?? "");
+    if (promptText) {
+      promptInput.text = promptText;
+      lastPromptInput.set(contextKey, promptText);
     }
 
     runPromptInBackground(ctx, contextKey, chatId, session, promptInput, async () => {
@@ -3760,6 +4386,9 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "model", description: "View & change model" },
     { command: "think", description: "Set thinking effort" },
     { command: "fast", description: "Toggle Codex fast mode" },
+    { command: "formatting", description: "Select response formatting" },
+    { command: "pretty", description: "Normalize responses for Telegram" },
+    { command: "streaming", description: "Configure Telegram streaming UX" },
     { command: "auth", description: "Check auth status" },
     { command: "login", description: "Start authentication" },
     { command: "logout", description: "Sign out" },
@@ -3782,6 +4411,57 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
 }
 
 type FastModeOption = "on" | "off" | "once" | "status";
+
+function toolActivityModeToVerbosity(mode: ToolActivityMode): ToolVerbosity {
+  if (mode === "off") {
+    return "none";
+  }
+  if (mode === "verbose") {
+    return "all";
+  }
+  if (mode === "errors-only") {
+    return "errors-only";
+  }
+  return "new";
+}
+
+function parseStreamingModeArgs(
+  rawArgs: string,
+): { responsePreviewMode?: ResponsePreviewMode; toolActivityMode?: ToolActivityMode; finalResponseMode?: FinalResponseMode } | undefined {
+  const [category, value] = rawArgs.split(/\s+/).filter(Boolean);
+  if (!category || !value) {
+    return undefined;
+  }
+  return streamingModeUpdate(category, value);
+}
+
+function streamingModeUpdate(
+  category: string,
+  value: string,
+): { responsePreviewMode?: ResponsePreviewMode; toolActivityMode?: ToolActivityMode; finalResponseMode?: FinalResponseMode } | undefined {
+  if (category === "response" && isResponsePreviewMode(value)) {
+    return { responsePreviewMode: value };
+  }
+  if (category === "tool" && isToolActivityMode(value)) {
+    return { toolActivityMode: value };
+  }
+  if (category === "final" && isFinalResponseMode(value)) {
+    return { finalResponseMode: value };
+  }
+  return undefined;
+}
+
+function isResponsePreviewMode(value: string): value is ResponsePreviewMode {
+  return value === "off" || value === "edit" || value === "draft";
+}
+
+function isToolActivityMode(value: string): value is ToolActivityMode {
+  return value === "off" || value === "compact" || value === "verbose" || value === "errors-only";
+}
+
+function isFinalResponseMode(value: string): value is FinalResponseMode {
+  return value === "send" || value === "edit";
+}
 
 function isFastModeOption(value: string): value is FastModeOption {
   return value === "on" || value === "off" || value === "once" || value === "status";
@@ -3835,6 +4515,105 @@ function renderFastModeStatusHTML(info: CodexSessionInfo): string {
     "",
     "<code>/fast on</code> · <code>/fast off</code> · <code>/fast once</code> · <code>/fast status</code>",
   ].join("\n");
+}
+
+function buildFormattingButtons(current: TelegramResponseFormat): KeyboardItem[] {
+  return TELEGRAM_RESPONSE_FORMAT_OPTIONS.map((option) => ({
+    label: option.value === current ? `${option.label} ✓` : option.label,
+    callbackData: `formatting_${option.value}`,
+  }));
+}
+
+function renderFormattingStatusPlain(format: TelegramResponseFormat): string {
+  const option = TELEGRAM_RESPONSE_FORMAT_OPTIONS.find((candidate) => candidate.value === format);
+  return [
+    "Response formatting",
+    `Current: ${formatTelegramResponseFormatLabel(format)}`,
+    option ? `Behavior: ${option.description}` : undefined,
+    "",
+    `Fallback chain: ${formatResponseFallbackChain(format)}`,
+    "Commands: /formatting rich-message, /formatting markdown, /formatting html, /formatting plain",
+  ]
+    .filter((line): line is string => line !== undefined)
+    .join("\n");
+}
+
+function renderFormattingStatusHTML(format: TelegramResponseFormat): string {
+  const option = TELEGRAM_RESPONSE_FORMAT_OPTIONS.find((candidate) => candidate.value === format);
+  return [
+    "<b>Response formatting</b>",
+    `<b>Current:</b> <code>${escapeHTML(formatTelegramResponseFormatLabel(format))}</code>`,
+    option ? `<b>Behavior:</b> ${escapeHTML(option.description)}` : undefined,
+    "",
+    `<b>Fallback chain:</b> <code>${escapeHTML(formatResponseFallbackChain(format))}</code>`,
+    "<code>/formatting rich-message</code> · <code>/formatting markdown</code> · <code>/formatting html</code> · <code>/formatting plain</code>",
+  ]
+    .filter((line): line is string => line !== undefined)
+    .join("\n");
+}
+
+function formatResponseFallbackChain(format: TelegramResponseFormat): string {
+  if (format === "rich-message") {
+    return "HTML -> MarkdownV2 -> plain";
+  }
+  if (format === "markdown") {
+    return "MarkdownV2 -> HTML -> plain";
+  }
+  if (format === "html") {
+    return "HTML -> plain";
+  }
+  if (format === "plain") {
+    return "plain";
+  }
+  return "HTML -> plain";
+}
+
+function normalizeFormattingCommandArg(raw: string): string {
+  const value = raw.trim().toLowerCase();
+  if (value === "richmessage" || value === "rich") {
+    return "rich-message";
+  }
+  if (value === "markdown-v2" || value === "markdownv2" || value === "md" || value === "mdv2") {
+    return "markdown";
+  }
+  return value;
+}
+
+function buildPrettyButtons(current: TelegramPrettyMode): KeyboardItem[] {
+  return TELEGRAM_PRETTY_MODE_OPTIONS.map((option) => ({
+    label: option.value === current ? `${option.label} ✓` : option.label,
+    callbackData: `pretty_${option.value}`,
+  }));
+}
+
+function renderPrettyStatusPlain(mode: TelegramPrettyMode): string {
+  const option = TELEGRAM_PRETTY_MODE_OPTIONS.find((candidate) => candidate.value === mode);
+  return [
+    "Pretty normalization",
+    `Current: ${formatTelegramPrettyModeLabel(mode)}`,
+    option ? `Behavior: ${option.description}` : undefined,
+    "",
+    "Compatibility shell only. It does not change response rendering.",
+    "Use /formatting to choose Telegram-supported normalization.",
+    "Commands: /pretty on, /pretty off, /pretty once, /pretty status",
+  ]
+    .filter((line): line is string => line !== undefined)
+    .join("\n");
+}
+
+function renderPrettyStatusHTML(mode: TelegramPrettyMode): string {
+  const option = TELEGRAM_PRETTY_MODE_OPTIONS.find((candidate) => candidate.value === mode);
+  return [
+    "<b>Pretty normalization</b>",
+    `<b>Current:</b> <code>${escapeHTML(formatTelegramPrettyModeLabel(mode))}</code>`,
+    option ? `<b>Behavior:</b> ${escapeHTML(option.description)}` : undefined,
+    "",
+    "Compatibility shell only. It does not change response rendering.",
+    "Use <code>/formatting</code> to choose Telegram-supported normalization.",
+    "<code>/pretty on</code> · <code>/pretty off</code> · <code>/pretty once</code> · <code>/pretty status</code>",
+  ]
+    .filter((line): line is string => line !== undefined)
+    .join("\n");
 }
 
 function renderCompactStatusPlain(info: CodexSessionInfo): string {
@@ -4089,7 +4868,15 @@ function summarizeUserInputForChannel(userInput: CodexPromptInput): string {
 }
 
 function summarizePromptForLog(userInput: CodexPromptInput): string {
-  return truncateForChannelHeader(summarizeUserInputForChannel(userInput), 120);
+  if (typeof userInput === "string") {
+    return `type=text chars=${userInput.length}`;
+  }
+
+  const textChars = (userInput.text?.length ?? 0) + (userInput.stagedFileInstructions?.length ?? 0);
+  const imageCount = userInput.imagePaths?.length ?? 0;
+  return [`type=mixed`, `chars=${textChars}`, imageCount > 0 ? `images=${imageCount}` : undefined]
+    .filter((part): part is string => Boolean(part))
+    .join(" ");
 }
 
 function truncateForChannelHeader(text: string, maxLength: number): string {
@@ -4098,6 +4885,11 @@ function truncateForChannelHeader(text: string, maxLength: number): string {
   }
 
   return `${text.slice(0, maxLength - 1)}…`;
+}
+
+function redactLogId(value: string | number): string {
+  const digest = createHash("sha256").update(String(value)).digest("hex").slice(0, 10);
+  return `id:${digest}`;
 }
 
 function renderLaunchSummaryPlain(info: CodexSessionInfo): string {
@@ -4153,6 +4945,34 @@ async function warnUnknownSlashInput(ctx: Context, text: string): Promise<void> 
 
 function isSlashPathLike(text: string): boolean {
   return /^\/(?:home|tmp|var|workspace|mnt|opt|usr|etc|srv|root|Users)\//.test(text) || /^\/[^@\s]+(?:\/|\.)/.test(text);
+}
+
+function addReplyContext(ctx: Context, prompt: string): string {
+  const quoted = extractReplyContextText(ctx);
+  if (!quoted) {
+    return prompt;
+  }
+
+  const prefix = `[Replying to: "${quoted}"]`;
+  return prompt.trim() ? `${prefix}\n\n${prompt}` : prefix;
+}
+
+function extractReplyContextText(ctx: Context): string | undefined {
+  const reply = ctx.message?.reply_to_message;
+  const rawText = reply?.text ?? reply?.caption;
+  if (!rawText) {
+    return undefined;
+  }
+
+  const cleaned = sanitizeReplyContext(rawText);
+  return cleaned ? trimLine(cleaned, REPLY_CONTEXT_LIMIT) : undefined;
+}
+
+function sanitizeReplyContext(text: string): string {
+  return text
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function renderToolStartMessage(toolName: string): RenderedText {
@@ -4826,6 +5646,34 @@ async function sendTextMessage(
   }
 }
 
+async function sendRichMessage(
+  api: Context["api"],
+  chatId: TelegramChatId,
+  candidates: RichMessageCandidate[],
+  options: TextOptions = {},
+): Promise<{ message_id: number }> {
+  let lastParseError: unknown;
+
+  for (const candidate of candidates) {
+    const text = candidate.text || " ";
+    try {
+      return await api.sendMessage(chatId, text, {
+        ...(candidate.parseMode ? { parse_mode: candidate.parseMode } : {}),
+        ...(options.messageThreadId ? { message_thread_id: options.messageThreadId } : {}),
+        reply_markup: options.replyMarkup,
+      });
+    } catch (error) {
+      if (isTelegramParseError(error)) {
+        lastParseError = error;
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  throw lastParseError ?? new Error("No Telegram rich message candidate could be sent");
+}
+
 function getServiceInstanceName(): string {
   return getCurrentServiceInstanceName();
 }
@@ -4865,28 +5713,100 @@ async function safeEditMessage(
   messageId: number,
   text: string,
   options: TextOptions = {},
-): Promise<void> {
+): Promise<number> {
   const parseMode = Object.prototype.hasOwnProperty.call(options, "parseMode") ? options.parseMode : "HTML";
+  const chunks = splitTelegramText(text);
+  const fallbackChunks = options.fallbackText ? splitTelegramText(options.fallbackText) : [];
+  const firstChunk = chunks[0] ?? "";
+  const firstFallback = fallbackChunks[0] ?? firstChunk;
 
   try {
-    await bot.api.editMessageText(chatId, messageId, text, {
+    await bot.api.editMessageText(chatId, messageId, firstChunk, {
       ...(parseMode ? { parse_mode: parseMode } : {}),
       reply_markup: options.replyMarkup,
     });
   } catch (error) {
     if (isMessageNotModifiedError(error)) {
-      return;
+      return messageId;
     }
 
     if (parseMode && options.fallbackText !== undefined && isTelegramParseError(error)) {
-      await bot.api.editMessageText(chatId, messageId, options.fallbackText, {
+      await bot.api.editMessageText(chatId, messageId, firstFallback, {
         reply_markup: options.replyMarkup,
       });
+    } else {
+      throw error;
+    }
+  }
+
+  let lastMessageId = messageId;
+  for (const [index, chunk] of chunks.slice(1).entries()) {
+    const sent = await sendTextMessage(bot.api, chatId, chunk, {
+      parseMode,
+      fallbackText: fallbackChunks[index + 1] ?? chunk,
+      messageThreadId: options.messageThreadId,
+    });
+    lastMessageId = sent.message_id;
+  }
+
+  return lastMessageId;
+}
+
+async function editRichMessage(
+  bot: Bot<Context>,
+  chatId: TelegramChatId,
+  messageId: number,
+  candidates: RichMessageCandidate[],
+  options: TextOptions = {},
+): Promise<number> {
+  let lastParseError: unknown;
+
+  for (const candidate of candidates) {
+    const text = candidate.text || " ";
+    try {
+      await bot.api.editMessageText(chatId, messageId, text, {
+        ...(candidate.parseMode ? { parse_mode: candidate.parseMode } : {}),
+        reply_markup: options.replyMarkup,
+      });
+      return messageId;
+    } catch (error) {
+      if (isMessageNotModifiedError(error)) {
+        return messageId;
+      }
+      if (isTelegramParseError(error)) {
+        lastParseError = error;
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  throw lastParseError ?? new Error("No Telegram rich message candidate could be edited");
+}
+
+async function sendTelegramDraft(
+  api: Context["api"],
+  chatId: number,
+  draftId: number,
+  chunk: RenderedChunk,
+): Promise<void> {
+  const parseMode = chunk.parseMode;
+  try {
+    await api.sendMessageDraft(chatId, draftId, chunk.text || chunk.fallbackText, {
+      ...(parseMode ? { parse_mode: parseMode } : {}),
+    });
+  } catch (error) {
+    if (parseMode && isTelegramParseError(error)) {
+      await api.sendMessageDraft(chatId, draftId, chunk.fallbackText);
       return;
     }
-
     throw error;
   }
+}
+
+function buildTelegramDraftId(updateId: number): number {
+  const draftId = Math.abs(Math.trunc(updateId));
+  return draftId > 0 ? draftId : 1;
 }
 
 async function downloadTelegramFile(
@@ -4967,6 +5887,31 @@ function splitMarkdownForTelegram(markdown: string): RenderedChunk[] {
   return chunks;
 }
 
+function splitRichMarkdownForTelegram(
+  markdown: string,
+  format: TelegramResponseFormat,
+  pretty = false,
+): RichRenderedChunk[] {
+  if (!markdown) {
+    return [];
+  }
+
+  const chunks: RichRenderedChunk[] = [];
+  let remaining = markdown;
+
+  while (remaining) {
+    const maxLength = Math.min(remaining.length, FORMATTED_CHUNK_TARGET);
+    const initialCut = findPreferredSplitIndex(remaining, maxLength);
+    const candidate = remaining.slice(0, initialCut) || remaining.slice(0, 1);
+    const rendered = renderRichMarkdownChunkWithinLimit(candidate, format, pretty);
+
+    chunks.push(rendered);
+    remaining = remaining.slice(rendered.sourceText.length).trimStart();
+  }
+
+  return chunks;
+}
+
 function renderMarkdownChunkWithinLimit(markdown: string): RenderedChunk {
   if (!markdown) {
     return {
@@ -4990,6 +5935,37 @@ function renderMarkdownChunkWithinLimit(markdown: string): RenderedChunk {
     ...rendered,
     sourceText,
   };
+}
+
+function renderRichMarkdownChunkWithinLimit(
+  markdown: string,
+  format: TelegramResponseFormat,
+  pretty: boolean,
+): RichRenderedChunk {
+  if (!markdown) {
+    return {
+      sourceText: "",
+      candidates: [],
+    };
+  }
+
+  let sourceText = markdown;
+  let candidates = renderRichMessageCandidates(sourceText, format, { pretty });
+
+  while (maxRichCandidateLength(candidates) > TELEGRAM_MESSAGE_LIMIT && sourceText.length > 1) {
+    const nextLength = Math.max(1, sourceText.length - Math.max(100, Math.ceil(sourceText.length * 0.1)));
+    sourceText = sourceText.slice(0, nextLength).trimEnd() || sourceText.slice(0, nextLength);
+    candidates = renderRichMessageCandidates(sourceText, format, { pretty });
+  }
+
+  return {
+    sourceText,
+    candidates,
+  };
+}
+
+function maxRichCandidateLength(candidates: RichMessageCandidate[]): number {
+  return candidates.reduce((maxLength, candidate) => Math.max(maxLength, candidate.text.length), 0);
 }
 
 function renderStreamingMarkdownChunkWithinLimit(markdown: string): RenderedChunk {
@@ -5207,6 +6183,15 @@ function formatRelativeTime(date: Date): string {
 function isMessageNotModifiedError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return message.includes("message is not modified");
+}
+
+function isMessageToDeleteNotFoundError(error: unknown): boolean {
+  const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  return (
+    message.includes("message to delete not found") ||
+    message.includes("message can't be deleted") ||
+    message.includes("message identifier is not specified")
+  );
 }
 
 function isTelegramParseError(error: unknown): boolean {

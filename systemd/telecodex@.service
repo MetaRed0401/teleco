@@ -8,9 +8,8 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=%h/telecodex
 Environment=NODE_ENV=production
-Environment=TELECODEX_INSTANCE=%i
 EnvironmentFile=%h/telecodex/.env.%i
-ExecStart=/usr/bin/env node dist/index.js
+ExecStart=/usr/bin/env TELECODEX_INSTANCE=%i node dist/index.js
 Restart=on-failure
 RestartSec=5
 KillSignal=SIGTERM

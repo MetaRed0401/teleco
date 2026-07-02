@@ -9,6 +9,8 @@ Docker provides two variants with the same TeleCodex app behavior:
 - `Dockerfile` + `docker-compose.yml`: normal image with Node, pnpm, Codex CLI, and required runtime dependencies.
 - `Dockerfile.local` + `docker-compose.local.yml`: operator image with the brew-parity toolset used in this environment.
 
+Both variants pin Codex CLI to the supported 0.142.5 baseline by default. Override `CODEX_CLI_VERSION` only when you have tested the target Codex app-server version with TeleCodex.
+
 Use the normal image by default:
 
 ```bash
@@ -34,6 +36,8 @@ TELECODEX_CONTAINER_WORKSPACE=/workspace
 Inside Docker, TeleCodex uses `TELECODEX_WORKSPACE` when set, otherwise `/workspace`.
 The local compose file defaults `TELECODEX_WORKSPACE_DIR` to `${HOME}` so Codex can see the host home directory. Set `TELECODEX_WORKSPACE_DIR` explicitly when you want a narrower mount.
 Compose mounts the Codex home directory but masks `/home/telecodex/.codex/auth.json` with `.telecodex/docker-empty-auth.json`. This keeps sessions, skills, plugins, memories, sqlite state, and other local Codex assets available while hiding the host auth file.
+
+Use explicit absolute host paths for workspaces in production. If the host is behind a proxy, pass the relevant `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, or platform-specific proxy variables into the container before starting TeleCodex.
 
 ## Tool Layer
 

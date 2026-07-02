@@ -13,7 +13,10 @@ import {
   type CodexSandboxMode,
 } from "./codex-launch.js";
 
-export type ToolVerbosity = "all" | "summary" | "errors-only" | "none";
+export type ToolVerbosity = "all" | "new" | "summary" | "errors-only" | "none";
+export type ResponsePreviewMode = "off" | "edit" | "draft";
+export type ToolActivityMode = "off" | "compact" | "verbose" | "errors-only";
+export type FinalResponseMode = "send" | "edit";
 
 export interface TeleCodexConfig {
   telegramBotToken: string;
@@ -30,9 +33,13 @@ export interface TeleCodexConfig {
   defaultLaunchProfileId: string;
   enableUnsafeLaunchProfiles: boolean;
   toolVerbosity: ToolVerbosity;
+  responsePreviewMode: ResponsePreviewMode;
+  toolActivityMode: ToolActivityMode;
+  finalResponseMode: FinalResponseMode;
   showTurnTokenUsage: boolean;
   enableTelegramLogin: boolean;
   enableTelegramReactions: boolean;
+  enableTelegramDraftStreaming: boolean;
   telegramReactionProcessingEmoji?: string;
   telegramReactionSuccessEmoji?: string;
   telegramReactionFailureEmoji?: string;
@@ -73,11 +80,21 @@ export function loadConfig(): TeleCodexConfig {
     launchProfiles,
   );
   const toolVerbosity = parseToolVerbosity(optionalString(process.env.TOOL_VERBOSITY));
+  const responsePreviewMode = parseResponsePreviewMode(optionalString(process.env.RESPONSE_PREVIEW_MODE));
+  const toolActivityMode = parseToolActivityMode(
+    optionalString(process.env.TOOL_ACTIVITY_MODE),
+    optionalString(process.env.TOOL_VERBOSITY),
+  );
+  const finalResponseMode = parseFinalResponseMode(optionalString(process.env.FINAL_RESPONSE_MODE));
   const showTurnTokenUsage = parseBooleanEnv(optionalString(process.env.SHOW_TURN_TOKEN_USAGE), false);
   const enableTelegramLogin = parseBooleanEnv(optionalString(process.env.ENABLE_TELEGRAM_LOGIN), true);
   const enableTelegramReactions = parseBooleanEnv(
     optionalString(process.env.ENABLE_TELEGRAM_REACTIONS),
     false,
+  );
+  const enableTelegramDraftStreaming = parseBooleanEnv(
+    optionalString(process.env.ENABLE_TELEGRAM_DRAFT_STREAMING),
+    true,
   );
   const telegramReactionProcessingEmoji = parseOptionalEmojiEnv(
     optionalString(process.env.TELEGRAM_REACTION_PROCESSING_EMOJI),
@@ -107,7 +124,7 @@ export function loadConfig(): TeleCodexConfig {
   );
   const autoCompactAfterCodexAutoCompact = parseBooleanEnv(
     optionalString(process.env.AUTO_COMPACT_AFTER_CODEX_AUTO_COMPACT),
-    true,
+    false,
   );
   const autoCompactAfterEveryTurn = parseBooleanEnv(
     optionalString(process.env.AUTO_COMPACT_AFTER_EVERY_TURN),
@@ -139,9 +156,13 @@ export function loadConfig(): TeleCodexConfig {
     defaultLaunchProfileId,
     enableUnsafeLaunchProfiles,
     toolVerbosity,
+    responsePreviewMode,
+    toolActivityMode,
+    finalResponseMode,
     showTurnTokenUsage,
     enableTelegramLogin,
     enableTelegramReactions,
+    enableTelegramDraftStreaming,
     telegramReactionProcessingEmoji,
     telegramReactionSuccessEmoji,
     telegramReactionFailureEmoji,
@@ -375,15 +396,87 @@ function parseToolVerbosity(raw: string | undefined): ToolVerbosity {
 
   switch (raw) {
     case "all":
+    case "new":
     case "summary":
     case "errors-only":
     case "none":
       return raw;
     default:
       console.warn(
-        `Invalid TOOL_VERBOSITY value: "${raw}". Expected one of: all, summary, errors-only, none. Falling back to "summary".`,
+        `Invalid TOOL_VERBOSITY value: "${raw}". Expected one of: all, new, summary, errors-only, none. Falling back to "summary".`,
       );
       return "summary";
+  }
+}
+
+function parseResponsePreviewMode(raw: string | undefined): ResponsePreviewMode {
+  if (!raw) {
+    return "off";
+  }
+
+  switch (raw) {
+    case "off":
+    case "edit":
+    case "draft":
+      return raw;
+    default:
+      console.warn(
+        `Invalid RESPONSE_PREVIEW_MODE value: "${raw}". Expected one of: off, edit, draft. Falling back to "off".`,
+      );
+      return "off";
+  }
+}
+
+function parseToolActivityMode(raw: string | undefined, legacyVerbosityRaw?: string): ToolActivityMode {
+  if (!raw) {
+    if (legacyVerbosityRaw) {
+      return toolVerbosityToActivityMode(parseToolVerbosity(legacyVerbosityRaw));
+    }
+    return "compact";
+  }
+
+  switch (raw) {
+    case "off":
+    case "compact":
+    case "verbose":
+    case "errors-only":
+      return raw;
+    default:
+      console.warn(
+        `Invalid TOOL_ACTIVITY_MODE value: "${raw}". Expected one of: off, compact, verbose, errors-only. Falling back to "compact".`,
+      );
+      return "compact";
+  }
+}
+
+function parseFinalResponseMode(raw: string | undefined): FinalResponseMode {
+  if (!raw) {
+    return "send";
+  }
+
+  switch (raw) {
+    case "send":
+    case "edit":
+      return raw;
+    default:
+      console.warn(
+        `Invalid FINAL_RESPONSE_MODE value: "${raw}". Expected one of: send, edit. Falling back to "send".`,
+      );
+      return "send";
+  }
+}
+
+function toolVerbosityToActivityMode(verbosity: ToolVerbosity): ToolActivityMode {
+  switch (verbosity) {
+    case "all":
+      return "verbose";
+    case "errors-only":
+      return "errors-only";
+    case "none":
+      return "off";
+    case "new":
+    case "summary":
+      return "compact";
   }
 }
 

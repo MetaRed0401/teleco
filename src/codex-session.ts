@@ -1146,12 +1146,19 @@ export class CodexSessionService {
             return;
           }
 
-          const turn = readRecord(params?.turn);
-          const status = readString(turn?.status);
-          controller.signal.removeEventListener("abort", onAbort);
-          done();
-          if (status === "failed") {
-            reject(new Error(readString(readRecord(turn?.error)?.message) ?? "Codex app-server turn failed."));
+      const turn = readRecord(params?.turn);
+      const status = readString(turn?.status);
+      controller.signal.removeEventListener("abort", onAbort);
+      done();
+      if (status === "failed") {
+            const turnError = readRecord(turn?.error);
+            reject(
+              new Error(
+                readString(turnError?.message) ??
+                  readString(turnError?.additionalDetails) ??
+                  "Codex app-server turn failed.",
+              ),
+            );
             return;
           }
           resolve();
@@ -1281,6 +1288,11 @@ export class CodexSessionService {
     callbacks: CodexSessionCallbacks,
   ): void {
     const params = readRecord(notification.params);
+    const notificationThreadId = readString(params?.threadId);
+    if (notificationThreadId && this.currentThreadId && notificationThreadId !== this.currentThreadId) {
+      return;
+    }
+
     switch (notification.method) {
       case "thread/started": {
         const threadId = readString(readRecord(params?.thread)?.id);
@@ -1399,8 +1411,34 @@ export class CodexSessionService {
       }
       case "turn/moderationMetadata":
         break;
-      case "turn/completed":
+      case "turn/completed": {
+        const turn = readRecord(params?.turn);
+        const status = readString(turn?.status);
+        const turnError = readRecord(turn?.error);
+        const message = readString(turnError?.message) ?? readString(turnError?.additionalDetails);
+        if ((status === "failed" || status === "interrupted") && message) {
+          const id = `app-server-turn-${status}-${Date.now()}`;
+          this.emitAppServerToolStart(callbacks, `app_server_turn_${status}`, id);
+          callbacks.onToolUpdate(id, message);
+          callbacks.onToolEnd(id, status === "failed");
+        }
         callbacks.onAgentEnd();
+        break;
+      }
+      case "thread/deleted": {
+        if (!notificationThreadId || notificationThreadId === this.currentThreadId) {
+          this.currentThreadId = null;
+          this.appServerThreadLoaded = false;
+          this.appServerCurrentTurnId = null;
+        }
+        break;
+      }
+      case "thread/status/changed":
+      case "thread/settings/updated":
+      case "turn/diff/updated":
+      case "turn/plan/updated":
+      case "account/rateLimits/updated":
+      case "mcp/server/status/updated":
         break;
       case "warning": {
         const message = readString(params?.message);

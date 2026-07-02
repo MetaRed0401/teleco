@@ -16,6 +16,10 @@ The app-server runtime is the primary path. It provides structured turn lifecycl
 
 The legacy SDK fallback is kept only as a compatibility path. New operation should use `ENABLE_CODEX_APP_SERVER_RUNTIME=true`.
 
+The supported Codex runtime baseline for this branch is 0.142.5. 0.143 alpha releases are outside this compatibility pass.
+
+TeleCodex keeps app-server handling conservative across Codex releases: known turn, tool, token usage, approval, compact, and rate-limit events are rendered; unknown MCP/plugin/status notifications are ignored unless they are useful and safe to show on mobile.
+
 ## Sessions and Instances
 
 TeleCodex keeps one active Codex thread per Telegram context. Private chats use the chat ID. Topic-aware contexts may include the topic ID.
@@ -32,7 +36,9 @@ Each instance should have its own Telegram token, routing settings, and optional
 
 ## Streaming and Tool Events
 
-Assistant text is streamed into Telegram messages. Tool activity is sent separately so mobile output does not become one large concatenated transcript.
+Assistant text is accumulated by default and sent once as the final response. Tool activity is sent separately so mobile output shows progress without repeatedly editing or replacing the final answer.
+
+`RESPONSE_PREVIEW_MODE` controls optional response previews: `off`, `edit`, or `draft`. The default is `off`. `TOOL_ACTIVITY_MODE` controls progress messages: `off`, `compact`, `verbose`, or `errors-only`. `FINAL_RESPONSE_MODE` controls whether the final answer is sent as a new message or edits an existing preview: `send` or `edit`. The `/streaming` command can override these values per Telegram context without editing `.env`.
 
 Tool events are derived from app-server item notifications:
 
@@ -43,7 +49,9 @@ Tool events are derived from app-server item notifications:
 - context compaction
 - warnings and errors
 
-`TOOL_VERBOSITY` controls how much detail is sent.
+`TOOL_VERBOSITY` controls how much detail is sent. Use `summary` for the quietest mobile-friendly default, `new` to show tool start/end messages without streaming command output, and `all` only when live tool output is useful.
+
+Dynamic tools and MCP servers are discovered by Codex at runtime. Do not assume the first tool list is exhaustive, and do not treat plugin/catalog metadata as user-visible unless TeleCodex explicitly formats it.
 
 ## Approval Bridge
 
@@ -76,3 +84,9 @@ Codex turns run in the background so Telegram can continue processing updates. `
 Incoming prompts are queued while a turn or compact is running. The next queued prompt starts after the current operation completes.
 
 Service updates are guarded by `.telecodex/service-update.lock`. In multi-instance mode, update, restart, and stop actions require an explicit instance or `--all` to avoid touching the wrong bot.
+
+## Time, Paths, And Proxies
+
+Telegram-facing operational messages should prefer explicit timestamps and workspace paths because mobile users may return to a session much later. Relative wording is fine for compact labels, but recovery and status messages should include enough absolute context to resume.
+
+When running through Docker, launchd, systemd, or a remote executor, prefer runtime-provided absolute paths over manual path assembly. Behind PAC/WPAD/static proxies, set proxy environment variables for the service/container before starting Codex app-server.

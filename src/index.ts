@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { createBot, registerCommands } from "./bot.js";
 import { markInterruptedOperations, type ActiveOperationRecord } from "./active-operations.js";
 import { checkAuthStatus } from "./codex-auth.js";
@@ -6,6 +8,7 @@ import { loadConfig, type TeleCodexConfig } from "./config.js";
 import { escapeHTML } from "./format.js";
 import { consumeServiceOperationMarkers, type ServiceOperationMarker } from "./service-operation-marker.js";
 import { SessionRegistry } from "./session-registry.js";
+import { installRuntimeFileLogger } from "./runtime-log.js";
 
 let registry: SessionRegistry | undefined;
 let bot: ReturnType<typeof createBot> | undefined;
@@ -13,11 +16,15 @@ let config: TeleCodexConfig | undefined;
 
 try {
   config = loadConfig();
+  const runtimeLogPath = installRuntimeFileLogger(config);
   registry = new SessionRegistry(config);
   bot = createBot(config, registry);
   await registerCommands(bot);
 
   console.log("TeleCodex running");
+  if (runtimeLogPath) {
+    console.log(`Runtime file log: ${runtimeLogPath}`);
+  }
   const authStatus = await checkAuthStatus(config.codexApiKey);
   console.log(`Auth: ${authStatus.authenticated ? "authenticated" : "not authenticated"} (${authStatus.method})`);
   if (!authStatus.authenticated) {
@@ -141,7 +148,7 @@ async function notifyLifecycle(event: "started" | "stopping", signal?: NodeJS.Si
       await withTimeout(bot.api.sendMessage(chatId, message, { parse_mode: "HTML" }), 1500);
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
-      console.warn(`Failed to send lifecycle notification to ${chatId}: ${detail}`);
+      console.warn(`Failed to send lifecycle notification to ${redactLogId(chatId)}: ${detail}`);
     }
   }
 }
@@ -168,7 +175,7 @@ async function notifyInterruptedOperations(): Promise<void> {
       );
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
-      console.warn(`Failed to send interrupted operation notification to ${operation.chatId}: ${detail}`);
+      console.warn(`Failed to send interrupted operation notification to ${redactLogId(operation.chatId)}: ${detail}`);
     }
   }
 }
@@ -191,7 +198,7 @@ async function notifyServiceOperationRecovery(): Promise<void> {
       );
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
-      console.warn(`Failed to send service operation recovery notification to ${marker.chatId}: ${detail}`);
+      console.warn(`Failed to send service operation recovery notification to ${redactLogId(marker.chatId)}: ${detail}`);
     }
   }
 }
@@ -211,6 +218,11 @@ function renderServiceOperationRecoveryMessage(marker: ServiceOperationMarker): 
   ]
     .filter((line): line is string => Boolean(line))
     .join("\n");
+}
+
+function redactLogId(value: string | number): string {
+  const digest = createHash("sha256").update(String(value)).digest("hex").slice(0, 10);
+  return `id:${digest}`;
 }
 
 function renderInterruptedOperationMessage(operation: ActiveOperationRecord): string {

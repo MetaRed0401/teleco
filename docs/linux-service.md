@@ -69,6 +69,15 @@ scripts/telecodex-service.sh restart first
 scripts/telecodex-service.sh stop first
 ```
 
+If the user journal is unavailable, TeleCodex also writes an instance log under the active workspace:
+
+```text
+.telecodex/service.log
+.telecodex/<instance>/service.log
+```
+
+`telecodex-service logs <instance>` follows journal logs when available and falls back to this file log otherwise.
+
 Use `--all` only when you intend to affect every configured instance:
 
 ```bash

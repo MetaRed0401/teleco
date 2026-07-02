@@ -25,8 +25,8 @@ Recommended shape:
 
 ```json
 [
-  { "contextKey": "123456789", "chatId": "-1001111111111" },
-  { "contextKey": "123456789:42", "chatId": "-1002222222222" }
+  { "contextKey": "<private-chat-id>", "chatId": "-100<channel-id>" },
+  { "contextKey": "<private-chat-id>:<topic-id>", "chatId": "-100<channel-id>" }
 ]
 ```
 
