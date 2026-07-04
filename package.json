@@ -4,7 +4,7 @@
   "description": "Telegram bridge for the OpenAI Codex CLI SDK",
   "license": "MIT",
   "author": "Benedict Evert",
-  "packageManager": "pnpm@11.5.3",
+  "packageManager": "pnpm@11.9.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/benedict2310/telecodex"

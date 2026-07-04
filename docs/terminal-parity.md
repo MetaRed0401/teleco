@@ -66,8 +66,9 @@ TeleCodex uses a two-stage compact flow for better terminal parity:
 
 Telegram command behavior:
 
-- `/compact` runs both compact stages for the active thread.
-- `/compact status` shows the current thread, workspace, launch profile, model, and compact availability.
+- `/compact` opens a compact control panel with status and run buttons.
+- `/compact run` runs both compact stages for the active thread.
+- `/status` shows the current thread, workspace, launch profile, model, compact state, and context information.
 - `/compact preview` is not supported because the native protocol exposes a start endpoint, not a preview-only endpoint.
 
 The thread id is preserved. Incoming Telegram prompts are queued while compact is running.

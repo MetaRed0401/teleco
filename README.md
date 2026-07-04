@@ -17,7 +17,7 @@ This project is derived from [benedict2310/telecodex](https://github.com/benedic
 - Run multiple isolated bot instances from one source checkout using separate `.env.*` files.
 - Run as a Linux user systemd service with lifecycle notifications and service update commands.
 - Mirror final Codex responses to a configured Telegram channel when needed.
-- Use launch profiles to switch Codex model, sandbox, approval policy, and reasoning level.
+- Use Telegram commands to switch Codex model, sandbox, approval policy, and reasoning level.
 - Choose Telegram output behavior with `/streaming` and `/formatting`.
 
 ## Requirements
@@ -78,7 +78,7 @@ Common settings:
 - `TELEGRAM_BOT_TOKEN`: Telegram bot token from `@BotFather`.
 - `TELEGRAM_ALLOWED_USER_IDS`: comma-separated list of Telegram users allowed to control the bot.
 - `TELEGRAM_CHANNEL_ID`: optional channel or supergroup chat ID for copied final replies.
-- `CODEX_MODEL`: default Codex model slug.
+- `CODEX_MODEL`: legacy fallback model slug. Prefer `/model` in Telegram for runtime model selection.
 - `CODEX_SANDBOX_MODE`: `read-only`, `workspace-write`, or `danger-full-access`.
 - `CODEX_APPROVAL_POLICY`: `never`, `on-request`, `on-failure`, or `untrusted`.
 - `CODEX_DEFAULT_LAUNCH_PROFILE`: default launch profile ID.
@@ -86,6 +86,7 @@ Common settings:
 - `RESPONSE_PREVIEW_MODE`: `off`, `edit`, or `draft`. Default is `off`; use `/streaming` to override per Telegram context.
 - `TOOL_ACTIVITY_MODE`: `off`, `compact`, `verbose`, or `errors-only`. Default is `compact`; use `/streaming` to override per Telegram context.
 - `FINAL_RESPONSE_MODE`: `send` or `edit`. Default is `send`; use `/streaming` to override per Telegram context.
+- `TOOL_DIFF_PREVIEW_TTL_MINUTES`: minutes to keep persisted `Show diff` previews under `.telecodex/tool-diffs.sqlite`; default is `4320` minutes, or 3 days.
 - `TOOL_VERBOSITY`: legacy fallback for tool activity. Prefer `TOOL_ACTIVITY_MODE`.
 - `ENABLE_LIFECYCLE_NOTIFICATIONS`: sends start and stop notifications.
 - `ENABLE_TELEGRAM_LOGIN`: enables `/login` and `/logout` from Telegram.
@@ -205,8 +206,8 @@ When `.env.*` files exist, commands that can affect running services require eit
 | `/status` | Show session, model, profile, queue, and workspace status. |
 | `/doctor` | Check the service runtime environment, PATH, tools, git/auth state, and approval bridge support. |
 | `/locks` | Show known Git and TeleCodex runtime lock files without removing them. |
-| `/compact` | Run two-stage context compaction for the current thread. |
-| `/compact status` | Show compact availability and current context information. |
+| `/compact` | Show compact controls with run/status buttons. |
+| `/compact run` | Run two-stage context compaction for the current thread. |
 | `/stop` | Abort the active Codex turn as quickly as possible. |
 | `/retry` | Retry the last prompt. |
 | `/steer <prompt>` | Send steering instructions into the active Codex turn. |
@@ -217,21 +218,20 @@ When `.env.*` files exist, commands that can affect running services require eit
 | `/think <level>` | Set the reasoning level directly. |
 | `/model` | Show available model controls. |
 | `/model <slug>` | Set the Codex model. |
-| `/launch_profiles` | Show launch profiles. |
-| `/launch <profile>` | Apply a launch profile. |
+| `/permission` | Show and select runtime permission profiles. |
 | `/auth` | Show authentication status. |
 | `/login` | Start Telegram-driven Codex login when enabled. |
 | `/logout` | Clear Telegram-driven login state when enabled. |
-| `/voice` | Toggle voice input handling. |
-| `/attach` | Show attachment guidance. |
-| `/handback` | Show handback guidance for continuing locally. |
+| `/voice` | Show voice transcription backend status. |
+| `/attach <thread-id>` | Attach the current Telegram context to a Codex thread. |
+| `/handback` | Hand the active thread back to Codex CLI and print a resume command. |
 | `/files [path]` | List files under a workspace path. |
 | `/tree [path]` | Show a workspace tree. |
 | `/find <query>` | Find files by name. |
 | `/view <path>` | Read a workspace file. |
 | `/grep <query>` | Search text in the workspace. |
 | `/update` | Trigger a service update for the current instance. |
-| `/service_update` | Alias for `/update`. |
+| `/restart` | Trigger a service restart for the current instance. |
 
 Plain text messages are sent to Codex as prompts. Replying to a bot message keeps the conversation attached to the same Telegram context.
 
@@ -275,7 +275,7 @@ Incoming Telegram prompts are queued while compact is running.
 
 ## Launch Profiles and Safety
 
-Launch profiles let you switch Codex behavior without editing `.env` each time. Profiles can define model, sandbox mode, approval policy, reasoning level, and a safety policy.
+Launch profiles let you switch Codex permission behavior without editing `.env` each time. Use `/model` and `/think` for model and reasoning selection.
 
 Built-in profiles include normal workspace-write operation and safer read-only/review modes. The `Restrict` and `Full` profiles use `danger-full-access` and are hidden unless `ENABLE_UNSAFE_LAUNCH_PROFILES=true`.
 
@@ -303,6 +303,8 @@ plain: plain
 `TOOL_VERBOSITY` remains as a legacy fallback. Prefer `TOOL_ACTIVITY_MODE` in `.env` and `/streaming` in Telegram.
 
 Long shell commands are formatted as code blocks when possible. File changes, shell usage, and other tool summaries are labeled so they are easier to scan in Telegram.
+
+File-change diff previews are stored as bounded SQLite cache entries so `Show diff` buttons can survive service restarts until `TOOL_DIFF_PREVIEW_TTL_MINUTES` expires. Single-instance mode stores them in `.telecodex/tool-diffs.sqlite`; named multi-bot instances store them under `.telecodex/<instance>/tool-diffs.sqlite`.
 
 See `docs/runtime-architecture.md` and `docs/terminal-parity.md` for the deeper runtime model and the remaining differences from an interactive Codex terminal session.
 
@@ -351,5 +353,7 @@ When running behind a system proxy, configure proxy variables for both the conta
 ## Security Notes
 
 Teleco can give a Telegram account remote access to Codex running on your machine. Keep the bot private, restrict `TELEGRAM_ALLOWED_USER_IDS`, avoid committing secrets, and be careful with `danger-full-access` profiles.
+
+`Show diff` previews may contain source snippets or generated content. They are stored only under `.telecodex/` with a bounded TTL, but treat that runtime directory as sensitive.
 
 Before publishing or opening a pull request, check that no `.env`, `.telecodex/`, Codex auth files, Telegram IDs, API keys, or personal workspace paths are staged. For a clean public branch, squash local work into a single reviewable commit before pushing to `MetaRed0401/teleco`.

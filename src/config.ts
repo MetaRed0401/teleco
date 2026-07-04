@@ -51,6 +51,7 @@ export interface TeleCodexConfig {
   autoCompactAfterEveryTurn: boolean;
   autoCompactCooldownTurns: number;
   autoCompactCooldownMinutes: number;
+  toolDiffPreviewTtlMinutes: number;
 }
 
 export function loadConfig(): TeleCodexConfig {
@@ -140,6 +141,11 @@ export function loadConfig(): TeleCodexConfig {
     10,
     "AUTO_COMPACT_COOLDOWN_MINUTES",
   );
+  const toolDiffPreviewTtlMinutes = parseIntegerEnv(
+    optionalString(process.env.TOOL_DIFF_PREVIEW_TTL_MINUTES),
+    4320,
+    "TOOL_DIFF_PREVIEW_TTL_MINUTES",
+  );
 
   return {
     telegramBotToken,
@@ -174,6 +180,7 @@ export function loadConfig(): TeleCodexConfig {
     autoCompactAfterEveryTurn,
     autoCompactCooldownTurns,
     autoCompactCooldownMinutes,
+    toolDiffPreviewTtlMinutes,
   };
 }
 

@@ -38,7 +38,16 @@ coverage/
 .env.*
 !.env.example
 
-tmp
+tmp/
+*.tmp
+*.temp
+*.log
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.bak
+*.backup
 
 # Local task notes
 [Tt][Oo][Dd][Oo]*

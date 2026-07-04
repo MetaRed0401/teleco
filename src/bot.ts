@@ -73,6 +73,7 @@ import {
   type TelegramPrettyMode,
   type TelegramResponseFormat,
 } from "./telegram-formatting.js";
+import { ToolDiffPreviewStore } from "./tool-diff-store.js";
 import { getAvailableBackends, transcribeAudio } from "./voice.js";
 import {
   findWorkspaceFiles,
@@ -135,7 +136,9 @@ type SessionWorkspaceGroup = {
 
 type ToolState = {
   toolName: string;
+  toolCallId: string;
   partialResult: string;
+  diffPreview?: string;
   messageId?: number;
   finalStatus?: RenderedText;
   lastUpdateMs?: number;
@@ -158,6 +161,7 @@ type TextOptions = {
   fallbackText?: string;
   replyMarkup?: InlineKeyboard;
   messageThreadId?: number;
+  replyToMessageId?: number;
 };
 
 type RenderedText = {
@@ -198,6 +202,7 @@ function paginateKeyboard(items: KeyboardItem[], page: number, prefix: string): 
       keyboard.text("Next ▶️", `${prefix}_page_${currentPage + 1}`);
     }
   }
+  keyboard.row().text("Cancel", "ui_cancel");
 
   return keyboard;
 }
@@ -206,6 +211,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   const bot = new Bot<Context>(config.telegramBotToken);
   bot.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 10 }));
   const instanceName = process.env.TELECODEX_INSTANCE?.trim() || "default";
+  const toolDiffPreviewStore = new ToolDiffPreviewStore(config);
 
   const contextBusy = new Map<
     TelegramContextKey,
@@ -330,6 +336,62 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     await safeReply(ctx, escapeHTML("Still working on previous message. Use /queue <prompt> to run something next."), {
       fallbackText: "Still working on previous message. Use /queue <prompt> to run something next.",
     });
+  };
+
+  const buildConfirmKeyboard = (action: "logout" | "restart" | "update"): InlineKeyboard => {
+    const label =
+      action === "logout" ? "Confirm logout" : action === "restart" ? "Confirm restart" : "Confirm update";
+    return new InlineKeyboard().text(label, `confirm_${action}`).row().text("Cancel", "ui_cancel");
+  };
+
+  const sendConfirmPanel = async (
+    ctx: Context,
+    action: "logout" | "restart" | "update",
+    lines: { html: string[]; plain: string[] },
+  ): Promise<void> => {
+    await safeReply(ctx, lines.html.join("\n"), {
+      fallbackText: lines.plain.join("\n"),
+      replyMarkup: buildConfirmKeyboard(action),
+    });
+  };
+
+  const trySteerActiveTurn = async (
+    ctx: Context,
+    session: CodexSessionService,
+    input: CodexPromptInput,
+  ): Promise<"steered" | "unavailable" | "failed"> => {
+    if (!session.canSteer()) {
+      return "unavailable";
+    }
+
+    try {
+      await session.steer(input);
+      const summary = summarizeUserInputForChannel(input);
+      await safeReply(
+        ctx,
+        [
+          "<b>Steered into active turn.</b>",
+          "Codex will consider it before the next tool/action when possible.",
+          "",
+          `<code>${escapeHTML(summary)}</code>`,
+        ].join("\n"),
+        {
+          fallbackText: [
+            "Steered into active turn.",
+            "Codex will consider it before the next tool/action when possible.",
+            "",
+            summary,
+          ].join("\n"),
+        },
+      );
+      return "steered";
+    } catch (error) {
+      const message = friendlyErrorText(error);
+      await safeReply(ctx, `<b>Steer failed:</b> <code>${escapeHTML(message)}</code>`, {
+        fallbackText: `Steer failed: ${message}`,
+      });
+      return "failed";
+    }
   };
 
   const getPromptQueue = (contextKey: TelegramContextKey): QueuedPrompt[] => {
@@ -966,6 +1028,34 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       state.lastUpdateMs = Date.now();
     };
 
+    const createToolDiffReplyMarkup = (state: ToolState): InlineKeyboard | undefined => {
+      const diffPreview = state.diffPreview?.trim();
+      if (state.toolName !== "file_change" || !diffPreview) {
+        return undefined;
+      }
+
+      const info = session.getInfo();
+      const previewId = toolDiffPreviewStore.store({
+        contextKey,
+        threadId: info.threadId ?? undefined,
+        chatId,
+        messageThreadId,
+        toolCallId: state.toolCallId,
+        toolName: state.toolName,
+        payload: {
+          summary: state.partialResult.trim() || undefined,
+          diffText: diffPreview,
+          source: "unknown",
+          truncated: diffPreview.includes("truncated") || diffPreview.includes("omitted"),
+          limits: {
+            maxLines: 160,
+            maxChars: 3500,
+          },
+        },
+      });
+      return new InlineKeyboard().text("Show diff", `tooldiff_${previewId}`);
+    };
+
     const hasResponseBody = (): boolean => accumulatedText.trim().length > 0;
 
     const renderPreview = (): RenderedChunk => {
@@ -990,7 +1080,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const buildFinalResponseText = (text: string): string => {
       const trimmedText = text.trim();
       const usageLine =
-        config.showTurnTokenUsage && lastTurnUsage ? formatTurnUsageLine(lastTurnUsage) : "";
+        config.showTurnTokenUsage && lastTurnUsage
+          ? formatTurnUsageLine(lastTurnUsage, session.getInfo().contextWindow)
+          : "";
 
       if (toolVerbosity === "summary") {
         const footerLines = [formatToolSummaryLine(toolCounts), usageLine].filter((line): line is string => Boolean(line));
@@ -1396,8 +1488,13 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
           return;
         }
 
-        toolStates.set(toolCallId, { toolName, partialResult: "", lastUpdateMs: Date.now() });
+        toolStates.set(toolCallId, { toolName, toolCallId, partialResult: "", lastUpdateMs: Date.now() });
         if (toolVerbosity !== "all" && toolVerbosity !== "new") {
+          void commitAssistantSegmentAtToolBoundary(toolName);
+          return;
+        }
+
+        if (shouldDelayToolStartMessage(toolName)) {
           void commitAssistantSegmentAtToolBoundary(toolName);
           return;
         }
@@ -1432,13 +1529,18 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
           console.error(`Failed to send tool start message for ${toolName}`, error);
         });
       },
-      onToolUpdate: (toolCallId: string, partialResult: string) => {
+      onToolUpdate: (toolCallId: string, partialResult: string, metadata) => {
         if (toolVerbosity === "none" || toolVerbosity === "summary" || toolVerbosity === "new") {
           return;
         }
 
         const state = toolStates.get(toolCallId);
         if (!state || !partialResult) {
+          return;
+        }
+
+        if (metadata?.kind === "diff") {
+          state.diffPreview = appendWithCap(state.diffPreview ?? "", partialResult, 3500);
           return;
         }
 
@@ -1458,6 +1560,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         clearToolUpdateTimer(toolCallId);
 
         state.finalStatus = renderToolEndMessage(state.toolName, state.partialResult, isError);
+        const finalReplyMarkup = createToolDiffReplyMarkup(state);
         if (toolVerbosity === "errors-only") {
           if (!isError) {
             return;
@@ -1466,6 +1569,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
           void sendTextMessage(bot.api, chatId, state.finalStatus.text, {
             parseMode: state.finalStatus.parseMode,
             fallbackText: state.finalStatus.fallbackText,
+            replyMarkup: finalReplyMarkup,
             messageThreadId,
           }).catch((error) => {
             console.error(`Failed to send tool error message for ${state.toolName}`, error);
@@ -1474,10 +1578,20 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         }
 
         if (!state.messageId) {
+          if (shouldSendFinalToolMessageWithoutStart(state.toolName, state.partialResult, state.diffPreview, isError)) {
+            void sendTextMessage(bot.api, chatId, state.finalStatus.text, {
+              parseMode: state.finalStatus.parseMode,
+              fallbackText: state.finalStatus.fallbackText,
+              replyMarkup: finalReplyMarkup,
+              messageThreadId,
+            }).catch((error) => {
+              console.error(`Failed to send delayed tool final message for ${state.toolName}`, error);
+            });
+          }
           return;
         }
 
-        if (toolActivityMode === "compact" && !isError) {
+        if (toolActivityMode === "compact" && !isError && state.toolName !== "context_compaction") {
           void bot.api.deleteMessage(chatId, state.messageId).catch(() => undefined);
           return;
         }
@@ -1485,6 +1599,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         void safeEditMessage(bot, chatId, state.messageId, state.finalStatus.text, {
           parseMode: state.finalStatus.parseMode,
           fallbackText: state.finalStatus.fallbackText,
+          replyMarkup: finalReplyMarkup,
           messageThreadId,
         }).catch((error) => {
           console.error(`Failed to update tool message for ${state.toolName}`, error);
@@ -1753,7 +1868,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     await safeReply(ctx, html, { fallbackText: plain });
   });
 
-  bot.command("status", async (ctx) => {
+  const sendStatusReply = async (ctx: Context): Promise<void> => {
     const contextSession = await getContextSession(ctx, { deferThreadStart: true });
     if (!contextSession) {
       return;
@@ -1794,6 +1909,134 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
 
     await safeReply(ctx, htmlLines.join("\n"), { fallbackText: plainLines.join("\n") });
+  };
+
+  const startCompactForContext = async (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    session: CodexSessionService,
+  ): Promise<void> => {
+    const busyState = getBusyState(contextKey);
+    if (session.isProcessing() || busyState.processing) {
+      await safeReply(ctx, "Cannot compact while a Codex turn is running. Use /stop first if needed.", {
+        fallbackText: "Cannot compact while a Codex turn is running. Use /stop first if needed.",
+      });
+      return;
+    }
+
+    void (async () => {
+      await runTwoStageCompact(ctx, contextKey, session, { sendStepUpdates: true });
+    })().catch((error) => {
+      console.error("Compact failed:", error);
+    });
+  };
+
+  const sendCompactPanel = async (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    session: CodexSessionService,
+  ): Promise<void> => {
+    const busyState = getBusyState(contextKey);
+    const rendered = renderCompactControlPanel(session.getInfo(), busyState.compacting ? "running" : "ready");
+    await safeReply(ctx, rendered.html, {
+      fallbackText: rendered.plain,
+      replyMarkup: buildCompactControlKeyboard(),
+    });
+  };
+
+  const runTelegramLogout = async (ctx: Context): Promise<void> => {
+    const result = await startLogout();
+    if (result.success) {
+      await safeReply(ctx, `<b>🔓 Logged out.</b>\n\n${escapeHTML(result.message)}`, {
+        fallbackText: `🔓 Logged out.\n\n${result.message}`,
+      });
+      return;
+    }
+
+    await safeReply(ctx, `<b>❌ Logout failed.</b>\n\n<code>${escapeHTML(result.message)}</code>`, {
+      fallbackText: `❌ Logout failed.\n\n${result.message}`,
+    });
+  };
+
+  const runServiceUpdateCommand = async (ctx: Context): Promise<void> => {
+    if (!ctx.chat) {
+      return;
+    }
+
+    try {
+      const instance = getServiceInstanceName();
+      const marker = startServiceOperationMarker(config, {
+        type: "update",
+        instance,
+        chatId: ctx.chat.id,
+        messageThreadId: ctx.message?.message_thread_id ?? ctx.callbackQuery?.message?.message_thread_id,
+      });
+      const launched = startServiceUpdate();
+      updateServiceOperationMarkerPid(config, instance, marker.id, launched.pid);
+      await safeReply(
+        ctx,
+        [
+          "<b>Service update launched.</b>",
+          `<b>Instance:</b> <code>${escapeHTML(instance)}</code>`,
+          launched.pid ? `<b>PID:</b> <code>${launched.pid}</code>` : undefined,
+          "",
+          "Running fire-and-forget. This bot may restart if the update succeeds.",
+        ]
+          .filter((line): line is string => line !== undefined)
+          .join("\n"),
+        {
+          fallbackText: [
+            "Service update launched.",
+            `Instance: ${instance}`,
+            launched.pid ? `PID: ${launched.pid}` : undefined,
+            "",
+            "Running fire-and-forget. This bot may restart if the update succeeds.",
+          ]
+            .filter((line): line is string => line !== undefined)
+            .join("\n"),
+        },
+      );
+    } catch (error) {
+      await safeReply(ctx, `<b>Service update failed to launch:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: `Service update failed to launch: ${friendlyErrorText(error)}`,
+      });
+    }
+  };
+
+  const runServiceRestartCommand = async (ctx: Context): Promise<void> => {
+    if (!ctx.chat) {
+      return;
+    }
+
+    const instance = getServiceInstanceName();
+    startServiceOperationMarker(config, {
+      type: "restart",
+      instance,
+      chatId: ctx.chat.id,
+      messageThreadId: ctx.message?.message_thread_id ?? ctx.callbackQuery?.message?.message_thread_id,
+    });
+    await safeReply(
+      ctx,
+      [
+        "<b>Service restart requested.</b>",
+        `<b>Instance:</b> <code>${escapeHTML(instance)}</code>`,
+        "",
+        "Restarting fire-and-forget. This command does not contact Codex app-server.",
+      ].join("\n"),
+      {
+        fallbackText: [
+          "Service restart requested.",
+          `Instance: ${instance}`,
+          "",
+          "Restarting fire-and-forget. This command does not contact Codex app-server.",
+        ].join("\n"),
+      },
+    );
+    scheduleServiceRestart();
+  };
+
+  bot.command("status", async (ctx) => {
+    await sendStatusReply(ctx);
   });
 
   bot.command("doctor", async (ctx) => {
@@ -1858,13 +2101,17 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
 
     const { contextKey, session } = contextSession;
-    const info = session.getInfo();
     const arg = commandArgs(ctx, "compact").toLowerCase();
 
     if (arg === "status") {
-      await safeReply(ctx, renderCompactStatusHTML(info), {
-        fallbackText: renderCompactStatusPlain(info),
+      await safeReply(ctx, "Compact status is included in /status.", {
+        fallbackText: "Compact status is included in /status.",
       });
+      return;
+    }
+
+    if (arg === "") {
+      await sendCompactPanel(ctx, contextKey, session);
       return;
     }
 
@@ -1887,19 +2134,14 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return;
     }
 
-    const busyState = getBusyState(contextKey);
-    if (session.isProcessing() || busyState.processing) {
-      await safeReply(ctx, "Cannot compact while a Codex turn is running. Use /stop first if needed.", {
-        fallbackText: "Cannot compact while a Codex turn is running. Use /stop first if needed.",
+    if (arg !== "run" && arg !== "now") {
+      await safeReply(ctx, "Unknown compact option. Use /status or /compact run.", {
+        fallbackText: "Unknown compact option. Use /status or /compact run.",
       });
       return;
     }
 
-    void (async () => {
-      await runTwoStageCompact(ctx, contextKey, session, { sendStepUpdates: true });
-    })().catch((error) => {
-      console.error("Compact failed:", error);
-    });
+    await startCompactForContext(ctx, contextKey, session);
   });
 
   bot.command("login", async (ctx) => {
@@ -1994,16 +2236,15 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return;
     }
 
-    const result = await startLogout();
-    if (result.success) {
-      await safeReply(ctx, `<b>🔓 Logged out.</b>\n\n${escapeHTML(result.message)}`, {
-        fallbackText: `🔓 Logged out.\n\n${result.message}`,
-      });
-      return;
-    }
-
-    await safeReply(ctx, `<b>❌ Logout failed.</b>\n\n<code>${escapeHTML(result.message)}</code>`, {
-      fallbackText: `❌ Logout failed.\n\n${result.message}`,
+    await sendConfirmPanel(ctx, "logout", {
+      html: [
+        "<b>Confirm logout?</b>",
+        "This signs out the Codex CLI auth used by this service.",
+      ],
+      plain: [
+        "Confirm logout?",
+        "This signs out the Codex CLI auth used by this service.",
+      ],
     });
   });
 
@@ -2046,44 +2287,19 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return;
     }
 
-    try {
-      const instance = getServiceInstanceName();
-      const marker = startServiceOperationMarker(config, {
-        type: "update",
-        instance,
-        chatId: ctx.chat.id,
-        messageThreadId: ctx.message?.message_thread_id,
-      });
-      const launched = startServiceUpdate();
-      updateServiceOperationMarkerPid(config, instance, marker.id, launched.pid);
-      await safeReply(
-        ctx,
-        [
-          "<b>Service update launched.</b>",
-          `<b>Instance:</b> <code>${escapeHTML(instance)}</code>`,
-          launched.pid ? `<b>PID:</b> <code>${launched.pid}</code>` : undefined,
-          "",
-          "Running fire-and-forget. This bot may restart if the update succeeds.",
-        ]
-          .filter((line): line is string => line !== undefined)
-          .join("\n"),
-        {
-          fallbackText: [
-            "Service update launched.",
-            `Instance: ${instance}`,
-            launched.pid ? `PID: ${launched.pid}` : undefined,
-            "",
-            "Running fire-and-forget. This bot may restart if the update succeeds.",
-          ]
-            .filter((line): line is string => line !== undefined)
-            .join("\n"),
-        },
-      );
-    } catch (error) {
-      await safeReply(ctx, `<b>Service update failed to launch:</b> ${escapeHTML(friendlyErrorText(error))}`, {
-        fallbackText: `Service update failed to launch: ${friendlyErrorText(error)}`,
-      });
-    }
+    const instance = getServiceInstanceName();
+    await sendConfirmPanel(ctx, "update", {
+      html: [
+        "<b>Confirm service update?</b>",
+        `<b>Instance:</b> <code>${escapeHTML(instance)}</code>`,
+        "This installs dependencies, builds, and may restart this bot.",
+      ],
+      plain: [
+        "Confirm service update?",
+        `Instance: ${instance}`,
+        "This installs dependencies, builds, and may restart this bot.",
+      ],
+    });
   });
 
   bot.command(["restart", "force_restart", "service_restart"], async (ctx) => {
@@ -2092,30 +2308,18 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
 
     const instance = getServiceInstanceName();
-    startServiceOperationMarker(config, {
-      type: "restart",
-      instance,
-      chatId: ctx.chat.id,
-      messageThreadId: ctx.message?.message_thread_id,
-    });
-    await safeReply(
-      ctx,
-      [
-        "<b>Service restart requested.</b>",
+    await sendConfirmPanel(ctx, "restart", {
+      html: [
+        "<b>Confirm service restart?</b>",
         `<b>Instance:</b> <code>${escapeHTML(instance)}</code>`,
-        "",
-        "Restarting fire-and-forget. This command does not contact Codex app-server.",
-      ].join("\n"),
-      {
-        fallbackText: [
-          "Service restart requested.",
-          `Instance: ${instance}`,
-          "",
-          "Restarting fire-and-forget. This command does not contact Codex app-server.",
-        ].join("\n"),
-      },
-    );
-    scheduleServiceRestart();
+        "This is fire-and-forget and does not contact Codex app-server.",
+      ],
+      plain: [
+        "Confirm service restart?",
+        `Instance: ${instance}`,
+        "This is fire-and-forget and does not contact Codex app-server.",
+      ],
+    });
   });
 
   const getWorkspaceForCommand = async (ctx: Context): Promise<string | null> => {
@@ -2199,6 +2403,13 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     if (!workspace) return;
 
     const parsed = parseQueryAndPath(commandArgs(ctx, "find"));
+    if (!parsed.query) {
+      await safeReply(ctx, "Usage: /find <query> [path]", {
+        fallbackText: "Usage: /find <query> [path]",
+        replyMarkup: new InlineKeyboard().text("Files", "cmd_files").text("Cancel", "ui_cancel"),
+      });
+      return;
+    }
     try {
       const result = await findWorkspaceFiles(workspace, parsed.query, parsed.pathArg || ".");
       const lines = [
@@ -2221,6 +2432,13 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     if (!workspace) return;
 
     const parsed = parseQueryAndPath(commandArgs(ctx, "search"));
+    if (!parsed.query) {
+      await safeReply(ctx, "Usage: /search <query> [path]", {
+        fallbackText: "Usage: /search <query> [path]",
+        replyMarkup: new InlineKeyboard().text("Files", "cmd_files").text("Cancel", "ui_cancel"),
+      });
+      return;
+    }
     try {
       const result = await searchWorkspaceFiles(workspace, parsed.query, parsed.pathArg || ".");
       const lines = [
@@ -2252,6 +2470,13 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
 
     const requestedPath = commandArgsAny(ctx, ["sendfile", "file", "download"]);
+    if (!requestedPath) {
+      await safeReply(ctx, "Usage: /sendfile <path>\nTip: use /search <query> first if you do not know the path.", {
+        fallbackText: "Usage: /sendfile <path>\nTip: use /search <query> first if you do not know the path.",
+        replyMarkup: new InlineKeyboard().text("Search files", "cmd_search_help").row().text("Cancel", "ui_cancel"),
+      });
+      return;
+    }
     try {
       const file = await resolveWorkspaceFileForSend(workspace, requestedPath, config.maxFileSize);
       await ctx.api.sendChatAction(chatId, "upload_document", {
@@ -2273,6 +2498,13 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     if (!workspace) return;
 
     const parsed = parseQueryAndPath(commandArgs(ctx, "grep"));
+    if (!parsed.query) {
+      await safeReply(ctx, "Usage: /grep <text> [path]", {
+        fallbackText: "Usage: /grep <text> [path]",
+        replyMarkup: new InlineKeyboard().text("Files", "cmd_files").text("Cancel", "ui_cancel"),
+      });
+      return;
+    }
     try {
       const result = await grepWorkspaceText(workspace, parsed.query, parsed.pathArg || ".");
       const lines = [
@@ -2297,6 +2529,13 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     if (!workspace) return;
 
     const parsed = parseViewArgs(commandArgs(ctx, "view"));
+    if (!parsed.pathArg) {
+      await safeReply(ctx, "Usage: /view <path> [start:end]\nTip: use /sendfile <path> to receive a file attachment.", {
+        fallbackText: "Usage: /view <path> [start:end]\nTip: use /sendfile <path> to receive a file attachment.",
+        replyMarkup: new InlineKeyboard().text("Files", "cmd_files").text("Search", "cmd_search_help").row().text("Cancel", "ui_cancel"),
+      });
+      return;
+    }
     try {
       const result = await readWorkspaceFile(workspace, parsed.pathArg, parsed.range);
       const header = `${result.relativePath}:${result.startLine}-${result.endLine}/${result.totalLines}`;
@@ -2508,18 +2747,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return;
     }
 
-    try {
-      await session.steer(userInput);
-      await safeReply(ctx, `<b>Steer sent to active turn.</b>\n<code>${escapeHTML(truncateForChannelHeader(userInput.replace(/\s+/g, " ").trim(), 160))}</code>`, {
-        fallbackText: `Steer sent to active turn.\n${truncateForChannelHeader(userInput.replace(/\s+/g, " ").trim(), 160)}`,
-      });
-    } catch (error) {
-      const message = friendlyErrorText(error);
-      await safeReply(ctx, `<b>Steer failed:</b> <code>${escapeHTML(message)}</code>`, {
-        fallbackText: `Steer failed: ${message}`,
-      });
-      return;
-    }
+    await trySteerActiveTurn(ctx, session, userInput);
   });
 
   bot.command(["ask", "prompt"], async (ctx) => {
@@ -2857,8 +3085,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const threadId = rawText.replace(/^\/attach(?:@\w+)?\s*/, "").trim();
 
     if (!threadId) {
-      await safeReply(ctx, escapeHTML("Usage: /attach <thread-id>"), {
-        fallbackText: "Usage: /attach <thread-id>",
+      const text = "Usage: /attach <thread-id>\nTip: use /sessions to browse recent threads and switch with buttons.";
+      await safeReply(ctx, escapeHTML(text), {
+        fallbackText: text,
+        replyMarkup: new InlineKeyboard().text("Browse sessions", "cmd_sessions").row().text("Cancel", "ui_cancel"),
       });
       return;
     }
@@ -2994,7 +3224,33 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return;
     }
 
-    const currentModel = session.getInfo().model ?? "(default)";
+    const requestedModel = commandArgs(ctx, "model");
+    if (requestedModel) {
+      if (!models.some((model) => model.slug === requestedModel)) {
+        const slugs = models.map((model) => model.slug).join("|");
+        const plainText = `Usage: /model ${slugs}`;
+        await safeReply(ctx, `<code>${escapeHTML(plainText)}</code>`, { fallbackText: plainText });
+        return;
+      }
+
+      try {
+        const model = session.setModel(requestedModel);
+        updateSessionMetadata(contextKey, session);
+        const html = `<b>Model set to</b> <code>${escapeHTML(model)}</code> — applies to new threads.`;
+        const plainText = `Model set to ${model} — applies to new threads.`;
+        await safeReply(ctx, html, { fallbackText: plainText });
+      } catch (error) {
+        const message = friendlyErrorText(error);
+        await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(message)}`, { fallbackText: `Failed: ${message}` });
+      }
+      return;
+    }
+
+    const statusDetails = await session.getStatusDetails();
+    const info = session.getInfo();
+    const runtimeModel = statusDetails.config?.model;
+    const currentModel = runtimeModel ?? info.model ?? "(default)";
+    const modelSource = runtimeModel ? "Codex runtime" : info.model ? "TeleCodex session" : "model default";
     const modelButtons = models.map((model) => ({
       label: `${model.displayName}${model.slug === currentModel ? " ✓" : ""}`,
       callbackData: `model_${model.slug}`,
@@ -3004,9 +3260,14 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     await safeReply(
       ctx,
-      [`<b>Current model:</b> <code>${escapeHTML(currentModel)}</code>`, "", "Select a model for new threads:"].join("\n"),
+      [
+        `<b>Current model:</b> <code>${escapeHTML(currentModel)}</code>`,
+        `<b>Source:</b> <code>${escapeHTML(modelSource)}</code>`,
+        "",
+        "Select a model for new threads:",
+      ].join("\n"),
       {
-        fallbackText: [`Current model: ${currentModel}`, "", "Select a model for new threads:"].join("\n"),
+        fallbackText: [`Current model: ${currentModel}`, `Source: ${modelSource}`, "", "Select a model for new threads:"].join("\n"),
         replyMarkup: keyboard,
       },
     );
@@ -3284,7 +3545,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       .row()
       .text("Tool activity", "streaming_category_tool")
       .row()
-      .text("Final response", "streaming_category_final");
+      .text("Final response", "streaming_category_final")
+      .row()
+      .text("Cancel", "ui_cancel");
   };
 
   const buildStreamingCategoryKeyboard = (
@@ -3297,7 +3560,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       .forEach((button) => {
         keyboard.text(button.label, button.callbackData).row();
       });
-    keyboard.text("← Streaming settings", "streaming_back");
+    keyboard.text("← Streaming settings", "streaming_back").row().text("Cancel", "ui_cancel");
     return keyboard;
   };
 
@@ -3389,6 +3652,135 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   bot.callbackQuery(NOOP_PAGE_CALLBACK_DATA, async (ctx) => {
     await ctx.answerCallbackQuery();
   });
+
+  bot.callbackQuery("ui_cancel", async (ctx) => {
+    const chatId = ctx.chat?.id;
+    const messageId = ctx.callbackQuery.message?.message_id;
+    await ctx.answerCallbackQuery({ text: "Closed" });
+    if (!chatId || !messageId) {
+      return;
+    }
+    await safeEditMessage(bot, chatId, messageId, "<b>Closed.</b>", {
+      fallbackText: "Closed.",
+      messageThreadId: ctx.callbackQuery.message?.message_thread_id,
+    });
+  });
+
+  bot.callbackQuery(/^confirm_(logout|restart|update)$/, async (ctx) => {
+    const action = ctx.match?.[1];
+    if (!action) {
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: `Confirmed ${action}` });
+    if (action === "logout") {
+      await runTelegramLogout(ctx);
+      return;
+    }
+    if (action === "update") {
+      await runServiceUpdateCommand(ctx);
+      return;
+    }
+    await runServiceRestartCommand(ctx);
+  });
+
+  bot.callbackQuery(/^cmd_(files|sessions|search_help)$/, async (ctx) => {
+    const action = ctx.match?.[1];
+    await ctx.answerCallbackQuery();
+    if (action === "files") {
+      await safeReply(ctx, "Run /files to browse the workspace.", {
+        fallbackText: "Run /files to browse the workspace.",
+      });
+      return;
+    }
+    if (action === "sessions") {
+      await safeReply(ctx, "Run /sessions to browse recent Codex threads.", {
+        fallbackText: "Run /sessions to browse recent Codex threads.",
+      });
+      return;
+    }
+    await safeReply(ctx, "Run /search <query> to find files, then /sendfile <path> or /view <path>.", {
+      fallbackText: "Run /search <query> to find files, then /sendfile <path> or /view <path>.",
+    });
+  });
+
+  bot.callbackQuery(/^compact_(run|status|cancel)$/, async (ctx) => {
+    const action = ctx.match?.[1];
+    const chatId = ctx.chat?.id;
+    const messageId = ctx.callbackQuery.message?.message_id;
+
+    if (!action) {
+      return;
+    }
+
+    if (action === "cancel") {
+      await ctx.answerCallbackQuery({ text: "Cancelled" });
+      if (chatId && messageId) {
+        await safeEditMessage(bot, chatId, messageId, "<b>Compact cancelled.</b>", {
+          fallbackText: "Compact cancelled.",
+          messageThreadId: ctx.callbackQuery.message?.message_thread_id,
+        });
+      }
+      return;
+    }
+
+    if (action === "status") {
+      await ctx.answerCallbackQuery({ text: "Opening status" });
+      await sendStatusReply(ctx);
+      return;
+    }
+
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      await ctx.answerCallbackQuery({ text: "No active context" });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: "Starting compact" });
+    await startCompactForContext(ctx, contextSession.contextKey, contextSession.session);
+  });
+
+  bot.callbackQuery(/^tooldiff_([a-f0-9]+)$/, async (ctx) => {
+    const previewId = ctx.match?.[1];
+    const chatId = ctx.chat?.id;
+    const contextKey = contextKeyFromCtx(ctx);
+    const messageThreadId = ctx.callbackQuery.message?.message_thread_id;
+    const replyToMessageId = ctx.callbackQuery.message?.message_id;
+    const payload =
+      previewId && chatId !== undefined && contextKey
+        ? toolDiffPreviewStore.lookup({
+            id: previewId,
+            contextKey,
+            chatId,
+            messageThreadId,
+          })
+        : undefined;
+    if (!previewId || chatId === undefined || !contextKey || !payload) {
+      await ctx.answerCallbackQuery({ text: "Diff preview expired" });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: "Sending diff preview" });
+    const rendered = renderToolDiffPreview(payload.diffText);
+    try {
+      await sendTextMessage(bot.api, chatId, rendered.text, {
+        parseMode: rendered.parseMode,
+        fallbackText: rendered.fallbackText,
+        messageThreadId,
+        replyToMessageId,
+      });
+    } catch (error) {
+      if (!replyToMessageId) {
+        throw error;
+      }
+      await sendTextMessage(bot.api, chatId, rendered.text, {
+        parseMode: rendered.parseMode,
+        fallbackText: rendered.fallbackText,
+        messageThreadId,
+      });
+    }
+  });
+
   handlePageCallback(/^sess_page_(\d+)$/, "sess", pendingSessionButtons, "Expired, run /sessions again");
   handlePageCallback(/^sessws_page_(\d+)$/, "sessws", pendingSessionWorkspaceButtons, "Expired, run /sessions again");
   handlePageCallback(/^ws_page_(\d+)$/, "ws", pendingWorkspaceButtons, "Expired, run /new again");
@@ -4116,7 +4508,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const { contextKey, session } = contextSession;
     const promptText = addReplyContext(ctx, userText);
-    if (getBusyState(contextKey).compacting) {
+    const busyState = getBusyState(contextKey);
+    if (busyState.compacting) {
       const queued = enqueuePrompt(contextKey, ctx, ctx.chat.id, promptText);
       if (!queued) {
         await safeReply(ctx, escapeHTML(`Queue is full (${MAX_PROMPT_QUEUE_SIZE}/${MAX_PROMPT_QUEUE_SIZE}).`), {
@@ -4129,6 +4522,15 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       await safeReply(ctx, `<b>Queued during compact #${queued.id}</b> position <code>${position}</code>`, {
         fallbackText: `Queued during compact #${queued.id} position ${position}`,
       });
+      return;
+    }
+
+    if (isBusy(contextKey)) {
+      const steerResult = await trySteerActiveTurn(ctx, session, promptText);
+      if (steerResult === "steered" || steerResult === "failed") {
+        return;
+      }
+      await sendBusyReply(ctx);
       return;
     }
 
@@ -4366,45 +4768,34 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "doctor", description: "Check runtime environment" },
     { command: "locks", description: "Show runtime lock files" },
     { command: "reconnect", description: "Reconnect Codex app-server" },
-    { command: "compact", description: "Compact current Codex context" },
+    { command: "compact", description: "Compact controls" },
     { command: "session", description: "Current thread details" },
     { command: "sessions", description: "Browse & switch threads" },
-    { command: "switch", description: "Switch to a thread by ID" },
     { command: "attach", description: "Bind a Codex thread to this topic" },
     { command: "handback", description: "Hand thread to Codex CLI" },
     { command: "retry", description: "Resend the last prompt" },
     { command: "queue", description: "Queue prompts for this context" },
     { command: "steer", description: "Steer the active Codex turn" },
     { command: "ask", description: "Send slash-looking text as prompt" },
-    { command: "prompt", description: "Alias for ask" },
-    { command: "abort", description: "Cancel current operation" },
     { command: "stop", description: "Cancel current operation" },
-    { command: "launch_profiles", description: "Select launch profile" },
     { command: "permission", description: "Change runtime permission profile" },
-    { command: "profile", description: "Alias for permission" },
     { command: "approvals", description: "List pending approvals" },
     { command: "model", description: "View & change model" },
     { command: "think", description: "Set thinking effort" },
     { command: "fast", description: "Toggle Codex fast mode" },
     { command: "formatting", description: "Select response formatting" },
-    { command: "pretty", description: "Normalize responses for Telegram" },
     { command: "streaming", description: "Configure Telegram streaming UX" },
     { command: "auth", description: "Check auth status" },
     { command: "login", description: "Start authentication" },
     { command: "logout", description: "Sign out" },
     { command: "voice", description: "Voice transcription status" },
     { command: "update", description: "Update current service instance" },
-    { command: "service_update", description: "Alias for update" },
     { command: "restart", description: "Restart current service" },
-    { command: "force_restart", description: "Alias for restart" },
-    { command: "service_restart", description: "Alias for restart" },
     { command: "files", description: "List workspace files" },
     { command: "tree", description: "Show workspace tree" },
     { command: "find", description: "Find workspace files" },
     { command: "search", description: "Search workspace files" },
     { command: "sendfile", description: "Send a workspace file" },
-    { command: "file", description: "Alias for sendfile" },
-    { command: "download", description: "Alias for sendfile" },
     { command: "view", description: "View a workspace file" },
     { command: "grep", description: "Search workspace text" },
   ]);
@@ -4616,38 +5007,42 @@ function renderPrettyStatusHTML(mode: TelegramPrettyMode): string {
     .join("\n");
 }
 
-function renderCompactStatusPlain(info: CodexSessionInfo): string {
-  return [
-    "Compact status",
-    `Thread ID: ${info.threadId ?? "(not started yet)"}`,
-    `Workspace: ${info.workspace}`,
-    `Launch profile: ${info.launchProfileLabel} (${info.launchProfileBehavior})${info.unsafeLaunch ? " [unsafe]" : ""}`,
-    `Model: ${info.model ?? "(default)"}`,
-    `Reasoning effort: ${info.reasoningEffort ?? "(default)"}`,
-    `Fast mode: ${formatFastModeValue(info)}`,
-    "",
-    "Step 1: app-server native compact",
-    "Step 2: Codex CLI PTY /compact",
-    "Preview: not available through native compact",
-    "Queue: incoming text is queued while compact is running",
-  ].join("\n");
+function buildCompactControlKeyboard(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("🗜️ Run compact", "compact_run")
+    .row()
+    .text("📊 Status", "compact_status")
+    .text("Cancel", "compact_cancel");
 }
 
-function renderCompactStatusHTML(info: CodexSessionInfo): string {
-  return [
-    "<b>Compact status</b>",
-    `<b>Thread ID:</b> <code>${escapeHTML(info.threadId ?? "(not started yet)")}</code>`,
+function renderCompactControlPanel(info: CodexSessionInfo, compactState: string): { html: string; plain: string } {
+  const htmlLines = [
+    "<b>Compact controls</b>",
+    `<b>Status:</b> <code>${escapeHTML(compactState)}</code>`,
+    `<b>Thread:</b> <code>${escapeHTML(info.threadId ?? "(not started yet)")}</code>`,
     `<b>Workspace:</b> <code>${escapeHTML(info.workspace)}</code>`,
-    `<b>Launch profile:</b> <code>${escapeHTML(`${info.launchProfileLabel} (${info.launchProfileBehavior})${info.unsafeLaunch ? " [unsafe]" : ""}`)}</code>`,
-    `<b>Model:</b> <code>${escapeHTML(info.model ?? "(default)")}</code>`,
-    `<b>Reasoning effort:</b> <code>${escapeHTML(info.reasoningEffort ?? "(default)")}</code>`,
-    `<b>Fast mode:</b> <code>${escapeHTML(formatFastModeValue(info))}</code>`,
+    info.contextWindow
+      ? `<b>Context:</b> <code>${escapeHTML(formatContextWindowValue(info.contextWindow))}</code>`
+      : "<b>Context:</b> <code>unknown</code>",
     "",
-    "<b>Step 1:</b> app-server native compact",
-    "<b>Step 2:</b> Codex CLI PTY <code>/compact</code>",
-    "<b>Preview:</b> not available through native compact",
-    "<b>Queue:</b> incoming text is queued while compact is running",
-  ].join("\n");
+    "Use the button below to run the two-stage compact flow.",
+    "Compact status lives in <code>/status</code>.",
+  ];
+  const plainLines = [
+    "Compact controls",
+    `Status: ${compactState}`,
+    `Thread: ${info.threadId ?? "(not started yet)"}`,
+    `Workspace: ${info.workspace}`,
+    info.contextWindow ? `Context: ${formatContextWindowValue(info.contextWindow)}` : "Context: unknown",
+    "",
+    "Use the button below to run the two-stage compact flow.",
+    "Compact status lives in /status.",
+  ];
+
+  return {
+    html: htmlLines.join("\n"),
+    plain: plainLines.join("\n"),
+  };
 }
 
 function renderSessionInfoPlain(info: CodexSessionInfo, instanceName?: string): string {
@@ -5004,14 +5399,27 @@ function renderToolRunningMessage(toolName: string, partialResult: string): Rend
   };
 }
 
+function renderToolDiffPreview(diffPreview: string): RenderedText {
+  const preview = limitToolDiffPreview(diffPreview);
+  return {
+    text: `<b>📝 Diff preview</b>\n<pre>${escapeHTML(preview)}</pre>`,
+    fallbackText: `📝 Diff preview\n\n\`\`\`diff\n${preview}\n\`\`\``,
+    parseMode: "HTML",
+  };
+}
+
 function renderToolEndMessage(toolName: string, partialResult: string, isError: boolean): RenderedText {
-  const preview = summarizeToolOutput(partialResult);
   const label = formatToolDisplayLabel(toolName);
-  const status = isError ? "Tool failed" : "Tool done";
-  const statusIcon = isError ? "❌" : "✅";
+  const preview = summarizeToolOutput(partialResult) || (label.kind === "file_change" && !isError ? "details unavailable" : "");
+  const status = formatToolCompletionStatus(label, isError);
   const detail = renderToolDetail(label);
-  const htmlLines = [`<b>${escapeHTML(statusIcon)} ${escapeHTML(status)}:</b> <code>${escapeHTML(label.kind)}</code>`, detail.html];
-  const plainLines = [`${statusIcon} ${status}: \`${label.kind}\``, detail.plain];
+  const htmlLines = [renderToolCompletionHeaderHTML(label, status)];
+  const plainLines = [renderToolCompletionHeaderPlain(label, status)];
+
+  if (label.kind !== "file_change" || (isError && !preview)) {
+    htmlLines.push(detail.html);
+    plainLines.push(detail.plain);
+  }
 
   if (preview) {
     htmlLines.push(`<pre>${escapeHTML(preview)}</pre>`);
@@ -5025,13 +5433,73 @@ function renderToolEndMessage(toolName: string, partialResult: string, isError: 
   };
 }
 
+function renderToolCompletionHeaderHTML(
+  label: { kind: string },
+  status: { icon: string; title: string },
+): string {
+  const kind = label.kind === "file_change" || label.kind === "compact" ? "" : ` <code>${escapeHTML(label.kind)}</code>`;
+  return `<b>${escapeHTML(status.icon)} ${escapeHTML(status.title)}:</b>${kind}`;
+}
+
+function renderToolCompletionHeaderPlain(
+  label: { kind: string },
+  status: { icon: string; title: string },
+): string {
+  const kind = label.kind === "file_change" || label.kind === "compact" ? "" : ` \`${label.kind}\``;
+  return `${status.icon} ${status.title}:${kind}`;
+}
+
+function formatToolCompletionStatus(
+  label: { kind: string },
+  isError: boolean,
+): { icon: string; title: string } {
+  if (isError) {
+    if (label.kind === "file_change") {
+      return { icon: "❌", title: "File change failed" };
+    }
+    if (label.kind === "bash") {
+      return { icon: "❌", title: "Shell failed" };
+    }
+    if (label.kind === "compact") {
+      return { icon: "❌", title: "Compact failed" };
+    }
+    if (label.kind === "mcp") {
+      return { icon: "❌", title: "MCP tool failed" };
+    }
+    if (label.kind === "dynamic") {
+      return { icon: "❌", title: "Dynamic tool failed" };
+    }
+    return { icon: "❌", title: "Tool failed" };
+  }
+
+  if (label.kind === "file_change") {
+    return { icon: "📝", title: "File changes applied" };
+  }
+  if (label.kind === "bash") {
+    return { icon: "✅", title: "Shell done" };
+  }
+  if (label.kind === "compact") {
+    return { icon: "🗜️", title: "Codex context compacted" };
+  }
+  if (label.kind === "mcp") {
+    return { icon: "✅", title: "MCP tool done" };
+  }
+  if (label.kind === "dynamic") {
+    return { icon: "✅", title: "Dynamic tool done" };
+  }
+  if (label.kind === "web_search") {
+    return { icon: "✅", title: "Web search done" };
+  }
+  return { icon: "✅", title: "Tool done" };
+}
+
 export function formatToolDisplayLabel(toolName: string): { icon: string; title: string; kind: string; detail: string } {
   if (toolName === "file_change") {
     return { icon: "📝", title: "File change", kind: "file_change", detail: "workspace edits" };
   }
 
   if (toolName === "context_compaction") {
-    return { icon: "🗜️", title: "Context compact", kind: "compact", detail: "conversation history compaction" };
+    return { icon: "🗜️", title: "Codex context compact", kind: "compact", detail: "Codex compacted the conversation context" };
   }
 
   if (toolName === "reasoning") {
@@ -5087,6 +5555,37 @@ function shouldRenderToolDetailBlock(label: { kind: string; detail: string }): b
   return label.kind === "bash" && (label.detail.length > 80 || label.detail.includes("\n"));
 }
 
+function limitToolDiffPreview(diffPreview: string): string {
+  const normalized = diffPreview.replace(/\r\n?/g, "\n").trim();
+  const maxLines = 160;
+  const maxChars = 3500;
+  const lines = normalized.split("\n");
+  let preview = lines.slice(0, maxLines).join("\n");
+  const omittedLines = Math.max(0, lines.length - maxLines);
+  if (preview.length > maxChars) {
+    preview = `${preview.slice(0, maxChars).trimEnd()}\n... truncated by character limit ...`;
+  } else if (omittedLines > 0) {
+    preview = `${preview}\n... ${omittedLines} more lines omitted ...`;
+  }
+  return preview || "No diff preview available.";
+}
+
+function shouldDelayToolStartMessage(toolName: string): boolean {
+  return toolName === "file_change";
+}
+
+function shouldSendFinalToolMessageWithoutStart(
+  toolName: string,
+  partialResult: string,
+  diffPreview: string | undefined,
+  isError: boolean,
+): boolean {
+  if (toolName !== "file_change") {
+    return false;
+  }
+  return true;
+}
+
 export function formatToolSummaryLine(toolCounts: Map<string, number>): string {
   if (toolCounts.size === 0) {
     return "";
@@ -5116,8 +5615,18 @@ function renderTodoList(items: Array<{ text: string; completed: boolean }>): str
   return `📋 <b>Plan</b>\n${lines.join("\n")}`;
 }
 
-export function formatTurnUsageLine(usage: { inputTokens: number; cachedInputTokens: number; outputTokens: number }): string {
-  return `🪙 in: ${usage.inputTokens} · cached: ${usage.cachedInputTokens} · out: ${usage.outputTokens}`;
+export function formatTurnUsageLine(
+  usage: { inputTokens: number; cachedInputTokens: number; outputTokens: number },
+  context?: ContextWindowSummary,
+): string {
+  const lines = [
+    `🪙 Turn: ${formatTokenCount(usage.inputTokens)} in · ${formatTokenCount(usage.outputTokens)} out · ${formatTokenCount(usage.cachedInputTokens)} cached`,
+  ];
+  const contextLine = formatContextWindowFooter(context);
+  if (contextLine) {
+    lines.push(`🧠 Context: ${contextLine}`);
+  }
+  return lines.join("\n");
 }
 
 export function summarizeToolName(toolName: string): string {
@@ -5194,6 +5703,15 @@ function formatContextWindowValue(context: ContextWindowSummary): string {
 
 function formatContextWindowPlain(context: ContextWindowSummary): string {
   return `Context usage: ${formatContextWindowValue(context)}`;
+}
+
+function formatContextWindowFooter(context: ContextWindowSummary | undefined): string | undefined {
+  if (!context || context.percentUsed === undefined) {
+    return undefined;
+  }
+
+  const leftPercent = Math.max(0, 100 - context.percentUsed);
+  return `${leftPercent}% left`;
 }
 
 function formatTokenCount(value: number): string {
@@ -5633,12 +6151,14 @@ async function sendTextMessage(
     return await api.sendMessage(chatId, text, {
       ...(parseMode ? { parse_mode: parseMode } : {}),
       ...(options.messageThreadId ? { message_thread_id: options.messageThreadId } : {}),
+      ...(options.replyToMessageId ? { reply_parameters: { message_id: options.replyToMessageId } } : {}),
       reply_markup: options.replyMarkup,
     });
   } catch (error) {
     if (parseMode && options.fallbackText !== undefined && isTelegramParseError(error)) {
       return await api.sendMessage(chatId, options.fallbackText, {
         ...(options.messageThreadId ? { message_thread_id: options.messageThreadId } : {}),
+        ...(options.replyToMessageId ? { reply_parameters: { message_id: options.replyToMessageId } } : {}),
         reply_markup: options.replyMarkup,
       });
     }

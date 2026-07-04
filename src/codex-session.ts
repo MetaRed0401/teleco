@@ -40,7 +40,7 @@ export type CodexApprovalResponse = { decision: "accept" | "acceptForSession" | 
 export interface CodexSessionCallbacks {
   onTextDelta: (delta: string, metadata?: { agentMessageId: string; startsNewMessage: boolean }) => void;
   onToolStart: (toolName: string, toolCallId: string) => void;
-  onToolUpdate: (toolCallId: string, partialResult: string) => void;
+  onToolUpdate: (toolCallId: string, partialResult: string, metadata?: { kind?: "output" | "diff" }) => void;
   onToolEnd: (toolCallId: string, isError: boolean) => void;
   onAgentEnd: () => void;
   onTodoUpdate?: (items: Array<{ text: string; completed: boolean }>) => void;
@@ -325,7 +325,7 @@ export class CodexSessionService {
         rateLimits: parseRateLimitStatus(rateLimitResponse),
       };
       details.config = parseConfigStatus(configResponse);
-      if (details.config?.model && !this.currentModel) {
+      if (details.config?.model) {
         this.currentModel = details.config.model;
       }
       if (details.config?.modelContextWindow) {
@@ -448,8 +448,12 @@ export class CodexSessionService {
             } else if (item.type === "file_change") {
               const toolId = item.id;
               const summary = item.changes.map((change) => `${change.kind} ${change.path}`).join(", ");
+              const diff = summarizeAppServerFileChangeDiff(item as unknown as Record<string, unknown>);
               callbacks.onToolStart("file_change", toolId);
               callbacks.onToolUpdate(toolId, summary);
+              if (diff) {
+                callbacks.onToolUpdate(toolId, diff, { kind: "diff" });
+              }
               callbacks.onToolEnd(toolId, item.status === "failed");
             } else if (item.type === "mcp_tool_call") {
               callbacks.onToolStart(`mcp:${item.server}/${item.tool}`, item.id);
@@ -1357,7 +1361,7 @@ export class CodexSessionService {
         const itemId = readString(params?.itemId);
         const delta = readString(params?.delta);
         if (itemId && delta) {
-          callbacks.onToolUpdate(itemId, delta);
+          callbacks.onToolUpdate(itemId, delta, { kind: "diff" });
         }
         break;
       }
@@ -1372,6 +1376,14 @@ export class CodexSessionService {
           }
           callbacks.onToolEnd(id, readString(item?.status) === "failed");
         } else if (type === "fileChange") {
+          const summary = summarizeAppServerFileChange(item);
+          const diff = summarizeAppServerFileChangeDiff(item);
+          if (summary) {
+            callbacks.onToolUpdate(id, summary);
+          }
+          if (diff) {
+            callbacks.onToolUpdate(id, diff, { kind: "diff" });
+          }
           callbacks.onToolEnd(id, readString(item?.status) === "failed");
         } else if (type === "mcpToolCall") {
           const error = readRecord(item?.error);
@@ -1708,6 +1720,206 @@ function summarizeUnknownValue(value: unknown): string | undefined {
   } catch {
     return String(value);
   }
+}
+
+function summarizeAppServerFileChange(item: Record<string, unknown> | undefined): string {
+  if (!item) {
+    return "";
+  }
+
+  const lines = new Set<string>();
+  collectFileChangeEntries(lines, item.changes);
+  collectFileChangeEntries(lines, item.files);
+  collectFileChangeEntries(lines, item.fileChanges);
+  collectFileChangeEntries(lines, item.edits);
+  collectFileChangeEntries(lines, item.operations);
+  collectFileChangeEntries(lines, item.modifiedFiles, "update");
+  collectFileChangeEntries(lines, item.createdFiles, "add");
+  collectFileChangeEntries(lines, item.deletedFiles, "remove");
+
+  const summary =
+    readString(item.summary) ??
+    readString(item.description) ??
+    readString(item.message) ??
+    readString(item.aggregatedOutput) ??
+    readString(item.output);
+  if (summary) {
+    addFileChangeSummaryText(lines, summary);
+  }
+
+  return [...lines].slice(0, 12).join("\n");
+}
+
+function summarizeAppServerFileChangeDiff(item: Record<string, unknown> | undefined): string {
+  if (!item) {
+    return "";
+  }
+
+  const diff =
+    readString(item.diff) ??
+    readString(item.patch) ??
+    readString(item.unifiedDiff) ??
+    readString(item.diffPreview) ??
+    collectNestedFileChangeDiff(item.changes) ??
+    collectNestedFileChangeDiff(item.files) ??
+    collectNestedFileChangeDiff(item.fileChanges) ??
+    collectNestedFileChangeDiff(item.edits) ??
+    collectNestedFileChangeDiff(item.operations);
+  return diff ? limitFileChangeDiffPreview(diff) : "";
+}
+
+function collectNestedFileChangeDiff(value: unknown): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+  if (typeof value === "string") {
+    return looksLikeDiff(value) ? value : undefined;
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      const diff = collectNestedFileChangeDiff(entry);
+      if (diff) {
+        return diff;
+      }
+    }
+    return undefined;
+  }
+
+  const record = readRecord(value);
+  if (!record) {
+    return undefined;
+  }
+
+  return (
+    readString(record.diff) ??
+    readString(record.patch) ??
+    readString(record.unifiedDiff) ??
+    readString(record.diffPreview) ??
+    collectNestedFileChangeDiff(record.changes) ??
+    collectNestedFileChangeDiff(record.files) ??
+    collectNestedFileChangeDiff(record.fileChanges) ??
+    collectNestedFileChangeDiff(record.edits)
+  );
+}
+
+function collectFileChangeEntries(lines: Set<string>, value: unknown, defaultKind = ""): void {
+  if (!value) {
+    return;
+  }
+
+  if (typeof value === "string") {
+    const line = defaultKind ? `${defaultKind} ${value}` : value;
+    addFileChangeSummaryText(lines, line);
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      collectFileChangeEntries(lines, entry, defaultKind);
+    }
+    return;
+  }
+
+  const record = readRecord(value);
+  if (!record) {
+    return;
+  }
+
+  const line = formatFileChangeRecord(record, defaultKind);
+  if (line) {
+    lines.add(line);
+    return;
+  }
+
+  collectFileChangeEntries(lines, record.changes);
+  collectFileChangeEntries(lines, record.files);
+  collectFileChangeEntries(lines, record.fileChanges);
+  collectFileChangeEntries(lines, record.edits);
+  collectFileChangeEntries(lines, record.operations);
+}
+
+function formatFileChangeRecord(record: Record<string, unknown>, defaultKind = ""): string {
+  const path =
+    readString(record.path) ??
+    readString(record.filePath) ??
+    readString(record.relativePath) ??
+    readString(record.name);
+  if (path) {
+    const kind =
+      readString(record.kind) ??
+      readString(record.action) ??
+      readString(record.changeType) ??
+      readString(record.status) ??
+      readString(record.type) ??
+      defaultKind;
+    return [normalizeFileChangeKind(kind), path].filter(Boolean).join(" ");
+  }
+
+  const summary = readString(record.summary) ?? readString(record.message) ?? readString(record.description);
+  return summary ? sanitizeFileChangeSummaryLine(summary) : "";
+}
+
+function addFileChangeSummaryText(lines: Set<string>, text: string): void {
+  for (const rawLine of text.split("\n")) {
+    const line = sanitizeFileChangeSummaryLine(rawLine);
+    if (line) {
+      lines.add(line);
+    }
+    if (lines.size >= 12) {
+      return;
+    }
+  }
+}
+
+function sanitizeFileChangeSummaryLine(line: string): string {
+  const trimmed = line.replace(/\s+/g, " ").trim();
+  if (!trimmed || trimmed === "workspace edits") {
+    return "";
+  }
+  if (trimmed.startsWith("@@") || trimmed.startsWith("diff --git")) {
+    return "";
+  }
+  return trimmed.length > 180 ? `${trimmed.slice(0, 177)}...` : trimmed;
+}
+
+function normalizeFileChangeKind(kind: string | undefined): string {
+  const normalized = kind?.trim().toLowerCase();
+  if (!normalized) {
+    return "";
+  }
+  if (normalized === "modify" || normalized === "modified") {
+    return "update";
+  }
+  if (normalized === "create" || normalized === "created") {
+    return "add";
+  }
+  if (normalized === "delete" || normalized === "deleted") {
+    return "remove";
+  }
+  return normalized;
+}
+
+function limitFileChangeDiffPreview(diff: string): string {
+  const normalized = diff.replace(/\r\n?/g, "\n").trim();
+  if (!normalized || !looksLikeDiff(normalized)) {
+    return "";
+  }
+
+  const maxLines = 160;
+  const maxChars = 3500;
+  const lines = normalized.split("\n");
+  let preview = lines.slice(0, maxLines).join("\n");
+  const omittedLines = Math.max(0, lines.length - maxLines);
+  if (preview.length > maxChars) {
+    preview = `${preview.slice(0, maxChars).trimEnd()}\n... truncated by character limit ...`;
+  } else if (omittedLines > 0) {
+    preview = `${preview}\n... ${omittedLines} more lines omitted ...`;
+  }
+  return preview;
+}
+
+function looksLikeDiff(text: string): boolean {
+  return /(^diff --git|^@@\\s|^---\\s|^\\+\\+\\+\\s|^[+-][^+-])/m.test(text);
 }
 
 function parseReasoningEfforts(value: unknown, currentModel?: string): string[] {
