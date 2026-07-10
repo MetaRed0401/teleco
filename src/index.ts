@@ -1,8 +1,15 @@
 import { createHash } from "node:crypto";
 
-import { createBot, registerCommands } from "./bot.js";
-import { markInterruptedOperations, type ActiveOperationRecord } from "./active-operations.js";
+import { createBot, registerCommands, sendRecoveredTurnItem } from "./bot.js";
+import {
+  acknowledgeActiveOperationItem,
+  finishActiveOperation,
+  markInterruptedOperations,
+  updateActiveOperation,
+  type ActiveOperationRecord,
+} from "./active-operations.js";
 import { checkAuthStatus } from "./codex-auth.js";
+import type { CodexTurnRecoveryItem } from "./codex-session.js";
 import { findLaunchProfile, formatLaunchProfileBehavior } from "./codex-launch.js";
 import { loadConfig, type TeleCodexConfig } from "./config.js";
 import { escapeHTML } from "./format.js";
@@ -13,6 +20,7 @@ import { installRuntimeFileLogger } from "./runtime-log.js";
 let registry: SessionRegistry | undefined;
 let bot: ReturnType<typeof createBot> | undefined;
 let config: TeleCodexConfig | undefined;
+let shuttingDown = false;
 
 try {
   config = loadConfig();
@@ -54,7 +62,6 @@ try {
   process.exit(1);
 }
 
-let shuttingDown = false;
 const shutdown = (signal: NodeJS.Signals) => {
   if (shuttingDown) {
     return;
@@ -82,7 +89,7 @@ let restartAttempts = 0;
 async function startPolling(): Promise<void> {
   try {
     await bot!.start({
-      drop_pending_updates: true,
+      drop_pending_updates: false,
       onStart: () => {
         restartAttempts = 0;
       },
@@ -163,21 +170,178 @@ async function notifyInterruptedOperations(): Promise<void> {
     if (operation.statusMessageId) {
       await bot.api.deleteMessage(operation.chatId, operation.statusMessageId).catch(() => undefined);
     }
+    void recoverInterruptedOperation(operation);
+  }
+}
 
-    const message = renderInterruptedOperationMessage(operation);
-    try {
-      await withTimeout(
-        bot.api.sendMessage(operation.chatId, message, {
+async function recoverInterruptedOperation(operation: ActiveOperationRecord): Promise<void> {
+  if (!bot || !config || !registry || !operation.threadId || operation.operation !== "turn") {
+    await sendInterruptedOperationFallback(operation);
+    return;
+  }
+
+  let recoveryMessageId: number | undefined;
+  const deliveredItemIds = new Set(operation.deliveredItemIds ?? []);
+  try {
+    const session = await registry.getOrCreate(operation.contextKey, { deferThreadStart: true });
+    if (session.getInfo().threadId !== operation.threadId) {
+      await session.resumeThread(operation.threadId);
+      registry.updateMetadata(operation.contextKey, session);
+    }
+
+    const deadline = Date.now() + 6 * 60 * 60 * 1000;
+    while (!shuttingDown && Date.now() < deadline) {
+      const snapshot = await session.getTurnRecoverySnapshot(operation.turnId);
+      await replayRecoveredItems(operation, snapshot.items, deliveredItemIds);
+      if (snapshot.threadStatus === "active" || snapshot.turnStatus === "inProgress") {
+        if (!recoveryMessageId) {
+          const message = await bot.api.sendMessage(
+            operation.chatId,
+            [
+              "<b>Teleco reconnected to active Codex work.</b>",
+              `<b>Thread:</b> <code>${escapeHTML(snapshot.threadId)}</code>`,
+              snapshot.turnId ? `<b>Turn:</b> <code>${escapeHTML(snapshot.turnId)}</code>` : undefined,
+              "The Codex daemon is still working. Missed messages are replayed individually while recovery continues.",
+            ]
+              .filter((line): line is string => Boolean(line))
+              .join("\n"),
+            {
+              parse_mode: "HTML",
+              ...(operation.messageThreadId ? { message_thread_id: operation.messageThreadId } : {}),
+            },
+          );
+          recoveryMessageId = message.message_id;
+          updateActiveOperation(config, operation.id, {
+            statusMessageId: recoveryMessageId,
+            turnId: snapshot.turnId ?? operation.turnId,
+          });
+        }
+        await bot.api.sendChatAction(operation.chatId, "typing", {
+          ...(operation.messageThreadId ? { message_thread_id: operation.messageThreadId } : {}),
+        }).catch(() => undefined);
+        await delay(5000);
+        continue;
+      }
+
+      if (recoveryMessageId) {
+        await bot.api.deleteMessage(operation.chatId, recoveryMessageId).catch(() => undefined);
+      }
+      if (snapshot.turnStatus === "completed") {
+        if (snapshot.items.length === 0 && snapshot.agentText) {
+          await deliverRecoveredResponse(operation, snapshot.agentText);
+        }
+        finishActiveOperation(config, operation.id, "completed");
+        return;
+      }
+
+      const terminalStatus = snapshot.turnStatus ?? snapshot.threadStatus;
+      await bot.api.sendMessage(
+        operation.chatId,
+        [
+          "<b>Codex work did not continue after restart.</b>",
+          `<b>Status:</b> <code>${escapeHTML(terminalStatus)}</code>`,
+          `<b>Thread:</b> <code>${escapeHTML(snapshot.threadId)}</code>`,
+          snapshot.error ? `<b>Error:</b> <code>${escapeHTML(snapshot.error)}</code>` : undefined,
+          "The thread history remains available and can be continued with a new prompt.",
+        ]
+          .filter((line): line is string => Boolean(line))
+          .join("\n"),
+        {
           parse_mode: "HTML",
           ...(operation.messageThreadId ? { message_thread_id: operation.messageThreadId } : {}),
-        }),
-        1500,
+        },
       );
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      console.warn(`Failed to send interrupted operation notification to ${redactLogId(operation.chatId)}: ${detail}`);
+      finishActiveOperation(config, operation.id, snapshot.turnStatus === "interrupted" ? "aborted" : "failed");
+      return;
+    }
+
+    throw new Error("Timed out waiting for recovered Codex turn completion.");
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    console.warn(`Failed to recover active operation for ${redactLogId(operation.chatId)}: ${detail}`);
+    await sendInterruptedOperationFallback(operation, detail);
+  }
+}
+
+async function replayRecoveredItems(
+  operation: ActiveOperationRecord,
+  items: CodexTurnRecoveryItem[],
+  deliveredItemIds: Set<string>,
+): Promise<void> {
+  if (!bot || !config || !registry) {
+    return;
+  }
+
+  for (const item of items) {
+    if (deliveredItemIds.has(item.id)) {
+      continue;
+    }
+    await sendRecoveredTurnItem(bot, registry, operation, item);
+    deliveredItemIds.add(item.id);
+    acknowledgeActiveOperationItem(config, operation.id, item.id);
+  }
+}
+
+async function deliverRecoveredResponse(operation: ActiveOperationRecord, agentText: string): Promise<void> {
+  if (!bot || !config) {
+    return;
+  }
+
+  const chunks = splitRecoveryText(agentText || "Codex completed the turn, but no final agent message was stored.");
+  const first = `<b>Recovered response after service restart</b>\n\n${escapeHTML(chunks[0] ?? "")}`;
+  let responseMessageId = operation.responseMessageId;
+  if (responseMessageId) {
+    try {
+      await bot.api.editMessageText(operation.chatId, responseMessageId, first, { parse_mode: "HTML" });
+    } catch {
+      responseMessageId = undefined;
     }
   }
+  if (!responseMessageId) {
+    const sent = await bot.api.sendMessage(operation.chatId, first, {
+      parse_mode: "HTML",
+      ...(operation.messageThreadId ? { message_thread_id: operation.messageThreadId } : {}),
+    });
+    responseMessageId = sent.message_id;
+    updateActiveOperation(config, operation.id, { responseMessageId });
+  }
+
+  for (const chunk of chunks.slice(1)) {
+    await bot.api.sendMessage(operation.chatId, escapeHTML(chunk), {
+      parse_mode: "HTML",
+      ...(operation.messageThreadId ? { message_thread_id: operation.messageThreadId } : {}),
+    });
+  }
+}
+
+async function sendInterruptedOperationFallback(operation: ActiveOperationRecord, detail?: string): Promise<void> {
+  if (!bot) {
+    return;
+  }
+  const message = [renderInterruptedOperationMessage(operation), detail ? `\n<b>Recovery detail:</b> <code>${escapeHTML(detail)}</code>` : undefined]
+    .filter((line): line is string => Boolean(line))
+    .join("\n");
+  try {
+    await bot.api.sendMessage(operation.chatId, message, {
+      parse_mode: "HTML",
+      ...(operation.messageThreadId ? { message_thread_id: operation.messageThreadId } : {}),
+    });
+  } catch (error) {
+    const errorDetail = error instanceof Error ? error.message : String(error);
+    console.warn(`Failed to send interrupted operation notification to ${redactLogId(operation.chatId)}: ${errorDetail}`);
+  }
+}
+
+function splitRecoveryText(value: string): string[] {
+  const chunks: string[] = [];
+  for (let offset = 0; offset < value.length; offset += 3200) {
+    chunks.push(value.slice(offset, offset + 3200));
+  }
+  return chunks.length > 0 ? chunks : [""];
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function notifyServiceOperationRecovery(): Promise<void> {

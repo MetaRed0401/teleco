@@ -15,10 +15,19 @@ import {
   type StagedFile,
 } from "./attachments.js";
 import {
+  acknowledgeActiveOperationItem,
   finishActiveOperation,
   startActiveOperation,
   updateActiveOperation,
+  type ActiveOperationRecord,
 } from "./active-operations.js";
+import {
+  findInterruptedApproval,
+  finishPersistedApproval,
+  markRestartedApprovalsInterrupted,
+  persistPendingApproval,
+  type PersistedApprovalState,
+} from "./approval-state.js";
 import { collectArtifactReport, ensureOutDir, formatArtifactSummary } from "./artifacts.js";
 import {
   formatSessionLabel,
@@ -30,11 +39,14 @@ import {
   type CodexPromptInput,
   type CodexApprovalRequest,
   type CodexApprovalResponse,
+  type CodexMcpElicitationRequest,
+  type CodexMcpElicitationResponse,
   type CodexRuntimeStatus,
   type CodexSessionCallbacks,
   type CodexSessionInfo,
   type CodexSessionService,
   type CodexStatusDetails,
+  type CodexTurnRecoveryItem,
 } from "./codex-session.js";
 import { checkAuthStatus, clearAuthCache, startLogin, startLogout } from "./codex-auth.js";
 import { runCliPtyCompact } from "./codex-cli-pty-compact.js";
@@ -120,6 +132,12 @@ type PendingApproval = {
   request: CodexApprovalRequest;
   rendered: { html: string; plain: string };
   createdAt: number;
+};
+type PendingMcpElicitation = {
+  resolve: (response: CodexMcpElicitationResponse) => void;
+  timeout: NodeJS.Timeout;
+  contextKey: TelegramContextKey | null;
+  origin: string;
 };
 type QueuedPrompt = {
   id: number;
@@ -212,6 +230,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   bot.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 10 }));
   const instanceName = process.env.TELECODEX_INSTANCE?.trim() || "default";
   const toolDiffPreviewStore = new ToolDiffPreviewStore(config);
+  const interruptedApprovalStates = markRestartedApprovalsInterrupted(config);
 
   const contextBusy = new Map<
     TelegramContextKey,
@@ -233,6 +252,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   const pendingPrettyButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingStreamingButtons = new Map<TelegramContextKey, StreamingSettingButton[]>();
   const pendingApprovals = new Map<string, PendingApproval>();
+  const pendingMcpElicitations = new Map<string, PendingMcpElicitation>();
   const lastPromptInput = new Map<TelegramContextKey, CodexPromptInput>();
   const promptQueues = new Map<TelegramContextKey, QueuedPrompt[]>();
   const compactAbortControllers = new Map<TelegramContextKey, AbortController>();
@@ -269,6 +289,13 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const state = contextBusy.get(contextKey);
     const session = registry.get(contextKey);
     return Boolean(state?.processing || state?.switching || state?.transcribing || state?.compacting || session?.isProcessing());
+  };
+
+  const hasActiveWork = (): boolean => {
+    if ([...contextBusy.values()].some((state) => state.processing || state.switching || state.transcribing || state.compacting)) {
+      return true;
+    }
+    return registry.listContexts().some((meta) => registry.get(meta.contextKey)?.isProcessing());
   };
 
   const getContextSession = async (
@@ -338,15 +365,21 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     });
   };
 
-  const buildConfirmKeyboard = (action: "logout" | "restart" | "update"): InlineKeyboard => {
+  const buildConfirmKeyboard = (action: "logout" | "restart" | "force_restart" | "update"): InlineKeyboard => {
     const label =
-      action === "logout" ? "Confirm logout" : action === "restart" ? "Confirm restart" : "Confirm update";
+      action === "logout"
+        ? "Confirm logout"
+        : action === "restart"
+          ? "Restart when idle"
+          : action === "force_restart"
+            ? "Force restart now"
+            : "Confirm update";
     return new InlineKeyboard().text(label, `confirm_${action}`).row().text("Cancel", "ui_cancel");
   };
 
   const sendConfirmPanel = async (
     ctx: Context,
-    action: "logout" | "restart" | "update",
+    action: "logout" | "restart" | "force_restart" | "update",
     lines: { html: string[]; plain: string[] },
   ): Promise<void> => {
     await safeReply(ctx, lines.html.join("\n"), {
@@ -713,9 +746,17 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     messageThreadId: number | undefined,
     request: CodexApprovalRequest,
   ): Promise<CodexApprovalResponse> => {
-    const approvalId = randomUUID();
     const approvalContextKey = contextKeyFromCtx(ctx);
-    const text = renderApprovalRequest(request);
+    const fingerprint = fingerprintApprovalRequest(request);
+    const interrupted = findInterruptedApproval(config, fingerprint, approvalContextKey);
+    const approvalId = interrupted?.id ?? randomUUID();
+    const rendered = renderApprovalRequest(request);
+    const text = interrupted
+      ? {
+          html: `<b>Approval request restored after reconnect</b>\n\n${rendered.html}`,
+          plain: `Approval request restored after reconnect\n\n${rendered.plain}`,
+        }
+      : rendered;
     const keyboard = new InlineKeyboard()
       .text("Allow once", `approval:${approvalId}:accept`)
       .text("Allow session", `approval:${approvalId}:acceptForSession`)
@@ -723,16 +764,31 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       .text("Deny", `approval:${approvalId}:decline`)
       .text("Cancel", `approval:${approvalId}:cancel`);
 
-    await sendTextMessage(bot.api, chatId, text.html, {
+    const sent = await sendTextMessage(bot.api, chatId, text.html, {
       parseMode: "HTML",
       fallbackText: text.plain,
       messageThreadId,
       replyMarkup: keyboard,
     });
 
+    const createdAt = interrupted?.createdAt ?? Date.now();
+    const expiresAt = Date.now() + 5 * 60 * 1000;
+    persistPendingApproval(config, {
+      id: approvalId,
+      fingerprint,
+      contextKey: approvalContextKey,
+      chatId,
+      messageThreadId,
+      messageId: sent.message_id,
+      method: request.method,
+      createdAt,
+      expiresAt,
+    });
+
     return new Promise<CodexApprovalResponse>((resolve) => {
       const timeout = setTimeout(() => {
         pendingApprovals.delete(approvalId);
+        finishPersistedApproval(config, approvalId, "expired", "decline");
         resolve({ decision: "decline" });
       }, 5 * 60 * 1000);
       pendingApprovals.set(approvalId, {
@@ -744,7 +800,130 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         messageThreadId,
         request,
         rendered: text,
-        createdAt: Date.now(),
+        createdAt,
+      });
+    });
+  };
+
+  const replayInterruptedApprovalState = async (state: PersistedApprovalState): Promise<void> => {
+    const type = approvalMethodLabel(state.method);
+    const html = [
+      "<b>Approval expired after bridge restart</b>",
+      `<b>Type:</b> <code>${escapeHTML(type)}</code>`,
+      "The original app-server request cannot be answered on the new connection.",
+      "Use <code>/retry</code> to request the operation again.",
+    ].join("\n");
+    const plain = [
+      "Approval expired after bridge restart",
+      `Type: ${type}`,
+      "The original app-server request cannot be answered on the new connection.",
+      "Use /retry to request the operation again.",
+    ].join("\n");
+
+    try {
+      await bot.api.editMessageText(state.chatId, state.messageId, html, {
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: [] },
+      });
+    } catch {
+      await sendTextMessage(bot.api, state.chatId, html, {
+        fallbackText: plain,
+        messageThreadId: state.messageThreadId,
+      });
+    }
+  };
+
+  const requestTelegramMcpElicitation = async (
+    ctx: Context,
+    chatId: TelegramChatId,
+    messageThreadId: number | undefined,
+    request: CodexMcpElicitationRequest,
+  ): Promise<CodexMcpElicitationResponse> => {
+    const params = request.params && typeof request.params === "object"
+      ? request.params as Record<string, unknown>
+      : undefined;
+    const mode = typeof params?.mode === "string" ? params.mode : "unknown";
+    const serverName = typeof params?.serverName === "string" ? params.serverName : "MCP server";
+    const message = typeof params?.message === "string" ? params.message : "Authentication is required.";
+
+    if (mode !== "url" || typeof params?.url !== "string") {
+      await sendTextMessage(
+        bot.api,
+        chatId,
+        [
+          "<b>⚠️ MCP input required</b>",
+          `<b>Server:</b> <code>${escapeHTML(serverName)}</code>`,
+          `<b>Mode:</b> <code>${escapeHTML(mode)}</code>`,
+          "This Telegram bridge accepts URL authentication only. The form request was cancelled safely.",
+        ].join("\n"),
+        {
+          fallbackText: `MCP input required\nServer: ${serverName}\nMode: ${mode}\nOnly URL authentication is supported; request cancelled.`,
+          messageThreadId,
+        },
+      );
+      return { action: "cancel", content: null, _meta: null };
+    }
+
+    let authUrl: URL;
+    try {
+      authUrl = new URL(params.url);
+      if (authUrl.protocol !== "https:" || authUrl.username || authUrl.password) {
+        throw new Error("Only credential-free HTTPS URLs are allowed.");
+      }
+    } catch {
+      await sendTextMessage(
+        bot.api,
+        chatId,
+        `<b>❌ MCP authentication blocked</b>\nThe server supplied an invalid or unsafe authentication URL.`,
+        {
+          fallbackText: "MCP authentication blocked: invalid or unsafe authentication URL.",
+          messageThreadId,
+        },
+      );
+      return { action: "cancel", content: null, _meta: null };
+    }
+
+    const pendingId = randomUUID();
+    const contextKey = contextKeyFromCtx(ctx);
+    const keyboard = new InlineKeyboard()
+      .url("Open authentication", authUrl.toString())
+      .row()
+      .text("I completed authentication", `mcpel:${pendingId}:accept`)
+      .row()
+      .text("Cancel", `mcpel:${pendingId}:cancel`);
+    await sendTextMessage(
+      bot.api,
+      chatId,
+      [
+        "<b>🔐 MCP authentication required</b>",
+        `<b>Server:</b> <code>${escapeHTML(serverName)}</code>`,
+        `<b>Origin:</b> <code>${escapeHTML(authUrl.origin)}</code>`,
+        escapeHTML(message),
+        "Open the link, verify the origin in your browser, then confirm completion here. Do not share codes or callback URLs.",
+      ].join("\n"),
+      {
+        fallbackText: [
+          "MCP authentication required",
+          `Server: ${serverName}`,
+          `Origin: ${authUrl.origin}`,
+          message,
+          "Verify the browser origin, complete authentication, then confirm here.",
+        ].join("\n"),
+        messageThreadId,
+        replyMarkup: keyboard,
+      },
+    );
+
+    return new Promise<CodexMcpElicitationResponse>((resolve) => {
+      const timeout = setTimeout(() => {
+        pendingMcpElicitations.delete(pendingId);
+        resolve({ action: "cancel", content: null, _meta: null });
+      }, 10 * 60 * 1000);
+      pendingMcpElicitations.set(pendingId, {
+        resolve,
+        timeout,
+        contextKey,
+        origin: authUrl.origin,
       });
     });
   };
@@ -830,6 +1009,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     let draftStreamingFailed = false;
     let lastDraftText = "";
     let accumulatedText = "";
+    let currentAgentMessageId: string | undefined;
     let responseMessageId: number | undefined;
     let responseMessagePromise: Promise<void> | undefined;
     let lastRenderedText = "";
@@ -1342,6 +1522,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       await deliverRichRenderedChunks(
         splitRichMarkdownForTelegram(segmentText, registry.getResponseFormat(contextKey)),
       );
+      acknowledgeActiveOperationItem(config, activeOperationId, currentAgentMessageId);
+      currentAgentMessageId = undefined;
       assistantSegments.push(segmentText);
       resetResponseState();
     };
@@ -1443,16 +1625,27 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       await deliverRichRenderedChunks(
         splitRichMarkdownForTelegram(finalText, registry.getResponseFormat(contextKey)),
       );
+      acknowledgeActiveOperationItem(config, activeOperationId, currentAgentMessageId);
+      currentAgentMessageId = undefined;
       await mirrorFinalResponseToChannel([...assistantSegments, finalText].join("\n\n"));
     };
 
     const callbacks: CodexSessionCallbacks = {
-      onTextDelta: (delta: string, _metadata) => {
+      onTextDelta: (delta: string, metadata) => {
         textDeltaQueue = textDeltaQueue
           .catch((error) => {
             console.error("Previous text delta processing failed", error);
           })
           .then(async () => {
+            if (
+              metadata?.startsNewMessage
+              && currentAgentMessageId
+              && metadata.agentMessageId !== currentAgentMessageId
+              && accumulatedText.trim()
+            ) {
+              await commitCurrentAssistantSegment();
+            }
+            currentAgentMessageId = metadata?.agentMessageId ?? currentAgentMessageId;
             accumulatedText += delta;
             if (!hasResponseBody()) {
               return;
@@ -1549,11 +1742,13 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       },
       onToolEnd: (toolCallId: string, isError: boolean) => {
         if (toolVerbosity === "none" || toolVerbosity === "summary") {
+          acknowledgeActiveOperationItem(config, activeOperationId, toolCallId);
           return;
         }
 
         const state = toolStates.get(toolCallId);
         if (!state) {
+          acknowledgeActiveOperationItem(config, activeOperationId, toolCallId);
           return;
         }
 
@@ -1563,6 +1758,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         const finalReplyMarkup = createToolDiffReplyMarkup(state);
         if (toolVerbosity === "errors-only") {
           if (!isError) {
+            acknowledgeActiveOperationItem(config, activeOperationId, toolCallId);
             return;
           }
 
@@ -1571,9 +1767,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
             fallbackText: state.finalStatus.fallbackText,
             replyMarkup: finalReplyMarkup,
             messageThreadId,
-          }).catch((error) => {
-            console.error(`Failed to send tool error message for ${state.toolName}`, error);
-          });
+          })
+            .then(() => acknowledgeActiveOperationItem(config, activeOperationId, toolCallId))
+            .catch((error) => {
+              console.error(`Failed to send tool error message for ${state.toolName}`, error);
+            });
           return;
         }
 
@@ -1584,15 +1782,21 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
               fallbackText: state.finalStatus.fallbackText,
               replyMarkup: finalReplyMarkup,
               messageThreadId,
-            }).catch((error) => {
-              console.error(`Failed to send delayed tool final message for ${state.toolName}`, error);
-            });
+            })
+              .then(() => acknowledgeActiveOperationItem(config, activeOperationId, toolCallId))
+              .catch((error) => {
+                console.error(`Failed to send delayed tool final message for ${state.toolName}`, error);
+              });
+          } else {
+            acknowledgeActiveOperationItem(config, activeOperationId, toolCallId);
           }
           return;
         }
 
         if (toolActivityMode === "compact" && !isError && state.toolName !== "context_compaction") {
-          void bot.api.deleteMessage(chatId, state.messageId).catch(() => undefined);
+          void bot.api.deleteMessage(chatId, state.messageId)
+            .catch(() => undefined)
+            .then(() => acknowledgeActiveOperationItem(config, activeOperationId, toolCallId));
           return;
         }
 
@@ -1601,9 +1805,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
           fallbackText: state.finalStatus.fallbackText,
           replyMarkup: finalReplyMarkup,
           messageThreadId,
-        }).catch((error) => {
-          console.error(`Failed to update tool message for ${state.toolName}`, error);
-        });
+        })
+          .then(() => acknowledgeActiveOperationItem(config, activeOperationId, toolCallId))
+          .catch((error) => {
+            console.error(`Failed to update tool message for ${state.toolName}`, error);
+          });
       },
       onTodoUpdate: (items) => {
         if (toolVerbosity === "none") {
@@ -1638,10 +1844,14 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       onTurnComplete: (usage) => {
         lastTurnUsage = usage;
       },
+      onTurnStarted: (turnId) => {
+        updateActiveOperation(config, activeOperationId, { turnId });
+      },
       onContextCompaction: () => {
         codexAutoCompactObserved = true;
       },
       onApprovalRequest: (request) => requestTelegramApproval(ctx, chatId, messageThreadId, request),
+      onMcpElicitationRequest: (request) => requestTelegramMcpElicitation(ctx, chatId, messageThreadId, request),
       onAgentEnd: () => {
         void finalizeResponse().catch((error) => {
           console.error("Failed to finalize Telegram response message", error);
@@ -1902,6 +2112,14 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     });
     const plainLines = rendered.plainLines;
     const htmlLines = rendered.htmlLines;
+    const pendingMcpAuthCount = [...pendingMcpElicitations.values()]
+      .filter((pending) => pending.contextKey === contextKey)
+      .length;
+
+    if (pendingMcpAuthCount > 0) {
+      plainLines.push(`MCP authentication: waiting (${pendingMcpAuthCount})`);
+      htmlLines.push(`<b>MCP authentication:</b> <code>waiting (${pendingMcpAuthCount})</code>`);
+    }
 
     if (!authStatus.authenticated) {
       plainLines.splice(3, 0, `Auth detail: ${authStatus.detail}`);
@@ -1959,6 +2177,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   };
 
   const runServiceUpdateCommand = async (ctx: Context): Promise<void> => {
+    if (hasActiveWork()) {
+      await safeReply(ctx, "<b>Update postponed.</b> Codex work is still active. Retry when idle or stop the active turn first.", {
+        fallbackText: "Update postponed. Codex work is still active. Retry when idle or stop the active turn first.",
+      });
+      return;
+    }
     if (!ctx.chat) {
       return;
     }
@@ -2003,8 +2227,27 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
   };
 
-  const runServiceRestartCommand = async (ctx: Context): Promise<void> => {
+  const runServiceRestartCommand = async (ctx: Context, force = false): Promise<void> => {
     if (!ctx.chat) {
+      return;
+    }
+
+    if (!force && hasActiveWork()) {
+      await safeReply(
+        ctx,
+        [
+          "<b>Restart postponed.</b>",
+          "Codex work is still active, so the service was not restarted.",
+          "Retry <code>/restart</code> when idle or use <code>/force_restart</code> only when an immediate restart is required.",
+        ].join("\n"),
+        {
+          fallbackText: [
+            "Restart postponed.",
+            "Codex work is still active, so the service was not restarted.",
+            "Retry /restart when idle or use /force_restart only when required.",
+          ].join("\n"),
+        },
+      );
       return;
     }
 
@@ -2021,18 +2264,22 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         "<b>Service restart requested.</b>",
         `<b>Instance:</b> <code>${escapeHTML(instance)}</code>`,
         "",
-        "Restarting fire-and-forget. This command does not contact Codex app-server.",
+        force
+          ? "Force restarting now. The managed Codex daemon is left running when available."
+          : "Restarting while idle. The managed Codex daemon is left running.",
       ].join("\n"),
       {
         fallbackText: [
           "Service restart requested.",
           `Instance: ${instance}`,
           "",
-          "Restarting fire-and-forget. This command does not contact Codex app-server.",
+          force
+            ? "Force restarting now. The managed Codex daemon is left running when available."
+            : "Restarting while idle. The managed Codex daemon is left running.",
         ].join("\n"),
       },
     );
-    scheduleServiceRestart();
+    scheduleServiceRestart(force);
   };
 
   bot.command("status", async (ctx) => {
@@ -2308,16 +2555,31 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
 
     const instance = getServiceInstanceName();
-    await sendConfirmPanel(ctx, "restart", {
+    const force = ctx.message?.text?.trim().toLowerCase().startsWith("/force_restart") ?? false;
+    if (!force && hasActiveWork()) {
+      await safeReply(
+        ctx,
+        "<b>Restart unavailable while Codex is working.</b> Retry when idle or use <code>/force_restart</code> for an explicit immediate restart.",
+        {
+          fallbackText: "Restart unavailable while Codex is working. Retry when idle or use /force_restart explicitly.",
+        },
+      );
+      return;
+    }
+    await sendConfirmPanel(ctx, force ? "force_restart" : "restart", {
       html: [
-        "<b>Confirm service restart?</b>",
+        force ? "<b>Confirm force restart?</b>" : "<b>Confirm service restart?</b>",
         `<b>Instance:</b> <code>${escapeHTML(instance)}</code>`,
-        "This is fire-and-forget and does not contact Codex app-server.",
+        force
+          ? "Teleco will restart immediately. The managed Codex daemon remains running when available, but Telegram streaming will briefly disconnect."
+          : "The service will restart only after the active-work check passes.",
       ],
       plain: [
-        "Confirm service restart?",
+        force ? "Confirm force restart?" : "Confirm service restart?",
         `Instance: ${instance}`,
-        "This is fire-and-forget and does not contact Codex app-server.",
+        force
+          ? "Teleco will restart immediately. Telegram streaming will briefly disconnect."
+          : "The service will restart only after the active-work check passes.",
       ],
     });
   });
@@ -3666,7 +3928,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     });
   });
 
-  bot.callbackQuery(/^confirm_(logout|restart|update)$/, async (ctx) => {
+  bot.callbackQuery(/^confirm_(logout|restart|force_restart|update)$/, async (ctx) => {
     const action = ctx.match?.[1];
     if (!action) {
       return;
@@ -3681,7 +3943,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       await runServiceUpdateCommand(ctx);
       return;
     }
-    await runServiceRestartCommand(ctx);
+    await runServiceRestartCommand(ctx, action === "force_restart");
   });
 
   bot.callbackQuery(/^cmd_(files|sessions|search_help)$/, async (ctx) => {
@@ -3831,9 +4093,14 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       await ctx.answerCallbackQuery({ text: "Approval expired" });
       return;
     }
+    if (pending.contextKey && contextKeyFromCtx(ctx) !== pending.contextKey) {
+      await ctx.answerCallbackQuery({ text: "Approval belongs to another context" });
+      return;
+    }
 
     pendingApprovals.delete(approvalId);
     clearTimeout(pending.timeout);
+    finishPersistedApproval(config, approvalId, "resolved", decision);
     pending.resolve({ decision });
     await ctx.answerCallbackQuery({ text: `Sent: ${decision}` });
     if (ctx.chat && ctx.callbackQuery.message?.message_id) {
@@ -3843,6 +4110,41 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         ctx.callbackQuery.message.message_id,
         `<b>Approval ${escapeHTML(decision)}</b>`,
         { fallbackText: `Approval ${decision}` },
+      );
+    }
+  });
+
+  bot.callbackQuery(/^mcpel:([^:]+):(accept|cancel)$/, async (ctx) => {
+    const pendingId = ctx.match?.[1];
+    const action = ctx.match?.[2] as "accept" | "cancel" | undefined;
+    if (!pendingId || !action) {
+      await ctx.answerCallbackQuery();
+      return;
+    }
+
+    const pending = pendingMcpElicitations.get(pendingId);
+    if (!pending) {
+      await ctx.answerCallbackQuery({ text: "MCP authentication request expired" });
+      return;
+    }
+    if (pending.contextKey && contextKeyFromCtx(ctx) !== pending.contextKey) {
+      await ctx.answerCallbackQuery({ text: "This request belongs to another Telegram context" });
+      return;
+    }
+
+    pendingMcpElicitations.delete(pendingId);
+    clearTimeout(pending.timeout);
+    pending.resolve({ action, content: null, _meta: null });
+    await ctx.answerCallbackQuery({ text: action === "accept" ? "Authentication completion sent" : "Authentication cancelled" });
+
+    if (ctx.chat && ctx.callbackQuery.message?.message_id) {
+      const title = action === "accept" ? "MCP authentication completed" : "MCP authentication cancelled";
+      await safeEditMessage(
+        bot,
+        ctx.chat.id,
+        ctx.callbackQuery.message.message_id,
+        `<b>${escapeHTML(title)}</b>\n<code>${escapeHTML(pending.origin)}</code>`,
+        { fallbackText: `${title}\n${pending.origin}` },
       );
     }
   });
@@ -4756,7 +5058,54 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     console.error("Telegram bot error:", message);
   });
 
+  if (interruptedApprovalStates.length > 0) {
+    setTimeout(() => {
+      for (const state of interruptedApprovalStates.slice(-5)) {
+        void replayInterruptedApprovalState(state).catch((error) => {
+          console.warn("Failed to replay interrupted approval state:", error instanceof Error ? error.message : String(error));
+        });
+      }
+    }, 0);
+  }
+
   return bot;
+}
+
+export async function sendRecoveredTurnItem(
+  bot: Bot<Context>,
+  registry: SessionRegistry,
+  operation: ActiveOperationRecord,
+  item: CodexTurnRecoveryItem,
+): Promise<void> {
+  const messageThreadId = operation.messageThreadId;
+  if (item.kind === "response") {
+    const rendered = splitRichMarkdownForTelegram(
+      formatResponseSegment(item.text),
+      registry.getResponseFormat(operation.contextKey),
+    );
+    for (const chunk of rendered) {
+      await sendRichMessage(bot.api, operation.chatId, chunk.candidates, { messageThreadId });
+    }
+    return;
+  }
+
+  const toolActivityMode = registry.getToolActivityMode(operation.contextKey);
+  if (toolActivityMode === "off") {
+    return;
+  }
+  if (toolActivityMode === "errors-only" && !item.isError) {
+    return;
+  }
+  if (toolActivityMode === "compact" && !item.isError && item.toolName !== "context_compaction") {
+    return;
+  }
+
+  const rendered = renderToolEndMessage(item.toolName, item.detail, item.isError);
+  await sendTextMessage(bot.api, operation.chatId, rendered.text, {
+    parseMode: rendered.parseMode,
+    fallbackText: rendered.fallbackText,
+    messageThreadId,
+  });
 }
 
 export async function registerCommands(bot: Bot<Context>): Promise<void> {
@@ -5469,6 +5818,15 @@ function formatToolCompletionStatus(
     if (label.kind === "dynamic") {
       return { icon: "❌", title: "Dynamic tool failed" };
     }
+    if (label.kind === "subagent") {
+      return { icon: "❌", title: "Sub-agent activity failed" };
+    }
+    if (label.kind === "hook") {
+      return { icon: "❌", title: "Hook failed" };
+    }
+    if (label.kind === "review") {
+      return { icon: "❌", title: "Review activity failed" };
+    }
     return { icon: "❌", title: "Tool failed" };
   }
 
@@ -5489,6 +5847,21 @@ function formatToolCompletionStatus(
   }
   if (label.kind === "web_search") {
     return { icon: "✅", title: "Web search done" };
+  }
+  if (label.kind === "subagent") {
+    return { icon: "✅", title: "Sub-agent activity done" };
+  }
+  if (label.kind === "hook") {
+    return { icon: "✅", title: "Hook done" };
+  }
+  if (label.kind === "review") {
+    return { icon: "✅", title: "Review activity done" };
+  }
+  if (label.kind === "image") {
+    return { icon: "✅", title: "Image activity done" };
+  }
+  if (label.kind === "wait") {
+    return { icon: "✅", title: "Wait completed" };
   }
   return { icon: "✅", title: "Tool done" };
 }
@@ -5522,6 +5895,10 @@ export function formatToolDisplayLabel(toolName: string): { icon: string; title:
     return { icon: "🌐", title: "Web search", kind: "web_search", detail: toolName.slice(3).trim() || "search" };
   }
 
+  if (toolName.startsWith("web:")) {
+    return { icon: "🌐", title: "Web search", kind: "web_search", detail: toolName.slice("web:".length) || "search" };
+  }
+
   if (toolName.startsWith("mcp:")) {
     const descriptor = toolName.slice("mcp:".length);
     const [server = "mcp", tool = descriptor] = descriptor.split("/");
@@ -5532,6 +5909,30 @@ export function formatToolDisplayLabel(toolName: string): { icon: string; title:
     const descriptor = toolName.slice("dynamic:".length);
     const [namespace = "tool", tool = descriptor] = descriptor.split("/");
     return { icon: "🧰", title: "Dynamic tool", kind: "dynamic", detail: `${namespace}/${tool}` };
+  }
+
+  if (toolName.startsWith("subagent:")) {
+    return { icon: "🤖", title: "Sub-agent activity", kind: "subagent", detail: toolName.slice("subagent:".length) || "activity" };
+  }
+
+  if (toolName.startsWith("hook:")) {
+    return { icon: "🪝", title: "Hook activity", kind: "hook", detail: toolName.slice("hook:".length) || "hook" };
+  }
+
+  if (toolName.startsWith("review:")) {
+    return { icon: "🔎", title: "Review mode", kind: "review", detail: toolName.slice("review:".length) || "review" };
+  }
+
+  if (toolName === "view_image") {
+    return { icon: "🖼️", title: "View image", kind: "image", detail: "workspace image" };
+  }
+
+  if (toolName === "image_generation") {
+    return { icon: "🎨", title: "Image generation", kind: "image", detail: "generated image" };
+  }
+
+  if (toolName === "sleep") {
+    return { icon: "⏳", title: "Waiting", kind: "wait", detail: "scheduled wait" };
   }
 
   return { icon: "💻", title: "Shell command", kind: "bash", detail: normalizeShellToolName(toolName) };
@@ -5630,8 +6031,28 @@ export function formatTurnUsageLine(
 }
 
 export function summarizeToolName(toolName: string): string {
-  if (toolName.startsWith("🔍 ")) {
+  if (toolName.startsWith("🔍 ") || toolName.startsWith("web:")) {
     return "web_fetch";
+  }
+
+  if (toolName.startsWith("subagent:")) {
+    return "subagent";
+  }
+
+  if (toolName.startsWith("hook:")) {
+    return "hook";
+  }
+
+  if (toolName.startsWith("review:")) {
+    return "review";
+  }
+
+  if (toolName === "view_image" || toolName === "image_generation") {
+    return "image";
+  }
+
+  if (toolName === "sleep") {
+    return "wait";
   }
 
   if (toolName === "file_change") {
@@ -5670,7 +6091,18 @@ function normalizeShellToolName(toolName: string): string {
   return toolName;
 }
 
-const SUBAGENT_TOOL_NAMES = new Set(["spawn_agent", "send_input", "wait_agent", "close_agent", "resume_agent"]);
+const SUBAGENT_TOOL_NAMES = new Set([
+  "spawn_agent",
+  "send_input",
+  "wait_agent",
+  "close_agent",
+  "resume_agent",
+  "spawnAgent",
+  "sendInput",
+  "wait",
+  "closeAgent",
+  "resumeAgent",
+]);
 
 type SessionTokenSummary = { input: number; cached: number; output: number };
 type ContextWindowSummary = NonNullable<CodexSessionInfo["contextWindow"]>;
@@ -5747,6 +6179,41 @@ function renderApprovalBridgeStatus(
     plain: "SDK cannot forward approval prompts; app-server runtime required",
     html: "SDK cannot forward approval prompts; app-server runtime required",
   };
+}
+
+function fingerprintApprovalRequest(request: CodexApprovalRequest): string {
+  return createHash("sha256")
+    .update(request.method)
+    .update("\0")
+    .update(stableApprovalJson(request.params))
+    .digest("hex");
+}
+
+function stableApprovalJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableApprovalJson).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableApprovalJson(record[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+function approvalMethodLabel(method: string): string {
+  if (method === "item/commandExecution/requestApproval") {
+    return "command";
+  }
+  if (method === "item/fileChange/requestApproval") {
+    return "file change";
+  }
+  if (method === "item/permissions/requestApproval") {
+    return "permission";
+  }
+  return "approval";
 }
 
 function renderApprovalRequest(request: CodexApprovalRequest): { html: string; plain: string } {
@@ -5868,6 +6335,11 @@ function formatRuntimeStatusPlain(status: CodexRuntimeStatus): string {
   const parts = [
     status.appServerRunning ? "process running" : "process not started",
     status.appServerInitialized ? "initialized" : "not initialized",
+    status.appServerTransport === "persistent-websocket"
+      ? "persistent listener"
+      : status.appServerTransport === "direct-stdio"
+        ? "direct stdio"
+        : undefined,
     status.currentTurnId ? `turn ${status.currentTurnId}` : undefined,
     `notifications ${status.recentNotificationCount}`,
     status.recentProblem ? `last ${status.recentProblem}` : undefined,
@@ -6198,10 +6670,10 @@ function getServiceInstanceName(): string {
   return getCurrentServiceInstanceName();
 }
 
-function startServiceCommand(command: "restart" | "update"): { instance: string; pid?: number } {
+function startServiceCommand(command: "restart" | "update", force = false): { instance: string; pid?: number } {
   const scriptPath = path.join(process.cwd(), "scripts", "telecodex-service.sh");
   const instance = getServiceInstanceName();
-  const child = spawn(scriptPath, [command, instance], {
+  const child = spawn(scriptPath, [command, instance, ...(force ? ["--force"] : [])], {
     cwd: process.cwd(),
     env: process.env,
     detached: true,
@@ -6220,9 +6692,9 @@ function startServiceUpdate(): { instance: string; pid?: number } {
   return startServiceCommand("update");
 }
 
-function scheduleServiceRestart(): void {
+function scheduleServiceRestart(force = false): void {
   const timer = setTimeout(() => {
-    startServiceCommand("restart");
+    startServiceCommand("restart", force);
   }, 750);
   timer.unref();
 }

@@ -1,0 +1,19 @@
+[Unit]
+Description=TeleCodex shared Codex app-server
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=%h/telecodex
+ExecStart=%h/telecodex/scripts/codex-app-server-daemon.sh
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+KillMode=control-group
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

@@ -24,7 +24,8 @@ This project is derived from [benedict2310/telecodex](https://github.com/benedic
 
 - Node.js 20 or newer.
 - pnpm 11 or newer.
-- Codex CLI/app-server 0.142.5 or newer on the 0.142 stable line.
+- Codex CLI/app-server 0.144.1 or newer.
+  This baseline supports the canonical app-server item protocol and includes the `0.142.5` WebSocket trace-log privacy fix.
 - A Telegram bot token from `@BotFather`.
 - Your numeric Telegram user ID.
 - Codex authentication on the host machine, or a `CODEX_API_KEY` if you choose API-key based auth.
@@ -35,7 +36,7 @@ For best results, install common developer tools such as `git`, `rg`, `fd`, `tre
 
 TeleCodex is a Telegram control plane for Codex running on the same machine as your repositories. Telegram receives prompts, progress, tool activity, approvals, and final replies. Codex still runs locally through the Codex app-server and CLI session files under your Codex home.
 
-This branch targets Codex 0.142.5 as its stable runtime baseline. 0.143 alpha releases are intentionally outside this compatibility pass.
+This branch targets Codex 0.144.1 as its stable runtime baseline. SDK and CLI versions are tracked separately when OpenAI does not publish them in lockstep.
 
 Privacy note: TeleCodex avoids logging raw Telegram prompt text and hashes Telegram chat/context identifiers in runtime logs. Telegram messages still intentionally include workspace paths, thread IDs, and tool summaries because those are needed for remote operation.
 
@@ -47,7 +48,13 @@ Telegram bot -> TeleCodex Node.js service -> Codex app-server -> local workspace
                                                 +-> Codex CLI PTY for compact reinforcement
 ```
 
-App-server is used for normal turns, tool/file-change streaming, approval requests, account/rate-limit status, and native compact. The CLI PTY path is used only where terminal parity matters, especially after compaction.
+App-server is used for normal turns, canonical tool/file-change activity, approval requests, account/rate-limit status, and native compact. On Linux, the independent `telecodex-codex-app-server.service` owns one persistent app-server listener on local loopback, and Telegram bridge instances connect to it directly. Restarting a bridge therefore does not terminate server-owned turns. Other platforms retain the direct stdio compatibility path until equivalent service supervision is implemented. Tool items are tracked by canonical item ID so start, delta, completion, and diff events are rendered once even when completion contains an aggregated output snapshot. The CLI PTY path is used only where terminal parity matters, especially after compaction.
+
+During startup, interrupted Teleco operation records are reconciled with `thread/read(includeTurns: true)`. Active turns are polled until terminal status, and a turn completed while Teleco was offline sends its final stored agent message back to the original Telegram context. Normal `/restart` and `/update` refuse to run while local work is active; `/force_restart` is the explicit immediate path.
+
+Linux and macOS service helpers apply the same owner-PID guard to direct `restart` and `update` calls. Add `--force` only when intentionally bypassing active-work protection.
+
+Codex 0.144.1 MCP URL elicitations are forwarded only to the originating Telegram context. Teleco accepts credential-free HTTPS URLs, requires explicit completion or cancellation, and does not mirror authentication prompts to notification channels. Structured MCP form elicitations are cancelled until a dedicated Telegram form UI is available.
 
 Codex app-server may expose new MCP, plugin, web-search, and status notifications across Codex releases. TeleCodex renders only the stable events it understands and ignores unknown notifications by default.
 
@@ -204,7 +211,7 @@ When `.env.*` files exist, commands that can affect running services require eit
 | `/help` | Show command help. |
 | `/new` | Start a new Codex session for the current Telegram context. |
 | `/status` | Show session, model, profile, queue, and workspace status. |
-| `/doctor` | Check the service runtime environment, PATH, tools, git/auth state, and approval bridge support. |
+| `/doctor` | Check the service runtime environment, PATH, tools, git/auth state, approval bridge support, and recommended Codex CLI baseline. |
 | `/locks` | Show known Git and TeleCodex runtime lock files without removing them. |
 | `/compact` | Show compact controls with run/status buttons. |
 | `/compact run` | Run two-stage context compaction for the current thread. |
@@ -317,7 +324,7 @@ Docker has two Ubuntu-based variants:
 - `Dockerfile` + `docker-compose.yml`: normal image with Node, pnpm, Codex CLI, and required runtime dependencies.
 - `Dockerfile.local` + `docker-compose.local.yml`: tool-rich image with the brew-parity CLI tools used by this environment.
 
-Both Dockerfiles pin Codex CLI to the supported 0.142.5 baseline unless `CODEX_CLI_VERSION` is overridden at build time.
+Both Dockerfiles pin Codex CLI to the supported 0.144.1 baseline unless `CODEX_CLI_VERSION` is overridden at build time.
 
 Typical Docker values:
 

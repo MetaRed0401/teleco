@@ -1,8 +1,8 @@
 [Unit]
 Description=TeleCodex Telegram bridge (%i)
 Documentation=file:%h/telecodex/README.md
-After=network-online.target
-Wants=network-online.target
+After=network-online.target telecodex-codex-app-server.service
+Wants=network-online.target telecodex-codex-app-server.service
 
 [Service]
 Type=simple

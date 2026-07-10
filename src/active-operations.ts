@@ -15,9 +15,12 @@ export interface ActiveOperationRecord {
   messageThreadId?: number;
   operation: ActiveOperationType;
   status: ActiveOperationStatus;
+  ownerPid?: number;
   threadId: string | null;
+  turnId?: string;
   workspace: string;
   promptSummary?: string;
+  deliveredItemIds?: string[];
   responseMessageId?: number;
   statusMessageId?: number;
   startedAt: number;
@@ -48,6 +51,7 @@ export function startActiveOperation(
     messageThreadId: input.messageThreadId,
     operation: input.operation,
     status: "running",
+    ownerPid: process.pid,
     threadId: input.threadId,
     workspace: input.workspace,
     promptSummary: input.promptSummary,
@@ -61,7 +65,7 @@ export function startActiveOperation(
 export function updateActiveOperation(
   config: TeleCodexConfig,
   id: string | undefined,
-  patch: Partial<Pick<ActiveOperationRecord, "responseMessageId" | "statusMessageId" | "threadId" | "workspace">>,
+  patch: Partial<Pick<ActiveOperationRecord, "deliveredItemIds" | "responseMessageId" | "statusMessageId" | "threadId" | "turnId" | "workspace">>,
 ): void {
   if (!id) {
     return;
@@ -76,6 +80,34 @@ export function updateActiveOperation(
   records[index] = {
     ...records[index]!,
     ...patch,
+    updatedAt: Date.now(),
+  };
+  writeOperations(config, records);
+}
+
+export function acknowledgeActiveOperationItem(
+  config: TeleCodexConfig,
+  id: string | undefined,
+  itemId: string | undefined,
+): void {
+  if (!id || !itemId) {
+    return;
+  }
+
+  const records = readOperations(config);
+  const index = records.findIndex((record) => record.id === id);
+  if (index === -1) {
+    return;
+  }
+
+  const record = records[index]!;
+  const deliveredItemIds = record.deliveredItemIds ?? [];
+  if (deliveredItemIds.includes(itemId)) {
+    return;
+  }
+  records[index] = {
+    ...record,
+    deliveredItemIds: [...deliveredItemIds, itemId].slice(-200),
     updatedAt: Date.now(),
   };
   writeOperations(config, records);
@@ -109,6 +141,10 @@ export function markInterruptedOperations(config: TeleCodexConfig): ActiveOperat
   const records = readOperations(config);
   const interrupted: ActiveOperationRecord[] = [];
   const next = records.map((record) => {
+    if (record.status === "interrupted") {
+      interrupted.push(record);
+      return record;
+    }
     if (record.status !== "running") {
       return record;
     }

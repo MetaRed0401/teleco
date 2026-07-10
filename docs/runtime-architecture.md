@@ -14,11 +14,19 @@ Telegram user
 
 The app-server runtime is the primary path. It provides structured turn lifecycle events, assistant deltas, tool activity, file-change events, token usage, account/rate-limit status, approval requests, and native context compact.
 
+Teleco uses a persistent app-server listener as the turn owner. Linux hosts run one listener in the independent `telecodex-codex-app-server.service`, and bridge instances connect directly over a local WebSocket. A Teleco bridge restart closes only its client connection. On startup, persisted operation thread/turn IDs are reconciled through `thread/read(includeTurns: true)`; active turns are polled and offline-completed final responses are returned to the originating Telegram context. Non-Linux direct stdio remains a compatibility path and cannot preserve an active turn when Teleco exits.
+
+App-server approval server requests are connection-scoped. Teleco persists a bounded fingerprint and Telegram route for pending approvals. After a bridge restart, old approval buttons are marked expired because their original request ID cannot be answered on the new connection. If app-server reissues the same approval, Teleco matches the fingerprint and sends a restored approval prompt; otherwise the user is directed to `/retry`.
+
 The legacy SDK fallback is kept only as a compatibility path. New operation should use `ENABLE_CODEX_APP_SERVER_RUNTIME=true`.
 
-The supported Codex runtime baseline for this branch is 0.142.5. 0.143 alpha releases are outside this compatibility pass.
+The supported Codex runtime baseline for this branch is 0.144.1. It uses canonical app-server items for tool activity and includes the `0.142.5` protection against full `Responses` WebSocket request payloads being written to trace logs.
 
-TeleCodex keeps app-server handling conservative across Codex releases: known turn, tool, token usage, approval, compact, and rate-limit events are rendered; unknown MCP/plugin/status notifications are ignored unless they are useful and safe to show on mobile.
+TeleCodex keeps app-server handling conservative across Codex releases. Canonical command, file change, MCP, dynamic tool, collaboration, sub-agent, web search, review, hook, and compact activity is normalized into one item-ID lifecycle. Aggregated completion output contributes only the suffix not already received through delta notifications. Unknown MCP/plugin/status notifications are ignored unless they are useful and safe to show on mobile.
+
+MCP URL elicitations are scoped to the originating Telegram context. Only credential-free HTTPS URLs receive an authentication button, and the user must explicitly confirm completion or cancel. Structured form elicitations fail closed until Teleco provides a schema-aware form UI. Authentication prompts are never mirrored to notification channels.
+
+The Codex `writes` mode belongs to app-tool approval configuration, not the global thread approval policy. Teleco therefore keeps `CODEX_APPROVAL_POLICY` limited to SDK/thread values and does not expose `writes` as a launch-profile option.
 
 ## Sessions and Instances
 

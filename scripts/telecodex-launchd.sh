@@ -32,7 +32,7 @@ run_cmd() {
 
 usage() {
   cat <<USAGE
-Usage: scripts/telecodex-launchd.sh <command> [instance|--all]
+Usage: scripts/telecodex-launchd.sh <command> [instance|--all] [--force]
 
 Setup:
   install                  Install deps, build, and write LaunchAgent plist(s)
@@ -46,7 +46,9 @@ Setup:
 Control:
   start [instance|--all]   Start single .env service, one instance, or all instances with --all
   stop [instance|--all]    Stop single .env service, one instance, or all instances with --all
-  restart [instance|--all] Restart selected service(s)
+  restart [instance|--all] Restart only when no live operation owns the instance
+  restart [instance|--all] --force
+                           Restart immediately even when work is active
   status [instance|--all]  Show launchd service state
   logs <instance>          Follow stdout/stderr logs for one instance
   update [instance|--all]  Install deps, build, rewrite plist(s), and restart selected service(s)
@@ -94,6 +96,76 @@ env_path_for_instance() {
     return
   fi
   printf '%s/.env.%s\n' "${REPO_DIR}" "${instance}"
+}
+
+env_value() {
+  local env_path="$1"
+  local name="$2"
+  local key value
+  [[ -f "${env_path}" ]] || return 0
+  while IFS='=' read -r key value || [[ -n "${key}" ]]; do
+    key="${key#export }"
+    [[ "${key}" == "${name}" ]] || continue
+    value="${value%$'\r'}"
+    value="${value%\"}"
+    value="${value#\"}"
+    value="${value%\'}"
+    value="${value#\'}"
+    printf '%s\n' "${value}"
+    return 0
+  done <"${env_path}"
+}
+
+workspace_for_instance() {
+  local instance="$1"
+  local env_path workspace
+  env_path="$(env_path_for_instance "${instance}")"
+  workspace="$(env_value "${env_path}" "TELECODEX_WORKSPACE")"
+  if [[ -n "${workspace}" ]]; then
+    printf '%s\n' "${workspace}"
+    return
+  fi
+  printf '%s\n' "${REPO_DIR}"
+}
+
+active_operations_path_for_instance() {
+  local instance="$1"
+  local workspace
+  workspace="$(workspace_for_instance "${instance}")"
+  if [[ "${instance}" == "default" ]]; then
+    printf '%s/.telecodex/active-operations.json\n' "${workspace}"
+    return
+  fi
+  printf '%s/.telecodex/%s/active-operations.json\n' "${workspace}" "${instance}"
+}
+
+guard_instance_active_work() {
+  local instance="$1"
+  local force="${2:-}"
+  [[ "${force}" == "--force" ]] && return 0
+
+  local operations_path status
+  operations_path="$(active_operations_path_for_instance "${instance}")"
+  if node -e '
+    const fs = require("node:fs");
+    const file = process.argv[1];
+    if (!fs.existsSync(file)) process.exit(0);
+    try {
+      const rows = JSON.parse(fs.readFileSync(file, "utf8"));
+      const live = Array.isArray(rows) && rows.some((row) => {
+        if (row?.status !== "running" || !Number.isInteger(row?.ownerPid)) return false;
+        try { process.kill(row.ownerPid, 0); return true; } catch { return false; }
+      });
+      process.exit(live ? 2 : 0);
+    } catch { process.exit(0); }
+  ' "${operations_path}"; then
+    return 0
+  else
+    status=$?
+  fi
+  if [[ "${status}" == "2" ]]; then
+    fail "Instance '${instance}' has active Codex work. Retry when idle or append --force."
+  fi
 }
 
 label_for_instance() {
@@ -445,6 +517,7 @@ list_command() {
 service_command() {
   local action="$1"
   local target="${2:-}"
+  local force="${3:-}"
   local instance label plist_path
   if [[ "${action}" == "logs" && -z "${target}" ]]; then
     fail "logs requires an explicit instance. Use: scripts/telecodex-launchd.sh logs first"
@@ -454,6 +527,9 @@ service_command() {
     [[ -n "${instance}" ]] || continue
     label="$(label_for_instance "${instance}")"
     plist_path="$(plist_path_for_instance "${instance}")"
+    if [[ "${action}" == "restart" ]]; then
+      guard_instance_active_work "${instance}" "${force}"
+    fi
     section "${action} ${instance}"
     case "${action}" in
       start)
@@ -523,12 +599,17 @@ LOCK
 
 update_command() {
   local target="${1:-}"
+  local force="${2:-}"
   local instances=()
   local instance
   while IFS= read -r instance; do
     [[ -n "${instance}" ]] && instances+=("${instance}")
   done < <(target_instances "${target}")
   [[ "${#instances[@]}" -gt 0 ]] || fail "No instances found."
+
+  for instance in "${instances[@]}"; do
+    guard_instance_active_work "${instance}" "${force}"
+  done
 
   acquire_lock "update" "${target}"
   build_project
@@ -590,10 +671,10 @@ case "${command}" in
     list_command
     ;;
   start | stop | restart | status | logs)
-    service_command "${command}" "${1:-}"
+    service_command "${command}" "${1:-}" "${2:-}"
     ;;
   update)
-    update_command "${1:-}"
+    update_command "${1:-}" "${2:-}"
     ;;
   bin-install)
     bin_install_command

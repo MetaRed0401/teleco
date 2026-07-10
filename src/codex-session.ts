@@ -37,6 +37,17 @@ export interface CodexApprovalRequest {
 
 export type CodexApprovalResponse = { decision: "accept" | "acceptForSession" | "decline" | "cancel" };
 
+export interface CodexMcpElicitationRequest {
+  method: "mcpServer/elicitation/request";
+  params?: unknown;
+}
+
+export type CodexMcpElicitationResponse = {
+  action: "accept" | "decline" | "cancel";
+  content: unknown | null;
+  _meta: unknown | null;
+};
+
 export interface CodexSessionCallbacks {
   onTextDelta: (delta: string, metadata?: { agentMessageId: string; startsNewMessage: boolean }) => void;
   onToolStart: (toolName: string, toolCallId: string) => void;
@@ -45,7 +56,9 @@ export interface CodexSessionCallbacks {
   onAgentEnd: () => void;
   onTodoUpdate?: (items: Array<{ text: string; completed: boolean }>) => void;
   onApprovalRequest?: (request: CodexApprovalRequest) => Promise<CodexApprovalResponse>;
+  onMcpElicitationRequest?: (request: CodexMcpElicitationRequest) => Promise<CodexMcpElicitationResponse>;
   onContextCompaction?: () => void;
+  onTurnStarted?: (turnId: string) => void;
   onTurnComplete?: (usage: {
     inputTokens: number;
     cachedInputTokens: number;
@@ -105,7 +118,33 @@ export interface CodexRuntimeStatus {
   currentTurnId: string | null;
   recentNotificationCount: number;
   recentProblem?: string;
+  appServerTransport?: "persistent-websocket" | "direct-stdio";
+  appServerTransportDetail?: string;
 }
+
+export interface CodexTurnRecoverySnapshot {
+  threadId: string;
+  turnId?: string;
+  threadStatus: string;
+  turnStatus?: string;
+  items: CodexTurnRecoveryItem[];
+  agentText: string;
+  error?: string;
+}
+
+export type CodexTurnRecoveryItem =
+  | {
+      id: string;
+      kind: "response";
+      text: string;
+    }
+  | {
+      id: string;
+      kind: "tool";
+      toolName: string;
+      detail: string;
+      isError: boolean;
+    };
 
 export interface CodexStatusDetails {
   account?: {
@@ -167,6 +206,12 @@ export interface CreateOptions {
 
 export type CodexPromptInput = string | { text?: string; imagePaths?: string[]; stagedFileInstructions?: string };
 
+type AppServerToolLifecycle = {
+  completed: boolean;
+  output: string;
+  diff: string;
+};
+
 export class CodexSessionService {
   private codex: Codex | null = null;
   private thread: Thread | null = null;
@@ -188,7 +233,7 @@ export class CodexSessionService {
   private appServerThreadLoaded = false;
   private appServerCurrentTurnId: string | null = null;
   private appServerCallbacks: CodexSessionCallbacks | undefined;
-  private readonly appServerStartedToolIds = new Set<string>();
+  private readonly appServerToolLifecycles = new Map<string, AppServerToolLifecycle>();
   private appServerInstructionSources: string[] = [];
   private appServerActivePermissionProfile: string | undefined;
   private appServerApprovalsReviewer: string | undefined;
@@ -293,7 +338,55 @@ export class CodexSessionService {
       appServerInitialized: this.appServerInitialized,
       currentTurnId: this.appServerCurrentTurnId,
       recentNotificationCount: notifications.length,
+      appServerTransport: this.appServerClient?.getTransportMode(),
+      appServerTransportDetail: this.appServerClient?.getTransportDetail(),
       recentProblem: closedReason ?? (recentProblem ? summarizeAppServerProblem(recentProblem) : undefined),
+    };
+  }
+
+  async getTurnRecoverySnapshot(turnId?: string): Promise<CodexTurnRecoverySnapshot> {
+    if (!this.config.enableCodexAppServerRuntime || !this.currentThreadId) {
+      throw new Error("App-server thread is not available for recovery.");
+    }
+
+    await this.ensureAppServerThreadReady();
+    const response = await this.getAppServerClient().request(
+      "thread/read",
+      { threadId: this.currentThreadId, includeTurns: true },
+      10_000,
+    );
+    const thread = readRecord(readRecord(response)?.thread);
+    if (!thread) {
+      throw new Error("Codex thread recovery snapshot is unavailable.");
+    }
+
+    const turns = Array.isArray(thread.turns)
+      ? thread.turns.map(readRecord).filter((turn): turn is Record<string, unknown> => Boolean(turn))
+      : [];
+    const turn = turnId
+      ? turns.find((candidate) => readString(candidate.id) === turnId)
+      : turns.at(-1);
+    const items = Array.isArray(turn?.items)
+      ? turn.items.map(readRecord).filter((item): item is Record<string, unknown> => Boolean(item))
+      : [];
+    const recoveryItems = items
+      .map((item, index) => toTurnRecoveryItem(item, index, readString(turn?.id)))
+      .filter((item): item is CodexTurnRecoveryItem => Boolean(item));
+    const agentMessages = recoveryItems
+      .filter((item): item is Extract<CodexTurnRecoveryItem, { kind: "response" }> => item.kind === "response")
+      .map((item) => item.text);
+    const agentText = agentMessages.at(-1) ?? "";
+    const threadStatus = readString(readRecord(thread.status)?.type) ?? "unknown";
+    const turnError = readRecord(turn?.error);
+
+    return {
+      threadId: readString(thread.id) ?? this.currentThreadId,
+      turnId: readString(turn?.id),
+      threadStatus,
+      turnStatus: readString(turn?.status),
+      items: recoveryItems,
+      agentText,
+      error: readString(turnError?.message) ?? readString(turnError?.additionalDetails),
     };
   }
 
@@ -1024,6 +1117,7 @@ export class CodexSessionService {
     this.appServerThreadLoaded = false;
     this.appServerCurrentTurnId = null;
     this.appServerCallbacks = undefined;
+    this.appServerToolLifecycles.clear();
   }
 
   private resetUsageState(): void {
@@ -1083,7 +1177,7 @@ export class CodexSessionService {
     const controller = new AbortController();
     this.abortController = controller;
     let client = this.getAppServerClient(callbacks);
-    this.appServerStartedToolIds.clear();
+    this.appServerToolLifecycles.clear();
     let unsubscribe = client.onNotification((notification) => {
       this.handleAppServerNotification(notification, callbacks);
     });
@@ -1121,6 +1215,9 @@ export class CodexSessionService {
         response = await this.requestAppServerTurnStart(client, turnStartParams);
       }
       this.appServerCurrentTurnId = readString(readRecord(readRecord(response)?.turn)?.id) ?? null;
+      if (this.appServerCurrentTurnId) {
+        callbacks.onTurnStarted?.(this.appServerCurrentTurnId);
+      }
 
       await new Promise<void>((resolve, reject) => {
         const onAbort = (): void => {
@@ -1176,6 +1273,7 @@ export class CodexSessionService {
     } finally {
       unsubscribe();
       this.appServerCurrentTurnId = null;
+      this.appServerToolLifecycles.clear();
       if (this.abortController === controller) {
         this.abortController = null;
       }
@@ -1284,7 +1382,27 @@ export class CodexSessionService {
       return response ?? { decision: "decline" };
     }
 
-    return { decision: "cancel" };
+    if (request.method === "mcpServer/elicitation/request") {
+      const response = await callbacks?.onMcpElicitationRequest?.({
+        method: request.method,
+        params: request.params,
+      });
+      return response ?? { action: "cancel", content: null, _meta: null };
+    }
+
+    if (request.method === "item/tool/requestUserInput") {
+      return { answers: {} };
+    }
+
+    if (request.method === "item/tool/call") {
+      return { contentItems: [], success: false };
+    }
+
+    if (request.method === "currentTime/read") {
+      return { currentTimeAt: Math.floor(Date.now() / 1000) };
+    }
+
+    throw new Error(`Unsupported app-server request: ${request.method}`);
   }
 
   private handleAppServerNotification(
@@ -1329,6 +1447,11 @@ export class CodexSessionService {
         } else if (type === "contextCompaction") {
           callbacks.onContextCompaction?.();
           this.emitAppServerToolStart(callbacks, "context_compaction", id);
+        } else {
+          const toolName = getCanonicalAppServerToolName(item);
+          if (toolName) {
+            this.emitAppServerToolStart(callbacks, toolName, id);
+          }
         }
         break;
       }
@@ -1353,7 +1476,8 @@ export class CodexSessionService {
         const itemId = readString(params?.itemId);
         const delta = readString(params?.delta);
         if (itemId && delta) {
-          callbacks.onToolUpdate(itemId, delta);
+          this.emitAppServerToolStart(callbacks, "shell", itemId);
+          this.emitAppServerToolDelta(callbacks, itemId, delta);
         }
         break;
       }
@@ -1361,7 +1485,33 @@ export class CodexSessionService {
         const itemId = readString(params?.itemId);
         const delta = readString(params?.delta);
         if (itemId && delta) {
-          callbacks.onToolUpdate(itemId, delta, { kind: "diff" });
+          this.emitAppServerToolStart(callbacks, "file_change", itemId);
+          this.emitAppServerToolDelta(callbacks, itemId, delta, "diff");
+        }
+        break;
+      }
+      case "item/fileChange/patchUpdated": {
+        const itemId = readString(params?.itemId);
+        if (itemId) {
+          const patchItem = { changes: params?.changes };
+          const summary = summarizeAppServerFileChange(patchItem);
+          const diff = summarizeAppServerFileChangeDiff(patchItem);
+          this.emitAppServerToolStart(callbacks, "file_change", itemId);
+          if (summary) {
+            this.emitAppServerToolSnapshot(callbacks, itemId, summary);
+          }
+          if (diff) {
+            this.emitAppServerToolSnapshot(callbacks, itemId, diff, "diff");
+          }
+        }
+        break;
+      }
+      case "item/mcpToolCall/progress": {
+        const itemId = readString(params?.itemId);
+        const message = readString(params?.message);
+        if (itemId && message) {
+          this.emitAppServerToolStart(callbacks, "mcp:unknown/tool", itemId);
+          this.emitAppServerToolDelta(callbacks, itemId, `${message}\n`);
         }
         break;
       }
@@ -1370,31 +1520,95 @@ export class CodexSessionService {
         const id = readString(item?.id) ?? randomItemId();
         const type = readString(item?.type);
         if (type === "commandExecution") {
+          this.emitAppServerToolStart(callbacks, readString(item?.command) ?? "shell", id);
           const output = readString(item?.aggregatedOutput);
           if (output) {
-            callbacks.onToolUpdate(id, output);
+            this.emitAppServerToolSnapshot(callbacks, id, output);
           }
-          callbacks.onToolEnd(id, readString(item?.status) === "failed");
+          this.emitAppServerToolEnd(callbacks, id, readString(item?.status) === "failed");
         } else if (type === "fileChange") {
+          this.emitAppServerToolStart(callbacks, "file_change", id);
           const summary = summarizeAppServerFileChange(item);
           const diff = summarizeAppServerFileChangeDiff(item);
           if (summary) {
-            callbacks.onToolUpdate(id, summary);
+            this.emitAppServerToolSnapshot(callbacks, id, summary);
           }
           if (diff) {
-            callbacks.onToolUpdate(id, diff, { kind: "diff" });
+            this.emitAppServerToolSnapshot(callbacks, id, diff, "diff");
           }
-          callbacks.onToolEnd(id, readString(item?.status) === "failed");
+          this.emitAppServerToolEnd(callbacks, id, readString(item?.status) === "failed");
         } else if (type === "mcpToolCall") {
+          this.emitAppServerToolStart(callbacks, `mcp:${readString(item?.server) ?? "unknown"}/${readString(item?.tool) ?? "tool"}`, id);
           const error = readRecord(item?.error);
           if (error) {
-            callbacks.onToolUpdate(id, readString(error?.message) ?? JSON.stringify(error));
+            this.emitAppServerToolSnapshot(callbacks, id, readString(error?.message) ?? JSON.stringify(error));
           }
-          callbacks.onToolEnd(id, Boolean(error) || readString(item?.status) === "failed");
+          this.emitAppServerToolEnd(callbacks, id, Boolean(error) || readString(item?.status) === "failed");
         } else if (type === "dynamicToolCall") {
-          callbacks.onToolEnd(id, readString(item?.status) === "failed" || item?.success === false);
+          this.emitAppServerToolStart(callbacks, `dynamic:${readString(item?.namespace) ?? "tool"}/${readString(item?.tool) ?? "call"}`, id);
+          this.emitAppServerToolEnd(callbacks, id, readString(item?.status) === "failed" || item?.success === false);
         } else if (type === "contextCompaction") {
-          callbacks.onToolEnd(id, false);
+          this.emitAppServerToolStart(callbacks, "context_compaction", id);
+          this.emitAppServerToolEnd(callbacks, id, false);
+        } else {
+          const toolName = getCanonicalAppServerToolName(item);
+          if (item && toolName) {
+            this.emitAppServerToolStart(callbacks, toolName, id);
+            const summary = summarizeCanonicalAppServerItem(item);
+            if (summary) {
+              this.emitAppServerToolSnapshot(callbacks, id, summary);
+            }
+            this.emitAppServerToolEnd(callbacks, id, isCanonicalAppServerItemError(item));
+          }
+        }
+        break;
+      }
+      case "hook/started": {
+        const run = readRecord(params?.run);
+        const id = readString(run?.id) ?? randomItemId();
+        const eventName = readString(run?.eventName) ?? "hook";
+        this.emitAppServerToolStart(callbacks, `hook:${eventName}`, `hook-${id}`);
+        const statusMessage = readString(run?.statusMessage);
+        if (statusMessage) {
+          this.emitAppServerToolSnapshot(callbacks, `hook-${id}`, statusMessage);
+        }
+        break;
+      }
+      case "hook/completed": {
+        const run = readRecord(params?.run);
+        const id = readString(run?.id) ?? randomItemId();
+        const toolId = `hook-${id}`;
+        const eventName = readString(run?.eventName) ?? "hook";
+        const status = readString(run?.status);
+        this.emitAppServerToolStart(callbacks, `hook:${eventName}`, toolId);
+        const statusMessage = readString(run?.statusMessage);
+        if (statusMessage) {
+          this.emitAppServerToolSnapshot(callbacks, toolId, statusMessage);
+        }
+        this.emitAppServerToolEnd(callbacks, toolId, status === "failed" || status === "blocked" || status === "stopped");
+        break;
+      }
+      case "item/autoApprovalReview/started":
+      case "item/autoApprovalReview/completed": {
+        const reviewId = readString(params?.reviewId) ?? randomItemId();
+        const toolId = `auto-approval-review-${reviewId}`;
+        const review = readRecord(params?.review);
+        const status = readString(review?.status) ?? "inProgress";
+        const riskLevel = readString(review?.riskLevel);
+        this.emitAppServerToolStart(callbacks, "review:auto-approval", toolId);
+        this.emitAppServerToolSnapshot(
+          callbacks,
+          toolId,
+          [`status: ${status}`, riskLevel ? `risk: ${riskLevel}` : undefined]
+            .filter((value): value is string => Boolean(value))
+            .join("\n"),
+        );
+        if (notification.method === "item/autoApprovalReview/completed") {
+          this.emitAppServerToolEnd(
+            callbacks,
+            toolId,
+            status === "denied" || status === "timedOut" || status === "aborted",
+          );
         }
         break;
       }
@@ -1442,6 +1656,7 @@ export class CodexSessionService {
           this.currentThreadId = null;
           this.appServerThreadLoaded = false;
           this.appServerCurrentTurnId = null;
+          this.appServerToolLifecycles.clear();
         }
         break;
       }
@@ -1492,11 +1707,51 @@ export class CodexSessionService {
   }
 
   private emitAppServerToolStart(callbacks: CodexSessionCallbacks, toolName: string, toolCallId: string): void {
-    if (this.appServerStartedToolIds.has(toolCallId)) {
+    if (this.appServerToolLifecycles.has(toolCallId)) {
       return;
     }
-    this.appServerStartedToolIds.add(toolCallId);
+    this.appServerToolLifecycles.set(toolCallId, { completed: false, output: "", diff: "" });
     callbacks.onToolStart(toolName, toolCallId);
+  }
+
+  private emitAppServerToolDelta(
+    callbacks: CodexSessionCallbacks,
+    toolCallId: string,
+    delta: string,
+    kind: "output" | "diff" = "output",
+  ): void {
+    const state = this.appServerToolLifecycles.get(toolCallId);
+    if (!state || state.completed || !delta) {
+      return;
+    }
+    state[kind] += delta;
+    callbacks.onToolUpdate(toolCallId, delta, { kind });
+  }
+
+  private emitAppServerToolSnapshot(
+    callbacks: CodexSessionCallbacks,
+    toolCallId: string,
+    snapshot: string,
+    kind: "output" | "diff" = "output",
+  ): void {
+    const state = this.appServerToolLifecycles.get(toolCallId);
+    if (!state || state.completed || !snapshot) {
+      return;
+    }
+    const delta = computeTextDelta(state[kind], snapshot);
+    state[kind] = snapshot;
+    if (delta) {
+      callbacks.onToolUpdate(toolCallId, delta, { kind });
+    }
+  }
+
+  private emitAppServerToolEnd(callbacks: CodexSessionCallbacks, toolCallId: string, isError: boolean): void {
+    const state = this.appServerToolLifecycles.get(toolCallId);
+    if (!state || state.completed) {
+      return;
+    }
+    state.completed = true;
+    callbacks.onToolEnd(toolCallId, isError);
   }
 
   private buildAppServerSandboxPolicy(): Record<string, unknown> {
@@ -1545,6 +1800,82 @@ export class CodexSessionService {
   }
 }
 
+function toTurnRecoveryItem(
+  item: Record<string, unknown>,
+  index: number,
+  turnId: string | undefined,
+): CodexTurnRecoveryItem | undefined {
+  const type = readString(item.type);
+  const id = readString(item.id) ?? `${turnId ?? "turn"}:${index}:${type ?? "item"}`;
+
+  if (type === "agentMessage") {
+    const text = readString(item.text)?.trim();
+    return text ? { id, kind: "response", text } : undefined;
+  }
+
+  if (type === "commandExecution") {
+    return {
+      id,
+      kind: "tool",
+      toolName: readString(item.command) ?? "shell",
+      detail: trimRecoveryDetail(readString(item.aggregatedOutput) ?? ""),
+      isError: readString(item.status) === "failed",
+    };
+  }
+
+  if (type === "fileChange") {
+    return {
+      id,
+      kind: "tool",
+      toolName: "file_change",
+      detail: trimRecoveryDetail(summarizeAppServerFileChange(item)),
+      isError: readString(item.status) === "failed",
+    };
+  }
+
+  if (type === "mcpToolCall") {
+    const error = readRecord(item.error);
+    return {
+      id,
+      kind: "tool",
+      toolName: `mcp:${readString(item.server) ?? "unknown"}/${readString(item.tool) ?? "tool"}`,
+      detail: trimRecoveryDetail(readString(error?.message) ?? ""),
+      isError: Boolean(error) || readString(item.status) === "failed",
+    };
+  }
+
+  if (type === "dynamicToolCall") {
+    return {
+      id,
+      kind: "tool",
+      toolName: `dynamic:${readString(item.namespace) ?? "tool"}/${readString(item.tool) ?? "call"}`,
+      detail: "",
+      isError: readString(item.status) === "failed" || item.success === false,
+    };
+  }
+
+  if (type === "contextCompaction") {
+    return { id, kind: "tool", toolName: "context_compaction", detail: "", isError: false };
+  }
+
+  const toolName = getCanonicalAppServerToolName(item);
+  if (!toolName) {
+    return undefined;
+  }
+  return {
+    id,
+    kind: "tool",
+    toolName,
+    detail: trimRecoveryDetail(summarizeCanonicalAppServerItem(item) ?? ""),
+    isError: isCanonicalAppServerItemError(item),
+  };
+}
+
+function trimRecoveryDetail(value: string): string {
+  const limit = 6000;
+  return value.length > limit ? `${value.slice(0, limit)}\n...truncated` : value;
+}
+
 function readRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : undefined;
 }
@@ -1564,6 +1895,81 @@ function isRecoverableAppServerError(error: unknown): boolean {
 
 function readBoolean(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
+}
+
+function getCanonicalAppServerToolName(item: Record<string, unknown> | undefined): string | undefined {
+  const type = readString(item?.type);
+  if (type === "collabAgentToolCall") {
+    return `subagent:${readString(item?.tool) ?? "collaboration"}`;
+  }
+  if (type === "subAgentActivity") {
+    return `subagent:${readString(item?.kind) ?? "activity"}`;
+  }
+  if (type === "webSearch") {
+    return `web:${readString(item?.query) ?? "search"}`;
+  }
+  if (type === "imageView") {
+    return "view_image";
+  }
+  if (type === "imageGeneration") {
+    return "image_generation";
+  }
+  if (type === "sleep") {
+    return "sleep";
+  }
+  if (type === "enteredReviewMode") {
+    return "review:entered";
+  }
+  if (type === "exitedReviewMode") {
+    return "review:exited";
+  }
+  if (type === "hookPrompt") {
+    return "hook:prompt";
+  }
+  return undefined;
+}
+
+function summarizeCanonicalAppServerItem(item: Record<string, unknown>): string | undefined {
+  const type = readString(item.type);
+  if (type === "collabAgentToolCall") {
+    const receivers = readStringArray(item.receiverThreadIds);
+    const states = readRecord(item.agentsStates);
+    const stateSummary = states
+      ? Object.entries(states)
+          .map(([threadId, value]) => {
+            const status = readString(readRecord(value)?.status);
+            return status ? `${threadId}: ${status}` : undefined;
+          })
+          .filter((value): value is string => Boolean(value))
+          .join("\n")
+      : "";
+    return [receivers.length > 0 ? `targets: ${receivers.join(", ")}` : undefined, stateSummary || undefined]
+      .filter((value): value is string => Boolean(value))
+      .join("\n") || undefined;
+  }
+  if (type === "subAgentActivity") {
+    const threadId = readString(item.agentThreadId);
+    const kind = readString(item.kind);
+    return [threadId ? `agent: ${threadId}` : undefined, kind ? `activity: ${kind}` : undefined]
+      .filter((value): value is string => Boolean(value))
+      .join("\n") || undefined;
+  }
+  if (type === "webSearch") {
+    return readString(item.query);
+  }
+  if (type === "sleep") {
+    const durationMs = readNumber(item.durationMs);
+    return durationMs === undefined ? undefined : `duration: ${durationMs}ms`;
+  }
+  if (type === "imageView") {
+    return readString(item.path);
+  }
+  return undefined;
+}
+
+function isCanonicalAppServerItemError(item: Record<string, unknown>): boolean {
+  const status = readString(item.status);
+  return status === "failed" || status === "declined" || readString(item.kind) === "interrupted";
 }
 
 function readStringArray(value: unknown): string[] {

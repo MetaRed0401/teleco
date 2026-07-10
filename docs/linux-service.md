@@ -1,6 +1,6 @@
 # Linux user service
 
-TeleCodex is usually most useful as a host user service. Running on the host lets Codex use the same `codex` auth state, workspace files, shell tools, and language CLIs that you use in your terminal.
+TeleCodex is usually most useful as a host user service. Running on the host lets Codex use the same `codex` auth state, workspace files, shell tools, and language CLIs that you use in your terminal. Keep the host service aligned to Codex CLI/app-server 0.144.1+ for canonical app-server compatibility.
 
 ## Install service support
 
@@ -95,6 +95,14 @@ scripts/telecodex-service.sh update --all
 ```
 
 `update` installs dependencies, rebuilds `dist/`, and restarts the selected instance(s). During update, the script writes `.telecodex/service-update.lock` with the running PID, target, command, and start time so other agents/scripts can avoid colliding.
+
+Telegram `/restart` and `/update` refuse to proceed while Codex work is active. `/force_restart` is the explicit immediate path. Codex turns run in the independent `telecodex-codex-app-server.service`, while each Teleco instance owns only a local WebSocket connection; restarting Teleco therefore leaves server-owned work running and reconciles its final response after startup. The service installer enables this single shared user unit automatically.
+
+Direct script control uses the same guard. `scripts/telecodex-service.sh restart <instance>` and `update <instance>` inspect the instance-local active-operation owner PID and refuse to stop a live worker. Append `--force` only for an intentional immediate restart:
+
+```bash
+scripts/telecodex-service.sh restart first --force
+```
 
 `/service_update` from Telegram updates the current process instance using `TELECODEX_INSTANCE`. In single-bot mode this is `default`; in multi-bot mode it is the systemd instance name such as `first`, `second`, or `third`.
 

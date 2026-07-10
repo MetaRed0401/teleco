@@ -1,6 +1,10 @@
 # macOS LaunchAgent service
 
-TeleCodex can run as a macOS user LaunchAgent. This is the macOS equivalent of the Linux user systemd service: it runs under your user account, can reuse your Codex CLI auth state, and can access the same workspace files and developer tools available on the host.
+TeleCodex can run as a macOS user LaunchAgent. This is the macOS equivalent of the Linux user systemd service: it runs under your user account, can reuse your Codex CLI auth state, and can access the same workspace files and developer tools available on the host. Keep the app-server runtime baseline at 0.144.1+ for canonical app-server compatibility.
+
+macOS currently retains the bridge-owned direct stdio app-server compatibility path. Persistent runtime supervision is implemented for Linux first; restarting the macOS LaunchAgent can therefore interrupt an active turn until equivalent launchd ownership is added.
+
+The launchd helper also blocks direct restart/update while a live operation owner PID exists. Use `scripts/telecodex-launchd.sh restart <instance> --force` only when an immediate restart is intentional.
 
 ## Install service support
 

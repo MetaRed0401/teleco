@@ -8,8 +8,11 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 USER_SYSTEMD_DIR="${HOME}/.config/systemd/user"
 UNIT_SRC="${REPO_DIR}/systemd/${LEGACY_SERVICE_NAME}"
 TEMPLATE_UNIT_SRC="${REPO_DIR}/systemd/${TEMPLATE_SERVICE_NAME}"
+CODEX_SERVER_SERVICE_NAME="telecodex-codex-app-server.service"
+CODEX_SERVER_UNIT_SRC="${REPO_DIR}/systemd/${CODEX_SERVER_SERVICE_NAME}"
 UNIT_DEST="${USER_SYSTEMD_DIR}/${LEGACY_SERVICE_NAME}"
 TEMPLATE_UNIT_DEST="${USER_SYSTEMD_DIR}/${TEMPLATE_SERVICE_NAME}"
+CODEX_SERVER_UNIT_DEST="${USER_SYSTEMD_DIR}/${CODEX_SERVER_SERVICE_NAME}"
 LOCK_DIR="${REPO_DIR}/.telecodex"
 LOCK_FILE="${LOCK_DIR}/service-update.lock"
 BIN_DIR="${HOME}/.local/bin"
@@ -35,7 +38,7 @@ run_cmd() {
 
 usage() {
   cat <<USAGE
-Usage: scripts/telecodex-service.sh <command> [instance|--all]
+Usage: scripts/telecodex-service.sh <command> [instance|--all] [--force]
 
 Setup:
   install                  Install service units, install deps, and build
@@ -49,7 +52,9 @@ Setup:
 Control:
   start [instance|--all]   Start single .env service, one instance, or all instances with --all
   stop [instance|--all]    Stop single .env service, one instance, or all instances with --all
-  restart [instance|--all] Restart single .env service, one instance, or all instances with --all
+  restart [instance|--all] Restart only when no live operation owns the instance
+  restart [instance|--all] --force
+                           Restart immediately even when work is active
   status [instance|--all]  Show single .env service, one instance, or all instances with --all
   logs <instance>          Follow logs for one instance
   update [instance|--all]  Install deps, build, and restart selected service(s)
@@ -69,6 +74,8 @@ Examples:
   scripts/telecodex-service.sh start main
   scripts/telecodex-service.sh update main
   scripts/telecodex-service.sh update --all
+  scripts/telecodex-service.sh runtime-status
+  scripts/telecodex-service.sh runtime-restart [--force]
 USAGE
 }
 
@@ -116,10 +123,13 @@ install_units() {
   detail "Repository: ${REPO_DIR}"
   detail "Legacy unit: ${UNIT_DEST}"
   detail "Template unit: ${TEMPLATE_UNIT_DEST}"
+  detail "Codex app-server unit: ${CODEX_SERVER_UNIT_DEST}"
   run_cmd mkdir -p "${USER_SYSTEMD_DIR}"
   run_cmd install -m 0644 "${UNIT_SRC}" "${UNIT_DEST}"
   run_cmd install -m 0644 "${TEMPLATE_UNIT_SRC}" "${TEMPLATE_UNIT_DEST}"
+  run_cmd install -m 0644 "${CODEX_SERVER_UNIT_SRC}" "${CODEX_SERVER_UNIT_DEST}"
   run_user_systemctl daemon-reload
+  run_user_systemctl enable --now "${CODEX_SERVER_SERVICE_NAME}"
 }
 
 build_project() {
@@ -305,6 +315,46 @@ workspace_for_instance() {
     return
   fi
   printf '%s\n' "${REPO_DIR}"
+}
+
+active_operations_path_for_instance() {
+  local instance="$1"
+  local workspace
+  workspace="$(workspace_for_instance "${instance}")"
+  if [[ "${instance}" == "default" ]]; then
+    printf '%s/.telecodex/active-operations.json\n' "${workspace}"
+    return
+  fi
+  printf '%s/.telecodex/%s/active-operations.json\n' "${workspace}" "${instance}"
+}
+
+guard_instance_active_work() {
+  local instance="$1"
+  local force="${2:-}"
+  [[ "${force}" == "--force" ]] && return 0
+
+  local operations_path status
+  operations_path="$(active_operations_path_for_instance "${instance}")"
+  if node -e '
+    const fs = require("node:fs");
+    const file = process.argv[1];
+    if (!fs.existsSync(file)) process.exit(0);
+    try {
+      const rows = JSON.parse(fs.readFileSync(file, "utf8"));
+      const live = Array.isArray(rows) && rows.some((row) => {
+        if (row?.status !== "running" || !Number.isInteger(row?.ownerPid)) return false;
+        try { process.kill(row.ownerPid, 0); return true; } catch { return false; }
+      });
+      process.exit(live ? 2 : 0);
+    } catch { process.exit(0); }
+  ' "${operations_path}"; then
+    return 0
+  else
+    status=$?
+  fi
+  if [[ "${status}" == "2" ]]; then
+    fail "Instance '${instance}' has active Codex work. Retry when idle or append --force."
+  fi
 }
 
 log_file_for_instance() {
@@ -540,6 +590,7 @@ validate_env_for_instance() {
 service_command() {
   local action="$1"
   local target="${2:-}"
+  local force="${3:-}"
   local instances=()
   local instance
 
@@ -556,6 +607,9 @@ service_command() {
 
   for instance in "${instances[@]}"; do
     validate_env_for_instance "${instance}"
+    if [[ "${action}" == "restart" ]]; then
+      guard_instance_active_work "${instance}" "${force}"
+    fi
     section "${action^} ${instance}"
     if [[ "${action}" == "logs" ]]; then
       detail "Press Ctrl-C to stop following logs."
@@ -625,6 +679,7 @@ LOCK
 
 update_command() {
   local target="${1:-}"
+  local force="${2:-}"
   local instances=()
   local instance
 
@@ -635,6 +690,10 @@ update_command() {
   done < <(target_instances "${target}")
 
   [[ "${#instances[@]}" -gt 0 ]] || fail "No instances found."
+
+  for instance in "${instances[@]}"; do
+    guard_instance_active_work "${instance}" "${force}"
+  done
 
   acquire_lock "update" "${target}"
   install_units
@@ -647,6 +706,27 @@ update_command() {
   done
 
   section "Update complete"
+}
+
+runtime_status_command() {
+  section "Codex runtime status"
+  systemctl --user status "${CODEX_SERVER_SERVICE_NAME}" --no-pager || true
+}
+
+runtime_restart_command() {
+  local force="${1:-}"
+  local instance
+
+  if [[ "${force}" != "--force" ]]; then
+    while IFS= read -r instance; do
+      [[ -n "${instance}" ]] || continue
+      guard_instance_active_work "${instance}" ""
+    done < <(all_instances)
+  fi
+
+  install_units
+  section "Restarting persistent Codex runtime"
+  run_user_systemctl restart "${CODEX_SERVER_SERVICE_NAME}"
 }
 
 bin_install_command() {
@@ -676,7 +756,8 @@ uninstall_command() {
     run_user_systemctl disable --now "$(service_name_for_instance "${instance}")" || true
   done
   run_user_systemctl disable --now "${LEGACY_SERVICE_NAME}" || true
-  run_cmd rm -f "${UNIT_DEST}" "${TEMPLATE_UNIT_DEST}"
+  run_user_systemctl disable --now "${CODEX_SERVER_SERVICE_NAME}" || true
+  run_cmd rm -f "${UNIT_DEST}" "${TEMPLATE_UNIT_DEST}" "${CODEX_SERVER_UNIT_DEST}"
   run_user_systemctl daemon-reload
   section "Uninstall complete"
   detail "Env files were kept."
@@ -706,10 +787,16 @@ case "${command}" in
     list_command
     ;;
   start | stop | restart | status | logs)
-    service_command "${command}" "${1:-}"
+    service_command "${command}" "${1:-}" "${2:-}"
     ;;
   update)
-    update_command "${1:-}"
+    update_command "${1:-}" "${2:-}"
+    ;;
+  runtime-status)
+    runtime_status_command
+    ;;
+  runtime-restart)
+    runtime_restart_command "${1:-}"
     ;;
   bin-install)
     bin_install_command

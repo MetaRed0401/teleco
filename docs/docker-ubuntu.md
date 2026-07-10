@@ -9,7 +9,7 @@ Docker provides two variants with the same TeleCodex app behavior:
 - `Dockerfile` + `docker-compose.yml`: normal image with Node, pnpm, Codex CLI, and required runtime dependencies.
 - `Dockerfile.local` + `docker-compose.local.yml`: operator image with the brew-parity toolset used in this environment.
 
-Both variants pin Codex CLI to the supported 0.142.5 baseline by default. Override `CODEX_CLI_VERSION` only when you have tested the target Codex app-server version with TeleCodex.
+Both variants pin Codex CLI to the supported 0.144.1 baseline by default. This baseline supports the canonical app-server item protocol and includes the `0.142.5` WebSocket trace-log privacy fix. Override `CODEX_CLI_VERSION` only when you have tested the target Codex app-server version with TeleCodex.
 
 Use the normal image by default:
 

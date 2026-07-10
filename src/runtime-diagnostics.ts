@@ -8,8 +8,11 @@ import { escapeHTML } from "./format.js";
 
 const COMMAND_TIMEOUT_MS = 1800;
 const OUTPUT_LIMIT = 4000;
+const MIN_RECOMMENDED_CODEX_CLI_VERSION = "0.144.1";
 const APP_SERVER_APPROVAL_BRIDGE_DETAIL =
   "Codex app-server exposes approval server requests that TeleCodex can forward to Telegram inline buttons.";
+const CODEX_BASELINE_REASON =
+  "matches the supported canonical app-server protocol and includes the 0.142.5 trace-log privacy fix";
 
 export type RuntimeDoctorReport = {
   instanceName: string;
@@ -41,6 +44,10 @@ export type RuntimeDoctorReport = {
   codex: {
     approvalBridgeSupported: boolean;
     approvalBridgeDetail: string;
+    minimumVersionRequirement: {
+      status: "ok" | "warn" | "unknown";
+      detail: string;
+    };
   };
 };
 
@@ -124,6 +131,7 @@ export async function collectRuntimeDoctor(options: {
     codex: {
       approvalBridgeSupported: true,
       approvalBridgeDetail: APP_SERVER_APPROVAL_BRIDGE_DETAIL,
+      minimumVersionRequirement: getCodexVersionRequirement(codex.available, codex.version),
     },
   };
 }
@@ -178,6 +186,7 @@ export function renderRuntimeDoctor(report: RuntimeDoctorReport): { html: string
     `pnpm-lock.yaml: ${formatBoolean(report.project.hasPnpmLock)}`,
     `node_modules: ${formatBoolean(report.project.hasNodeModules)}`,
   ];
+  const codexVersionRequirement = formatCodexVersionRequirement(report.codex.minimumVersionRequirement);
   const gitLines = [
     `available: ${formatBoolean(report.git.available)}`,
     report.git.insideWorkTree !== undefined ? `worktree: ${formatBoolean(report.git.insideWorkTree)}` : undefined,
@@ -220,6 +229,9 @@ export function renderRuntimeDoctor(report: RuntimeDoctorReport): { html: string
     "",
     "Codex app-server:",
     `- ${approvalLine}`,
+    "",
+    "Codex CLI baseline:",
+    `- ${codexVersionRequirement}`,
   ]
     .filter((line): line is string => line !== undefined)
     .join("\n");
@@ -248,6 +260,9 @@ export function renderRuntimeDoctor(report: RuntimeDoctorReport): { html: string
     `<pre>${escapeHTML(envLines.map((line) => `- ${line}`).join("\n"))}</pre>`,
     "<b>Codex app-server</b>",
     `<pre>${escapeHTML(`- ${approvalLine}`)}</pre>`,
+    "",
+    "<b>Codex CLI baseline</b>",
+    `<pre>${escapeHTML(`- ${codexVersionRequirement}`)}</pre>`,
   ].join("\n");
 
   return { html, plain };
@@ -493,6 +508,74 @@ function appendLimited(current: string, next: string): string {
 function firstLine(value?: string): string | undefined {
   const line = value?.split(/\r?\n/).map((entry) => entry.trim()).find(Boolean);
   return line || undefined;
+}
+
+function getCodexVersionRequirement(
+  available: boolean,
+  rawVersion: string | undefined,
+): { status: "ok" | "warn" | "unknown"; detail: string } {
+  if (!available) {
+    return {
+      status: "unknown",
+      detail: `Codex CLI not found. Install ${MIN_RECOMMENDED_CODEX_CLI_VERSION}+ for the WebSocket trace log privacy fix.`,
+    };
+  }
+
+  const parsed = parseVersion(rawVersion);
+  if (!parsed) {
+    return {
+      status: "unknown",
+      detail:
+        `Unable to parse codex --version output. Confirm ${MIN_RECOMMENDED_CODEX_CLI_VERSION}+ for a WebSocket trace log privacy fix.`,
+    };
+  }
+
+  const current = toVersionParts(parsed);
+  const minimum = toVersionParts(MIN_RECOMMENDED_CODEX_CLI_VERSION);
+  if (isLessThan(current, minimum)) {
+    return {
+      status: "warn",
+      detail:
+        `Detected ${parsed}; upgrade to ${MIN_RECOMMENDED_CODEX_CLI_VERSION}+ to ${CODEX_BASELINE_REASON}.`,
+    };
+  }
+
+  return {
+    status: "ok",
+    detail: `Detected ${parsed}; includes the WebSocket trace log privacy fix (${CODEX_BASELINE_REASON}).`,
+  };
+}
+
+function parseVersion(raw: string | undefined): string | undefined {
+  if (!raw) {
+    return undefined;
+  }
+  const match = raw.match(/(\d+)\.(\d+)\.(\d+)/);
+  return match ? `${match[1]}.${match[2]}.${match[3]}` : undefined;
+}
+
+function toVersionParts(raw: string): [number, number, number] {
+  const [major, minor, patch] = raw.split(".").map((entry) => Number.parseInt(entry, 10));
+  return [major, minor, patch];
+}
+
+function isLessThan(left: [number, number, number], right: [number, number, number]): boolean {
+  if (left[0] !== right[0]) {
+    return left[0] < right[0];
+  }
+  if (left[1] !== right[1]) {
+    return left[1] < right[1];
+  }
+  return left[2] < right[2];
+}
+
+function formatCodexVersionRequirement(requirement: {
+  status: "ok" | "warn" | "unknown";
+  detail: string;
+}): string {
+  const prefix =
+    requirement.status === "warn" ? "warning" : requirement.status === "ok" ? "OK" : "info";
+  return `${prefix}: ${requirement.detail}`;
 }
 
 function formatAge(ageMs: number): string {
