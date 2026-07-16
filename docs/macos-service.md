@@ -1,8 +1,8 @@
 # macOS LaunchAgent service
 
-TeleCodex can run as a macOS user LaunchAgent. This is the macOS equivalent of the Linux user systemd service: it runs under your user account, can reuse your Codex CLI auth state, and can access the same workspace files and developer tools available on the host. Keep the app-server runtime baseline at 0.144.1+ for canonical app-server compatibility.
+TeleCodex can run as a macOS user LaunchAgent. This is the macOS equivalent of the Linux user systemd service: it runs under your user account, can reuse your Codex CLI auth state, and can access the same workspace files and developer tools available on the host. Codex CLI/app-server 0.144.1 is the minimum compatible baseline; 0.144.4 is the recommended stable version.
 
-macOS currently retains the bridge-owned direct stdio app-server compatibility path. Persistent runtime supervision is implemented for Linux first; restarting the macOS LaunchAgent can therefore interrupt an active turn until equivalent launchd ownership is added.
+The launchd helper installs one persistent Codex app-server LaunchAgent on `ws://127.0.0.1:45123`. All Teleco bot LaunchAgents share this loopback-only runtime, so restarting or updating a bridge does not terminate an active Codex turn. Direct `pnpm dev` runs retain bridge-owned stdio unless the helper-provided runtime flag is present.
 
 The launchd helper also blocks direct restart/update while a live operation owner PID exists. Use `scripts/telecodex-launchd.sh restart <instance> --force` only when an immediate restart is intentional.
 
@@ -20,6 +20,16 @@ This installs dependencies, builds `dist/`, and writes LaunchAgent plist files u
 ~/Library/LaunchAgents/io.telecodex.plist
 ~/Library/LaunchAgents/io.telecodex.<instance>.plist
 ```
+
+It also writes and starts the shared runtime plist. Inspect or deliberately restart it with:
+
+```bash
+scripts/telecodex-launchd.sh runtime-status
+scripts/telecodex-launchd.sh runtime-restart
+scripts/telecodex-launchd.sh runtime-restart --force
+```
+
+The non-force restart refuses to stop the runtime while any configured instance owns active work.
 
 Single-bot mode uses `.env` with the `default` instance. Multi-bot mode uses `.env.<instance>` files.
 

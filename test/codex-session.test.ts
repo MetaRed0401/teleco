@@ -75,8 +75,59 @@ const mockState = vi.hoisted(() => {
   };
 });
 
+const mockAppServerState = vi.hoisted(() => {
+  let notifications: Array<{ method: string; params?: unknown }> = [];
+
+  const CodexAppServerClient = vi.fn().mockImplementation(function () {
+    const listeners = new Set<(notification: { method: string; params?: unknown }) => void>();
+    const client = {
+      initialize: vi.fn().mockResolvedValue(undefined),
+      isHealthy: vi.fn().mockReturnValue(true),
+      getNotifications: vi.fn().mockReturnValue([]),
+      getClosedReason: vi.fn().mockReturnValue(undefined),
+      close: vi.fn(),
+      onNotification: vi.fn((listener: (notification: { method: string; params?: unknown }) => void) => {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      }),
+      request: vi.fn().mockImplementation(async (method: string) => {
+        if (method === "thread/start") {
+          return { thread: { id: "thread-app-server" } };
+        }
+        if (method === "turn/start") {
+          setTimeout(() => {
+            for (const notification of notifications) {
+              for (const listener of [...listeners]) {
+                listener(notification);
+              }
+            }
+          }, 0);
+          return { turn: { id: "turn-app-server" } };
+        }
+        throw new Error(`Unexpected app-server request: ${method}`);
+      }),
+    };
+    return client;
+  });
+
+  return {
+    CodexAppServerClient,
+    setNotifications: (next: Array<{ method: string; params?: unknown }>) => {
+      notifications = next;
+    },
+    reset: () => {
+      notifications = [];
+      CodexAppServerClient.mockClear();
+    },
+  };
+});
+
 vi.mock("@openai/codex-sdk", () => ({
   Codex: mockState.Codex,
+}));
+
+vi.mock("../src/codex-app-server-client.js", () => ({
+  CodexAppServerClient: mockAppServerState.CodexAppServerClient,
 }));
 
 vi.mock("../src/codex-state.js", () => ({
@@ -143,7 +194,19 @@ describe("CodexSessionService", () => {
   beforeEach(() => {
     mockState.reset();
     mockCodexState.reset();
+    mockAppServerState.reset();
   });
+
+  const completedAppServerTurn = {
+    method: "turn/completed",
+    params: {
+      threadId: "thread-app-server",
+      turn: { id: "turn-app-server", status: "completed" },
+    },
+  };
+
+  const createAppServerService = () =>
+    CodexSessionService.create(createConfig({ enableCodexAppServerRuntime: true }));
 
   it("creates the service and starts an initial thread", async () => {
     const service = await CodexSessionService.create(createConfig());
@@ -537,6 +600,241 @@ describe("CodexSessionService", () => {
     expect(callbacks.onToolEnd).toHaveBeenCalledWith("cmd-3", false);
   });
 
+  it("deduplicates canonical app-server command deltas against the completion snapshot", async () => {
+    const service = await createAppServerService();
+    const callbacks = createCallbacks();
+    mockAppServerState.setNotifications([
+      {
+        method: "item/started",
+        params: {
+          threadId: "thread-app-server",
+          item: { id: "canonical-command", type: "commandExecution", command: "printf output" },
+        },
+      },
+      {
+        method: "item/commandExecution/outputDelta",
+        params: { threadId: "thread-app-server", itemId: "canonical-command", delta: "first\n" },
+      },
+      {
+        method: "item/completed",
+        params: {
+          threadId: "thread-app-server",
+          item: {
+            id: "canonical-command",
+            type: "commandExecution",
+            command: "printf output",
+            aggregatedOutput: "first\nsecond\n",
+            status: "completed",
+          },
+        },
+      },
+      completedAppServerTurn,
+    ]);
+
+    await service.prompt("run command", callbacks);
+
+    expect(callbacks.onToolStart).toHaveBeenCalledTimes(1);
+    expect(callbacks.onToolStart).toHaveBeenCalledWith("printf output", "canonical-command");
+    expect(callbacks.onToolUpdate.mock.calls).toEqual([
+      ["canonical-command", "first\n", { kind: "output" }],
+      ["canonical-command", "second\n", { kind: "output" }],
+    ]);
+    expect(callbacks.onToolEnd).toHaveBeenCalledTimes(1);
+    expect(callbacks.onToolEnd).toHaveBeenCalledWith("canonical-command", false);
+  });
+
+  it("keeps context usage pending until the selected model reports a fresh app-server window", async () => {
+    const service = await createAppServerService();
+    const callbacks = createCallbacks();
+    expect(service.getInfo()).toMatchObject({ model: "o3", contextWindowPending: true });
+
+    mockAppServerState.setNotifications([
+      {
+        method: "thread/tokenUsage/updated",
+        params: {
+          threadId: "thread-app-server",
+          turnId: "turn-app-server",
+          tokenUsage: {
+            last: { inputTokens: 20_000, cachedInputTokens: 10_000, outputTokens: 100 },
+            total: { inputTokens: 20_000, cachedInputTokens: 10_000, outputTokens: 100 },
+            modelContextWindow: 100_000,
+          },
+        },
+      },
+      completedAppServerTurn,
+    ]);
+    await service.prompt("model a turn", callbacks);
+    expect(service.getInfo()).toMatchObject({
+      model: "o3",
+      contextWindow: {
+        model: "o3",
+        limit: 100_000,
+        effectiveLimit: 100_000,
+        source: "app-server",
+        used: 20_000,
+        remaining: 80_000,
+        percentUsed: 20,
+      },
+    });
+
+    service.setModel("o4-mini");
+    expect(service.getInfo()).toMatchObject({
+      model: "o4-mini",
+      contextWindowPending: true,
+      lastTurnTokens: { input: 20_000, cached: 10_000, output: 100 },
+    });
+    expect(service.getInfo().contextWindow).toBeUndefined();
+
+    mockAppServerState.setNotifications([
+      {
+        method: "thread/tokenUsage/updated",
+        params: {
+          threadId: "thread-app-server",
+          turnId: "turn-app-server",
+          tokenUsage: {
+            last: { inputTokens: 50_000, cachedInputTokens: 40_000, outputTokens: 200 },
+            total: { inputTokens: 70_000, cachedInputTokens: 50_000, outputTokens: 300 },
+            modelContextWindow: 200_000,
+          },
+        },
+      },
+      completedAppServerTurn,
+    ]);
+    await service.prompt("model b turn", callbacks);
+    expect(service.getInfo()).toMatchObject({
+      model: "o4-mini",
+      contextWindow: {
+        model: "o4-mini",
+        limit: 200_000,
+        effectiveLimit: 200_000,
+        source: "app-server",
+        used: 50_000,
+        remaining: 150_000,
+        percentUsed: 25,
+      },
+    });
+    expect(service.getInfo().contextWindowPending).toBeUndefined();
+  });
+
+  it("renders a canonical app-server completion without prior start or delta notifications", async () => {
+    const service = await createAppServerService();
+    const callbacks = createCallbacks();
+    mockAppServerState.setNotifications([
+      {
+        method: "item/completed",
+        params: {
+          threadId: "thread-app-server",
+          item: {
+            id: "completion-only",
+            type: "commandExecution",
+            command: "echo ready",
+            aggregatedOutput: "ready\n",
+            status: "completed",
+          },
+        },
+      },
+      completedAppServerTurn,
+    ]);
+
+    await service.prompt("fast command", callbacks);
+
+    expect(callbacks.onToolStart).toHaveBeenCalledWith("echo ready", "completion-only");
+    expect(callbacks.onToolUpdate).toHaveBeenCalledWith("completion-only", "ready\n", { kind: "output" });
+    expect(callbacks.onToolEnd).toHaveBeenCalledWith("completion-only", false);
+  });
+
+  it("ignores duplicated canonical completion replay for the same item id", async () => {
+    const service = await createAppServerService();
+    const callbacks = createCallbacks();
+    const completion = {
+      method: "item/completed",
+      params: {
+        threadId: "thread-app-server",
+        item: {
+          id: "replayed-command",
+          type: "commandExecution",
+          command: "echo once",
+          aggregatedOutput: "once\n",
+          status: "completed",
+        },
+      },
+    };
+    mockAppServerState.setNotifications([completion, completion, completedAppServerTurn]);
+
+    await service.prompt("replay command", callbacks);
+
+    expect(callbacks.onToolStart).toHaveBeenCalledTimes(1);
+    expect(callbacks.onToolUpdate).toHaveBeenCalledTimes(1);
+    expect(callbacks.onToolEnd).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores unknown canonical item types without failing the turn or exposing their payload", async () => {
+    const service = await createAppServerService();
+    const callbacks = createCallbacks();
+    mockAppServerState.setNotifications([
+      {
+        method: "item/started",
+        params: {
+          threadId: "thread-app-server",
+          item: { id: "future-item", type: "futureSensitiveItem", secret: "must-not-be-rendered" },
+        },
+      },
+      {
+        method: "item/completed",
+        params: {
+          threadId: "thread-app-server",
+          item: { id: "future-item", type: "futureSensitiveItem", secret: "must-not-be-rendered" },
+        },
+      },
+      {
+        method: "item/completed",
+        params: {
+          threadId: "thread-owned-by-another-instance",
+          item: {
+            id: "foreign-command",
+            type: "commandExecution",
+            command: "must not run",
+            aggregatedOutput: "must not render",
+            status: "completed",
+          },
+        },
+      },
+      completedAppServerTurn,
+    ]);
+
+    await expect(service.prompt("future event", callbacks)).resolves.toBeUndefined();
+    expect(callbacks.onToolStart).not.toHaveBeenCalled();
+    expect(callbacks.onToolUpdate).not.toHaveBeenCalled();
+    expect(callbacks.onToolEnd).not.toHaveBeenCalled();
+  });
+
+  it("releases canonical item lifecycle state between app-server turns", async () => {
+    const service = await createAppServerService();
+    const callbacks = createCallbacks();
+    const completion = {
+      method: "item/completed",
+      params: {
+        threadId: "thread-app-server",
+        item: {
+          id: "reused-item-id",
+          type: "commandExecution",
+          command: "echo reusable",
+          aggregatedOutput: "reusable\n",
+          status: "completed",
+        },
+      },
+    };
+
+    mockAppServerState.setNotifications([completion, completedAppServerTurn]);
+    await service.prompt("first turn", callbacks);
+    mockAppServerState.setNotifications([completion, completedAppServerTurn]);
+    await service.prompt("second turn", callbacks);
+
+    expect(callbacks.onToolStart).toHaveBeenCalledTimes(2);
+    expect(callbacks.onToolUpdate).toHaveBeenCalledTimes(2);
+    expect(callbacks.onToolEnd).toHaveBeenCalledTimes(2);
+  });
+
   it("synthesizes tool events for file changes", async () => {
     const service = await CodexSessionService.create(createConfig());
     const thread = mockState.createdThreads[0];
@@ -553,6 +851,7 @@ describe("CodexSessionService", () => {
               { kind: "add", path: "src/new.ts" },
               { kind: "update", path: "README.md" },
             ],
+            diff: "diff --git a/src/new.ts b/src/new.ts\n@@\n+export const value = 1;\n",
             status: "completed",
           },
         },
@@ -563,6 +862,11 @@ describe("CodexSessionService", () => {
 
     expect(callbacks.onToolStart).toHaveBeenCalledWith("file_change", "patch-1");
     expect(callbacks.onToolUpdate).toHaveBeenCalledWith("patch-1", "add src/new.ts, update README.md");
+    expect(callbacks.onToolUpdate).toHaveBeenCalledWith(
+      "patch-1",
+      "diff --git a/src/new.ts b/src/new.ts\n@@\n+export const value = 1;",
+      { kind: "diff" },
+    );
     expect(callbacks.onToolEnd).toHaveBeenCalledWith("patch-1", false);
   });
 

@@ -98,10 +98,12 @@ export interface CodexSessionInfo {
     model: string;
     limit: number;
     effectiveLimit: number;
+    source: "app-server" | "model-cache";
     used?: number;
     remaining?: number;
     percentUsed?: number;
   };
+  contextWindowPending?: boolean;
 }
 
 export interface CodexCompactResult {
@@ -228,6 +230,8 @@ export class CodexSessionService {
   private lastTurnTokens: { input: number; cached: number; output: number } | undefined;
   private contextTokensUsed: number | undefined;
   private appServerModelContextWindow: number | undefined;
+  private appServerContextWindowModel: string | undefined;
+  private contextWindowPendingModel: string | undefined;
   private appServerClient: CodexAppServerClient | null = null;
   private appServerInitialized = false;
   private appServerThreadLoaded = false;
@@ -312,6 +316,9 @@ export class CodexSessionService {
     const contextWindow = this.getContextWindowInfo(info.model);
     if (contextWindow) {
       info.contextWindow = contextWindow;
+    }
+    if (info.model && this.contextWindowPendingModel === info.model) {
+      info.contextWindowPending = true;
     }
 
     return info;
@@ -418,11 +425,8 @@ export class CodexSessionService {
         rateLimits: parseRateLimitStatus(rateLimitResponse),
       };
       details.config = parseConfigStatus(configResponse);
-      if (details.config?.model) {
+      if (details.config?.model && !this.currentModel) {
         this.currentModel = details.config.model;
-      }
-      if (details.config?.modelContextWindow) {
-        this.appServerModelContextWindow = details.config.modelContextWindow;
       }
       const thread = parseThreadStatus(threadResponse);
       if (thread) {
@@ -677,7 +681,7 @@ export class CodexSessionService {
       this.currentWorkspace = effectiveWorkspace;
       this.currentThreadId = threadId;
       this.appServerThreadLoaded = true;
-      this.resetUsageState();
+      this.resetUsageState(effectiveModel);
       if (model) {
         this.currentModel = model;
       }
@@ -690,7 +694,7 @@ export class CodexSessionService {
     this.activeThreadLaunchProfile = this.currentLaunchProfile;
     this.currentWorkspace = effectiveWorkspace;
     this.currentThreadId = this.thread.id ?? null;
-    this.resetUsageState();
+    this.resetUsageState(effectiveModel);
     if (model) {
       this.currentModel = model;
     }
@@ -726,6 +730,8 @@ export class CodexSessionService {
       this.lastTurnTokens = undefined;
       this.contextTokensUsed = undefined;
       this.appServerModelContextWindow = undefined;
+      this.appServerContextWindowModel = undefined;
+      this.contextWindowPendingModel = model ?? this.currentModel ?? this.config.codexModel;
       if (model) {
         this.currentModel = model;
       }
@@ -744,6 +750,8 @@ export class CodexSessionService {
     this.lastTurnTokens = undefined;
     this.contextTokensUsed = undefined;
     this.appServerModelContextWindow = undefined;
+    this.appServerContextWindowModel = undefined;
+    this.contextWindowPendingModel = undefined;
     if (model) {
       this.currentModel = model;
     }
@@ -775,7 +783,7 @@ export class CodexSessionService {
       this.currentWorkspace = workspace;
       this.currentThreadId = threadId;
       this.appServerThreadLoaded = true;
-      this.resetUsageState();
+      this.resetUsageState(model ?? this.currentModel ?? this.config.codexModel);
       if (model) {
         this.currentModel = model;
       }
@@ -786,7 +794,7 @@ export class CodexSessionService {
     this.activeThreadLaunchProfile = this.currentLaunchProfile;
     this.currentWorkspace = workspace;
     this.currentThreadId = threadId;
-    this.resetUsageState();
+    this.resetUsageState(model ?? this.currentModel);
     if (model) {
       this.currentModel = model;
     }
@@ -936,6 +944,12 @@ export class CodexSessionService {
   }
 
   setModel(slug: string): string {
+    if (this.currentModel !== slug && this.config.enableCodexAppServerRuntime) {
+      this.appServerModelContextWindow = undefined;
+      this.appServerContextWindowModel = undefined;
+      this.contextTokensUsed = undefined;
+      this.contextWindowPendingModel = slug;
+    }
     this.currentModel = slug;
     return slug;
   }
@@ -1120,11 +1134,13 @@ export class CodexSessionService {
     this.appServerToolLifecycles.clear();
   }
 
-  private resetUsageState(): void {
+  private resetUsageState(model = this.currentModel ?? this.config.codexModel): void {
     this.sessionTokens = { input: 0, cached: 0, output: 0 };
     this.lastTurnTokens = undefined;
     this.contextTokensUsed = undefined;
     this.appServerModelContextWindow = undefined;
+    this.appServerContextWindowModel = undefined;
+    this.contextWindowPendingModel = this.config.enableCodexAppServerRuntime ? model : undefined;
   }
 
   private buildAppServerConfig(serviceTier = this.getRequestedServiceTier(false)): Record<string, unknown> | undefined {
@@ -1369,6 +1385,14 @@ export class CodexSessionService {
     request: AppServerRequest,
     callbacks?: CodexSessionCallbacks,
   ): Promise<unknown> {
+    const requestThreadId = readString(readRecord(request.params)?.threadId);
+    if (requestThreadId && this.currentThreadId && requestThreadId !== this.currentThreadId) {
+      if (request.method === "mcpServer/elicitation/request") {
+        return { action: "cancel", content: null, _meta: null };
+      }
+      return { decision: "decline" };
+    }
+
     if (
       request.method === "item/commandExecution/requestApproval" ||
       request.method === "item/fileChange/requestApproval" ||
@@ -1402,6 +1426,7 @@ export class CodexSessionService {
       return { currentTimeAt: Math.floor(Date.now() / 1000) };
     }
 
+    this.appServerClient?.recordUnknownEvent?.("request", request.method);
     throw new Error(`Unsupported app-server request: ${request.method}`);
   }
 
@@ -1412,6 +1437,10 @@ export class CodexSessionService {
     const params = readRecord(notification.params);
     const notificationThreadId = readString(params?.threadId);
     if (notificationThreadId && this.currentThreadId && notificationThreadId !== this.currentThreadId) {
+      return;
+    }
+    const notificationTurnId = readString(params?.turnId) ?? readString(readRecord(params?.turn)?.id);
+    if (notificationTurnId && this.appServerCurrentTurnId && notificationTurnId !== this.appServerCurrentTurnId) {
       return;
     }
 
@@ -1451,6 +1480,8 @@ export class CodexSessionService {
           const toolName = getCanonicalAppServerToolName(item);
           if (toolName) {
             this.emitAppServerToolStart(callbacks, toolName, id);
+          } else if (type && !isKnownPassiveAppServerItem(type)) {
+            this.appServerClient?.recordUnknownEvent?.("item", type);
           }
         }
         break;
@@ -1559,6 +1590,8 @@ export class CodexSessionService {
               this.emitAppServerToolSnapshot(callbacks, id, summary);
             }
             this.emitAppServerToolEnd(callbacks, id, isCanonicalAppServerItemError(item));
+          } else if (type && !isKnownPassiveAppServerItem(type)) {
+            this.appServerClient?.recordUnknownEvent?.("item", type);
           }
         }
         break;
@@ -1626,8 +1659,15 @@ export class CodexSessionService {
           output: readNumber(total?.outputTokens) ?? this.sessionTokens.output,
         };
         this.contextTokensUsed = undefined;
-        this.appServerModelContextWindow =
-          readNumber(usage?.modelContextWindow) ?? this.appServerModelContextWindow;
+        const modelContextWindow = readNumber(usage?.modelContextWindow);
+        const activeModel = this.currentModel ?? this.config.codexModel;
+        if (modelContextWindow && activeModel) {
+          this.appServerModelContextWindow = modelContextWindow;
+          this.appServerContextWindowModel = activeModel;
+          if (this.contextWindowPendingModel === activeModel) {
+            this.contextWindowPendingModel = undefined;
+          }
+        }
         callbacks.onTurnComplete?.({
           inputTokens: input,
           cachedInputTokens: cached,
@@ -1667,6 +1707,17 @@ export class CodexSessionService {
       case "account/rateLimits/updated":
       case "mcp/server/status/updated":
         break;
+      case "model/rerouted": {
+        const toModel = readString(params?.toModel);
+        if (toModel && toModel !== this.currentModel) {
+          this.currentModel = toModel;
+          this.appServerModelContextWindow = undefined;
+          this.appServerContextWindowModel = undefined;
+          this.contextTokensUsed = undefined;
+          this.contextWindowPendingModel = toModel;
+        }
+        break;
+      }
       case "warning": {
         const message = readString(params?.message);
         if (message) {
@@ -1685,7 +1736,10 @@ export class CodexSessionService {
         callbacks.onToolEnd(id, true);
         break;
       }
+      case "parse/error":
+        break;
       default:
+        this.appServerClient?.recordUnknownEvent?.("notification", notification.method);
         break;
     }
   }
@@ -1776,15 +1830,24 @@ export class CodexSessionService {
       return undefined;
     }
 
+    if (this.contextWindowPendingModel === modelSlug) {
+      return undefined;
+    }
+
     const modelRecord = listModels().find((candidate) => candidate.slug === modelSlug);
-    const rawLimit = this.appServerModelContextWindow ?? modelRecord?.contextWindow ?? modelRecord?.maxContextWindow;
+    const hasAppServerWindow = this.appServerContextWindowModel === modelSlug && Boolean(this.appServerModelContextWindow);
+    const rawLimit = hasAppServerWindow
+      ? this.appServerModelContextWindow
+      : modelRecord?.contextWindow ?? modelRecord?.maxContextWindow;
     if (!rawLimit) {
       return undefined;
     }
 
-    const percent = this.appServerModelContextWindow ? 100 : modelRecord?.effectiveContextWindowPercent ?? 100;
+    const percent = hasAppServerWindow ? 100 : modelRecord?.effectiveContextWindowPercent ?? 100;
     const effectiveLimit = Math.floor(rawLimit * (percent / 100));
-    const rawUsed = this.contextTokensUsed ?? this.lastTurnTokens?.input;
+    const rawUsed = hasAppServerWindow || !this.config.enableCodexAppServerRuntime
+      ? this.contextTokensUsed ?? this.lastTurnTokens?.input
+      : undefined;
     const used = rawUsed !== undefined && rawUsed <= effectiveLimit ? rawUsed : undefined;
     const remaining = used === undefined ? undefined : Math.max(0, effectiveLimit - used);
     const percentUsed = used === undefined ? undefined : Math.round((used / effectiveLimit) * 100);
@@ -1793,6 +1856,7 @@ export class CodexSessionService {
       model: modelSlug,
       limit: rawLimit,
       effectiveLimit,
+      source: hasAppServerWindow ? "app-server" : "model-cache",
       used,
       remaining,
       percentUsed,
@@ -2364,6 +2428,10 @@ function summarizeAppServerProblem(notification: AppServerNotification): string 
 
 function randomItemId(): string {
   return `item-${Math.random().toString(36).slice(2)}`;
+}
+
+function isKnownPassiveAppServerItem(type: string): boolean {
+  return ["agentMessage", "userMessage", "plan", "reasoning"].includes(type);
 }
 
 function getLaunchProfile(config: TeleCodexConfig, profileId: string): CodexLaunchProfile {

@@ -5,7 +5,7 @@
 
 ARG NODE_MAJOR=22
 ARG PNPM_VERSION=11.5.3
-ARG CODEX_CLI_VERSION=0.144.1
+ARG CODEX_CLI_VERSION
 ARG YQ_VERSION=4.49.2
 ARG GRON_VERSION=0.7.1
 ARG WEBSOCAT_VERSION=1.14.0
@@ -27,6 +27,8 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ENV DEBIAN_FRONTEND=noninteractive \
     PNPM_HOME=/usr/local/share/pnpm \
     PATH=/usr/local/share/pnpm:/usr/local/bin:/usr/bin:/bin
+
+COPY codex-versions.json /tmp/codex-versions.json
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -61,7 +63,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends nodejs \
     && corepack enable \
     && corepack prepare "pnpm@${PNPM_VERSION}" --activate \
-    && npm install -g "@openai/codex@${CODEX_CLI_VERSION}" @ast-grep/cli \
+    && resolved_codex_cli_version="${CODEX_CLI_VERSION:-$(node -p "require('/tmp/codex-versions.json').recommended")}" \
+    && npm install -g "@openai/codex@${resolved_codex_cli_version}" @ast-grep/cli \
     && ln -sf /usr/bin/fdfind /usr/local/bin/fd \
     && ln -sf /usr/bin/batcat /usr/local/bin/bat \
     && case "${TARGETARCH:-amd64}" in \
@@ -87,6 +90,7 @@ WORKDIR /app
 FROM base AS build
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY codex-versions.json ./codex-versions.json
 RUN pnpm install --frozen-lockfile
 
 COPY tsconfig.json ./
@@ -106,6 +110,7 @@ RUN useradd --create-home --home-dir /home/telecodex --uid 1001 --shell /bin/bas
 WORKDIR /app
 
 COPY --from=build --chown=telecodex:telecodex /app/package.json ./package.json
+COPY --from=build --chown=telecodex:telecodex /app/codex-versions.json ./codex-versions.json
 COPY --from=build --chown=telecodex:telecodex /app/node_modules ./node_modules
 COPY --from=build --chown=telecodex:telecodex /app/dist ./dist
 

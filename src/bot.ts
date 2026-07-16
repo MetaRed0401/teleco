@@ -17,12 +17,21 @@ import {
 import {
   acknowledgeActiveOperationItem,
   finishActiveOperation,
+  setActiveOperationDeliveryState,
   startActiveOperation,
   updateActiveOperation,
   type ActiveOperationRecord,
 } from "./active-operations.js";
 import {
+  claimTelegramDelivery,
+  completeTelegramDelivery,
+  failTelegramDelivery,
+  scheduleTelegramDeliveryCleanup,
+} from "./telegram-delivery-store.js";
+import {
+  APPROVAL_REQUEST_TTL_MS,
   findInterruptedApproval,
+  findPersistedApprovalState,
   finishPersistedApproval,
   markRestartedApprovalsInterrupted,
   persistPendingApproval,
@@ -137,7 +146,19 @@ type PendingMcpElicitation = {
   resolve: (response: CodexMcpElicitationResponse) => void;
   timeout: NodeJS.Timeout;
   contextKey: TelegramContextKey | null;
-  origin: string;
+  kind: "url" | "form";
+  origin?: string;
+  form?: SupportedMcpForm;
+};
+type SupportedMcpForm = {
+  fieldName: string;
+  label: string;
+  description?: string;
+  required: boolean;
+  input:
+    | { kind: "boolean" }
+    | { kind: "enum"; options: Array<{ label: string; value: string }> }
+    | { kind: "string"; minLength?: number; maxLength?: number };
 };
 type QueuedPrompt = {
   id: number;
@@ -252,7 +273,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   const pendingPrettyButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingStreamingButtons = new Map<TelegramContextKey, StreamingSettingButton[]>();
   const pendingApprovals = new Map<string, PendingApproval>();
+  const pendingApprovalRequests = new Map<string, Promise<CodexApprovalResponse>>();
   const pendingMcpElicitations = new Map<string, PendingMcpElicitation>();
+  const pendingMcpFormByContext = new Map<TelegramContextKey, string>();
   const lastPromptInput = new Map<TelegramContextKey, CodexPromptInput>();
   const promptQueues = new Map<TelegramContextKey, QueuedPrompt[]>();
   const compactAbortControllers = new Map<TelegramContextKey, AbortController>();
@@ -685,7 +708,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         );
       }
       const cliResult = await runCliPtyCompact(session.getInfo(), { signal: compactAbortController.signal });
-      await session.resumeThread(cliResult.threadId);
+      await registry.resumeThread(contextKey, session, cliResult.threadId);
       registry.updateMetadata(contextKey, session);
       markAutoCompactCompleted(contextKey);
       finishActiveOperation(config, activeOperationId, "completed");
@@ -740,14 +763,14 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
   };
 
-  const requestTelegramApproval = async (
+  const requestTelegramApprovalOnce = async (
     ctx: Context,
     chatId: TelegramChatId,
     messageThreadId: number | undefined,
     request: CodexApprovalRequest,
   ): Promise<CodexApprovalResponse> => {
     const approvalContextKey = contextKeyFromCtx(ctx);
-    const fingerprint = fingerprintApprovalRequest(request);
+    const fingerprint = fingerprintApprovalRequest(request, instanceName);
     const interrupted = findInterruptedApproval(config, fingerprint, approvalContextKey);
     const approvalId = interrupted?.id ?? randomUUID();
     const rendered = renderApprovalRequest(request);
@@ -772,7 +795,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     });
 
     const createdAt = interrupted?.createdAt ?? Date.now();
-    const expiresAt = Date.now() + 5 * 60 * 1000;
+    const expiresAt = Date.now() + APPROVAL_REQUEST_TTL_MS;
     persistPendingApproval(config, {
       id: approvalId,
       fingerprint,
@@ -790,7 +813,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         pendingApprovals.delete(approvalId);
         finishPersistedApproval(config, approvalId, "expired", "decline");
         resolve({ decision: "decline" });
-      }, 5 * 60 * 1000);
+      }, APPROVAL_REQUEST_TTL_MS);
       pendingApprovals.set(approvalId, {
         resolve,
         timeout,
@@ -803,6 +826,31 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         createdAt,
       });
     });
+  };
+
+  const requestTelegramApproval = (
+    ctx: Context,
+    chatId: TelegramChatId,
+    messageThreadId: number | undefined,
+    request: CodexApprovalRequest,
+  ): Promise<CodexApprovalResponse> => {
+    const contextKey = contextKeyFromCtx(ctx);
+    const fingerprint = fingerprintApprovalRequest(request, instanceName);
+    const requestKey = `${contextKey ?? "unknown"}\0${fingerprint}`;
+    const existing = pendingApprovalRequests.get(requestKey);
+    if (existing) {
+      return existing;
+    }
+
+    const pendingRequest = requestTelegramApprovalOnce(ctx, chatId, messageThreadId, request);
+    pendingApprovalRequests.set(requestKey, pendingRequest);
+    const release = (): void => {
+      if (pendingApprovalRequests.get(requestKey) === pendingRequest) {
+        pendingApprovalRequests.delete(requestKey);
+      }
+    };
+    void pendingRequest.then(release, release);
+    return pendingRequest;
   };
 
   const replayInterruptedApprovalState = async (state: PersistedApprovalState): Promise<void> => {
@@ -845,6 +893,93 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const mode = typeof params?.mode === "string" ? params.mode : "unknown";
     const serverName = typeof params?.serverName === "string" ? params.serverName : "MCP server";
     const message = typeof params?.message === "string" ? params.message : "Authentication is required.";
+
+    if (mode === "form") {
+      const form = parseSupportedMcpForm(params?.requestedSchema);
+      if (!form) {
+        await sendTextMessage(
+          bot.api,
+          chatId,
+          [
+            "<b>⚠️ MCP form cancelled safely</b>",
+            `<b>Server:</b> <code>${escapeHTML(serverName)}</code>`,
+            "Teleco supports one non-secret boolean, enum, or short string field per request.",
+          ].join("\n"),
+          {
+            fallbackText: `MCP form cancelled safely\nServer: ${serverName}\nUnsupported, multi-field, or sensitive schema.`,
+            messageThreadId,
+          },
+        );
+        return { action: "cancel", content: null, _meta: null };
+      }
+
+      const pendingId = randomUUID();
+      const contextKey = contextKeyFromCtx(ctx);
+      const previousPendingId = contextKey ? pendingMcpFormByContext.get(contextKey) : undefined;
+      if (previousPendingId) {
+        const previous = pendingMcpElicitations.get(previousPendingId);
+        if (previous) {
+          clearTimeout(previous.timeout);
+          previous.resolve({ action: "cancel", content: null, _meta: null });
+          pendingMcpElicitations.delete(previousPendingId);
+        }
+      }
+
+      const lines = [
+        "<b>📝 MCP input required</b>",
+        `<b>Server:</b> <code>${escapeHTML(serverName)}</code>`,
+        `<b>Field:</b> <code>${escapeHTML(form.label)}</code>`,
+        form.description ? escapeHTML(form.description) : undefined,
+        escapeHTML(message),
+      ].filter((line): line is string => Boolean(line));
+
+      if (form.input.kind === "string") {
+        const inputHints = [
+          "Reply to this message with the requested value.",
+          form.required ? undefined : "Send /skip to leave this optional field empty.",
+          "Send /cancel to cancel this request.",
+        ].filter((line): line is string => Boolean(line));
+        await bot.api.sendMessage(chatId, [...lines, ...inputHints].join("\n"), {
+          parse_mode: "HTML",
+          ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
+          reply_markup: {
+            force_reply: true,
+            selective: true,
+            input_field_placeholder: `Reply with ${form.label}`.slice(0, 64),
+          },
+        });
+      } else {
+        const keyboard = new InlineKeyboard();
+        const options = form.input.kind === "boolean"
+          ? [{ label: "Yes", value: "true" }, { label: "No", value: "false" }]
+          : form.input.options;
+        options.forEach((option, index) => {
+          keyboard.text(option.label.slice(0, 40), `mcpform:${pendingId}:${index}`);
+          if (index % 2 === 1) keyboard.row();
+        });
+        if (!form.required) {
+          keyboard.text("Skip", `mcpform:${pendingId}:skip`).row();
+        }
+        keyboard.text("Cancel", `mcpform:${pendingId}:cancel`);
+        await sendTextMessage(bot.api, chatId, lines.join("\n"), {
+          fallbackText: ["MCP input required", `Server: ${serverName}`, `Field: ${form.label}`, form.description, message]
+            .filter((line): line is string => Boolean(line))
+            .join("\n"),
+          messageThreadId,
+          replyMarkup: keyboard,
+        });
+      }
+
+      return new Promise<CodexMcpElicitationResponse>((resolve) => {
+        const timeout = setTimeout(() => {
+          pendingMcpElicitations.delete(pendingId);
+          if (contextKey) pendingMcpFormByContext.delete(contextKey);
+          resolve({ action: "cancel", content: null, _meta: null });
+        }, 10 * 60 * 1000);
+        pendingMcpElicitations.set(pendingId, { resolve, timeout, contextKey, kind: "form", form });
+        if (contextKey) pendingMcpFormByContext.set(contextKey, pendingId);
+      });
+    }
 
     if (mode !== "url" || typeof params?.url !== "string") {
       await sendTextMessage(
@@ -923,9 +1058,56 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         resolve,
         timeout,
         contextKey,
+        kind: "url",
         origin: authUrl.origin,
       });
     });
+  };
+
+  const handlePendingMcpFormText = async (ctx: Context, userText: string): Promise<boolean> => {
+    const contextKey = contextKeyFromCtx(ctx);
+    if (!contextKey) return false;
+    const pendingId = pendingMcpFormByContext.get(contextKey);
+    const pending = pendingId ? pendingMcpElicitations.get(pendingId) : undefined;
+    const form = pending?.kind === "form" ? pending.form : undefined;
+    if (!pendingId || !pending || !form || form.input.kind !== "string") {
+      return false;
+    }
+
+    const value = userText.trim();
+    const command = value.toLowerCase();
+    if (command === "/cancel") {
+      pendingMcpElicitations.delete(pendingId);
+      pendingMcpFormByContext.delete(contextKey);
+      clearTimeout(pending.timeout);
+      pending.resolve({ action: "cancel", content: null, _meta: null });
+      await safeReply(ctx, "MCP form cancelled.", { fallbackText: "MCP form cancelled." });
+      return true;
+    }
+    if (command === "/skip" && !form.required) {
+      pendingMcpElicitations.delete(pendingId);
+      pendingMcpFormByContext.delete(contextKey);
+      clearTimeout(pending.timeout);
+      pending.resolve({ action: "accept", content: {}, _meta: null });
+      await safeReply(ctx, "Optional MCP input skipped.", { fallbackText: "Optional MCP input skipped." });
+      return true;
+    }
+
+    const minLength = form.input.minLength ?? (form.required ? 1 : 0);
+    const maxLength = Math.min(form.input.maxLength ?? 500, 500);
+    if (value.length < minLength || value.length > maxLength) {
+      await safeReply(ctx, `Reply must be ${minLength}-${maxLength} characters.`, {
+        fallbackText: `Reply must be ${minLength}-${maxLength} characters.`,
+      });
+      return true;
+    }
+
+    pendingMcpElicitations.delete(pendingId);
+    pendingMcpFormByContext.delete(contextKey);
+    clearTimeout(pending.timeout);
+    pending.resolve({ action: "accept", content: { [form.fieldName]: value }, _meta: null });
+    await safeReply(ctx, "MCP input submitted.", { fallbackText: "MCP input submitted." });
+    return true;
   };
 
   const clearReaction = async (ctx: Context): Promise<void> => {
@@ -976,6 +1158,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const promptStartedAt = Date.now();
     let activeOperationId: string | undefined;
     let activeOperationFinished = false;
+    let activeOperationDeliveryFailed = false;
 
     if (isBusy(contextKey)) {
       await sendBusyReply(ctx);
@@ -1852,11 +2035,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       },
       onApprovalRequest: (request) => requestTelegramApproval(ctx, chatId, messageThreadId, request),
       onMcpElicitationRequest: (request) => requestTelegramMcpElicitation(ctx, chatId, messageThreadId, request),
-      onAgentEnd: () => {
-        void finalizeResponse().catch((error) => {
-          console.error("Failed to finalize Telegram response message", error);
-        });
-      },
+      onAgentEnd: () => undefined,
     };
 
     try {
@@ -1904,7 +2083,39 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         threadId: session.getInfo().threadId,
         workspace: session.getCurrentWorkspace(),
       });
-      await finalizeResponse();
+      setActiveOperationDeliveryState(config, activeOperationId, "completed-undelivered");
+      setActiveOperationDeliveryState(config, activeOperationId, "delivery-in-progress");
+      const finalDeliveryKey = activeOperationId ? `operation:${activeOperationId}:final` : undefined;
+      const finalDeliveryClaim = finalDeliveryKey
+        ? claimTelegramDelivery(config, {
+            deliveryKey: finalDeliveryKey,
+            contextKey,
+            chatId,
+            messageThreadId,
+            operationId: activeOperationId,
+            kind: "live-final",
+            payload: buildFinalResponseText(accumulatedText),
+          })
+        : "send";
+      try {
+        if (finalDeliveryClaim === "send") {
+          await finalizeResponse();
+          if (finalDeliveryKey) {
+            completeTelegramDelivery(config, finalDeliveryKey, responseMessageId);
+          }
+        } else {
+          finalized = true;
+        }
+        setActiveOperationDeliveryState(config, activeOperationId, "delivered");
+      } catch (error) {
+        activeOperationDeliveryFailed = true;
+        const detail = error instanceof Error ? error.message : String(error);
+        if (finalDeliveryKey) {
+          failTelegramDelivery(config, finalDeliveryKey, error);
+        }
+        setActiveOperationDeliveryState(config, activeOperationId, "delivery-failed", detail);
+        throw error;
+      }
       finishActiveOperation(config, activeOperationId, "completed");
       activeOperationFinished = true;
       markAutoCompactTurnCompleted(contextKey);
@@ -1925,7 +2136,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         `Prompt completed instance=${instanceName} context=${redactLogId(contextKey)} thread=${info.threadId ?? "none"} durationMs=${Date.now() - promptStartedAt}`,
       );
     } catch (error) {
-      finishActiveOperation(config, activeOperationId, isAbortLikeError(error) ? "aborted" : "failed");
+      if (!activeOperationDeliveryFailed) {
+        finishActiveOperation(config, activeOperationId, isAbortLikeError(error) ? "aborted" : "failed");
+      }
       activeOperationFinished = true;
       console.error(
         `Prompt failed instance=${instanceName} context=${redactLogId(contextKey)} durationMs=${Date.now() - promptStartedAt}: ${formatError(error)}`,
@@ -1970,6 +2183,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       clearAllToolUpdateTimers();
       clearFlushTimer();
       busyState.processing = false;
+      scheduleTelegramDeliveryCleanup(config);
     }
   };
 
@@ -3365,7 +3579,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const busyState = getBusyState(contextKey);
     busyState.switching = true;
     try {
-      const info = await session.switchSession(threadId);
+      const info = await registry.switchSession(contextKey, session, threadId);
       updateSessionMetadata(contextKey, session);
       const html = `<b>Attached to thread.</b>\n\n${renderSessionInfoHTML(info, instanceName)}`;
       const plain = `Attached to thread.\n\n${renderSessionInfoPlain(info, instanceName)}`;
@@ -3405,7 +3619,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       const busyState = getBusyState(contextKey);
       busyState.switching = true;
       try {
-        const info = await session.switchSession(threadId);
+        const info = await registry.switchSession(contextKey, session, threadId);
         updateSessionMetadata(contextKey, session);
         const html = `<b>Switched thread.</b>\n\n${renderSessionInfoHTML(info, instanceName)}`;
         const plain = `Switched thread.\n\n${renderSessionInfoPlain(info, instanceName)}`;
@@ -3498,8 +3712,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       try {
         const model = session.setModel(requestedModel);
         updateSessionMetadata(contextKey, session);
-        const html = `<b>Model set to</b> <code>${escapeHTML(model)}</code> — applies to new threads.`;
-        const plainText = `Model set to ${model} — applies to new threads.`;
+        const html = `<b>Model set to</b> <code>${escapeHTML(model)}</code> — context usage will refresh after the next turn.`;
+        const plainText = `Model set to ${model} — context usage will refresh after the next turn.`;
         await safeReply(ctx, html, { fallbackText: plainText });
       } catch (error) {
         const message = friendlyErrorText(error);
@@ -4090,7 +4304,39 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const pending = pendingApprovals.get(approvalId);
     if (!pending) {
-      await ctx.answerCallbackQuery({ text: "Approval expired" });
+      const contextKey = contextKeyFromCtx(ctx);
+      const persisted = findPersistedApprovalState(config, approvalId, contextKey);
+      const status = persisted?.status ?? "expired";
+      await ctx.answerCallbackQuery({ text: `Approval ${status}` });
+      if (ctx.chat && ctx.callbackQuery.message?.message_id) {
+        const canRetry = Boolean(
+          persisted
+          && (persisted.status === "expired" || persisted.status === "interrupted")
+          && contextKey
+          && lastPromptInput.has(contextKey),
+        );
+        const keyboard = new InlineKeyboard();
+        if (canRetry) {
+          keyboard.text("Retry last prompt", `approval_recovery:${approvalId}:retry`).row();
+        }
+        keyboard.text("Dismiss", `approval_recovery:${approvalId}:dismiss`);
+        await safeEditMessage(
+          bot,
+          ctx.chat.id,
+          ctx.callbackQuery.message.message_id,
+          [
+            "<b>Approval is no longer actionable</b>",
+            `<b>State:</b> <code>${escapeHTML(status)}</code>`,
+            canRetry
+              ? "The original request cannot be answered. Retry the last prompt to create a fresh request."
+              : "The original request cannot be answered. Send a new prompt if the operation is still needed.",
+          ].join("\n"),
+          {
+            fallbackText: `Approval is no longer actionable\nState: ${status}`,
+            replyMarkup: keyboard,
+          },
+        );
+      }
       return;
     }
     if (pending.contextKey && contextKeyFromCtx(ctx) !== pending.contextKey) {
@@ -4112,6 +4358,43 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         { fallbackText: `Approval ${decision}` },
       );
     }
+  });
+
+  bot.callbackQuery(/^approval_recovery:([^:]+):(retry|dismiss)$/, async (ctx) => {
+    const approvalId = ctx.match?.[1];
+    const action = ctx.match?.[2];
+    const contextKey = contextKeyFromCtx(ctx);
+    const messageId = ctx.callbackQuery.message?.message_id;
+    if (!approvalId || !action || !contextKey || !ctx.chat || !messageId) {
+      await ctx.answerCallbackQuery();
+      return;
+    }
+
+    if (action === "dismiss") {
+      await ctx.answerCallbackQuery({ text: "Dismissed" });
+      await safeEditMessage(bot, ctx.chat.id, messageId, "<b>Approval closed</b>", {
+        fallbackText: "Approval closed",
+      });
+      return;
+    }
+
+    const persisted = findPersistedApprovalState(config, approvalId, contextKey);
+    const cached = lastPromptInput.get(contextKey);
+    if (!persisted || !["expired", "interrupted"].includes(persisted.status) || !cached) {
+      await ctx.answerCallbackQuery({ text: "Retry is no longer available" });
+      return;
+    }
+    const session = await registry.getOrCreate(contextKey, { deferThreadStart: true });
+    if (isBusy(contextKey)) {
+      await ctx.answerCallbackQuery({ text: "Codex is already working" });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: "Retrying last prompt" });
+    await safeEditMessage(bot, ctx.chat.id, messageId, "<b>Approval expired</b>\nRetrying the last prompt...", {
+      fallbackText: "Approval expired\nRetrying the last prompt...",
+    });
+    runPromptInBackground(ctx, contextKey, ctx.chat.id, session, cached);
   });
 
   bot.callbackQuery(/^mcpel:([^:]+):(accept|cancel)$/, async (ctx) => {
@@ -4143,10 +4426,50 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         bot,
         ctx.chat.id,
         ctx.callbackQuery.message.message_id,
-        `<b>${escapeHTML(title)}</b>\n<code>${escapeHTML(pending.origin)}</code>`,
-        { fallbackText: `${title}\n${pending.origin}` },
+        `<b>${escapeHTML(title)}</b>\n<code>${escapeHTML(pending.origin ?? "")}</code>`,
+        { fallbackText: `${title}\n${pending.origin ?? ""}` },
       );
     }
+  });
+
+  bot.callbackQuery(/^mcpform:([^:]+):(\d+|skip|cancel)$/, async (ctx) => {
+    const pendingId = ctx.match?.[1];
+    const selection = ctx.match?.[2];
+    const pending = pendingId ? pendingMcpElicitations.get(pendingId) : undefined;
+    const form = pending?.kind === "form" ? pending.form : undefined;
+    if (!pendingId || !selection || !pending || !form) {
+      await ctx.answerCallbackQuery({ text: "MCP form expired" });
+      return;
+    }
+    if (pending.contextKey && contextKeyFromCtx(ctx) !== pending.contextKey) {
+      await ctx.answerCallbackQuery({ text: "This form belongs to another Telegram context" });
+      return;
+    }
+
+    let response: CodexMcpElicitationResponse;
+    if (selection === "cancel") {
+      response = { action: "cancel", content: null, _meta: null };
+    } else if (selection === "skip" && !form.required) {
+      response = { action: "accept", content: {}, _meta: null };
+    } else {
+      const index = Number.parseInt(selection, 10);
+      const values = form.input.kind === "boolean"
+        ? [true, false]
+        : form.input.kind === "enum"
+          ? form.input.options.map((option) => option.value)
+          : [];
+      if (!Number.isInteger(index) || index < 0 || index >= values.length) {
+        await ctx.answerCallbackQuery({ text: "Invalid MCP form selection" });
+        return;
+      }
+      response = { action: "accept", content: { [form.fieldName]: values[index] }, _meta: null };
+    }
+
+    pendingMcpElicitations.delete(pendingId);
+    if (pending.contextKey) pendingMcpFormByContext.delete(pending.contextKey);
+    clearTimeout(pending.timeout);
+    pending.resolve(response);
+    await ctx.answerCallbackQuery({ text: response.action === "accept" ? "MCP input submitted" : "MCP form cancelled" });
   });
 
   bot.callbackQuery(/^sessws_(\d+)$/, async (ctx) => {
@@ -4268,7 +4591,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const busyState = getBusyState(contextKey);
     busyState.switching = true;
     try {
-      const info = await session.switchSession(threadId);
+      const info = await registry.switchSession(contextKey, session, threadId);
       updateSessionMetadata(contextKey, session);
       const plainText = `Switched session.\n\n${renderSessionInfoPlain(info, instanceName)}`;
       const html = `<b>Switched session.</b>\n\n${renderSessionInfoHTML(info, instanceName)}`;
@@ -4528,8 +4851,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     try {
       const model = session.setModel(slug);
       updateSessionMetadata(contextKey, session);
-      const html = `<b>Model set to</b> <code>${escapeHTML(model)}</code> — applies to new threads.`;
-      const plainText = `Model set to ${model} — applies to new threads.`;
+      const html = `<b>Model set to</b> <code>${escapeHTML(model)}</code> — context usage will refresh after the next turn.`;
+      const plainText = `Model set to ${model} — context usage will refresh after the next turn.`;
 
       if (messageId) {
         await safeEditMessage(bot, chatId, messageId, html, { fallbackText: plainText });
@@ -4795,6 +5118,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   bot.on("message:text", async (ctx) => {
     const userText = ctx.message.text.trim();
     if (!userText) {
+      return;
+    }
+
+    if (await handlePendingMcpFormText(ctx, userText)) {
       return;
     }
 
@@ -5076,36 +5403,39 @@ export async function sendRecoveredTurnItem(
   registry: SessionRegistry,
   operation: ActiveOperationRecord,
   item: CodexTurnRecoveryItem,
-): Promise<void> {
+): Promise<number | undefined> {
   const messageThreadId = operation.messageThreadId;
   if (item.kind === "response") {
     const rendered = splitRichMarkdownForTelegram(
       formatResponseSegment(item.text),
       registry.getResponseFormat(operation.contextKey),
     );
+    let lastMessageId: number | undefined;
     for (const chunk of rendered) {
-      await sendRichMessage(bot.api, operation.chatId, chunk.candidates, { messageThreadId });
+      const message = await sendRichMessage(bot.api, operation.chatId, chunk.candidates, { messageThreadId });
+      lastMessageId = message.message_id;
     }
-    return;
+    return lastMessageId;
   }
 
   const toolActivityMode = registry.getToolActivityMode(operation.contextKey);
   if (toolActivityMode === "off") {
-    return;
+    return undefined;
   }
   if (toolActivityMode === "errors-only" && !item.isError) {
-    return;
+    return undefined;
   }
   if (toolActivityMode === "compact" && !item.isError && item.toolName !== "context_compaction") {
-    return;
+    return undefined;
   }
 
   const rendered = renderToolEndMessage(item.toolName, item.detail, item.isError);
-  await sendTextMessage(bot.api, operation.chatId, rendered.text, {
+  const message = await sendTextMessage(bot.api, operation.chatId, rendered.text, {
     parseMode: rendered.parseMode,
     fallbackText: rendered.fallbackText,
     messageThreadId,
   });
+  return message.message_id;
 }
 
 export async function registerCommands(bot: Bot<Context>): Promise<void> {
@@ -5370,7 +5700,9 @@ function renderCompactControlPanel(info: CodexSessionInfo, compactState: string)
     `<b>Status:</b> <code>${escapeHTML(compactState)}</code>`,
     `<b>Thread:</b> <code>${escapeHTML(info.threadId ?? "(not started yet)")}</code>`,
     `<b>Workspace:</b> <code>${escapeHTML(info.workspace)}</code>`,
-    info.contextWindow
+    info.contextWindowPending
+      ? `<b>Context:</b> <code>pending until next turn</code>`
+      : info.contextWindow
       ? `<b>Context:</b> <code>${escapeHTML(formatContextWindowValue(info.contextWindow))}</code>`
       : "<b>Context:</b> <code>unknown</code>",
     "",
@@ -5382,7 +5714,11 @@ function renderCompactControlPanel(info: CodexSessionInfo, compactState: string)
     `Status: ${compactState}`,
     `Thread: ${info.threadId ?? "(not started yet)"}`,
     `Workspace: ${info.workspace}`,
-    info.contextWindow ? `Context: ${formatContextWindowValue(info.contextWindow)}` : "Context: unknown",
+    info.contextWindowPending
+      ? "Context: pending until next turn"
+      : info.contextWindow
+        ? `Context: ${formatContextWindowValue(info.contextWindow)}`
+        : "Context: unknown",
     "",
     "Use the button below to run the two-stage compact flow.",
     "Compact status lives in /status.",
@@ -5406,7 +5742,11 @@ function renderSessionInfoPlain(info: CodexSessionInfo, instanceName?: string): 
     info.model ? `Model: ${info.model}` : undefined,
     info.reasoningEffort ? `Reasoning effort: ${info.reasoningEffort}` : undefined,
     `Fast mode: ${formatFastModeValue(info)}`,
-    info.contextWindow ? formatContextWindowPlain(info.contextWindow) : "Context window: unknown",
+    info.contextWindowPending
+      ? "Context window: pending until next turn"
+      : info.contextWindow
+        ? formatContextWindowPlain(info.contextWindow)
+        : "Context window: unknown",
     info.lastTurnTokens ? formatLastTurnTokensPlain(info.lastTurnTokens) : "Last turn usage: none yet",
     info.sessionTokens ? formatSessionTokensPlain(info.sessionTokens) : undefined,
   ]
@@ -5437,7 +5777,9 @@ function renderSessionInfoHTML(info: CodexSessionInfo, instanceName?: string): s
     info.model ? `<b>Model:</b> <code>${escapeHTML(info.model)}</code>` : undefined,
     info.reasoningEffort ? `<b>Reasoning effort:</b> <code>${escapeHTML(info.reasoningEffort)}</code>` : undefined,
     `<b>Fast mode:</b> <code>${escapeHTML(formatFastModeValue(info))}</code>`,
-    info.contextWindow
+    info.contextWindowPending
+      ? `<b>Context window:</b> <code>pending until next turn</code>`
+      : info.contextWindow
       ? `<b>Context window:</b> <code>${escapeHTML(formatContextWindowValue(info.contextWindow))}</code>`
       : "<b>Context window:</b> <code>unknown</code>",
     info.lastTurnTokens
@@ -5465,7 +5807,11 @@ function renderMobileStatus(options: {
   const info = options.info;
   const details = options.statusDetails;
   const account = details.account ? formatAccountStatus(details.account) : "unknown";
-  const context = info.contextWindow ? formatContextWindowValue(info.contextWindow) : "usage unavailable";
+  const context = info.contextWindowPending
+    ? "pending until next turn"
+    : info.contextWindow
+      ? formatContextWindowValue(info.contextWindow)
+      : "usage unavailable";
   const thread = shortId(info.threadId);
   const session = shortId(details.thread?.sessionId);
   const model = info.reasoningEffort ? `${info.model ?? "(default)"} · ${info.reasoningEffort}` : info.model ?? "(default)";
@@ -6126,7 +6472,7 @@ function formatLastTurnTokensPlain(tokens: SessionTokenSummary): string {
 function formatContextWindowValue(context: ContextWindowSummary): string {
   const base = `effective: ${formatTokenCount(context.effectiveLimit)}/${formatTokenCount(context.limit)}`;
   if (context.used === undefined || context.remaining === undefined || context.percentUsed === undefined) {
-    return `${base} · usage unavailable until next turn`;
+    return `${base} · usage unavailable until next turn${context.source === "model-cache" ? " · model cache" : ""}`;
   }
 
   const leftPercent = Math.max(0, 100 - context.percentUsed);
@@ -6181,11 +6527,33 @@ function renderApprovalBridgeStatus(
   };
 }
 
-function fingerprintApprovalRequest(request: CodexApprovalRequest): string {
+export function fingerprintApprovalRequest(request: CodexApprovalRequest, instanceName: string): string {
+  const params = readUnknownRecord(request.params) ?? {};
+  const identity = {
+    threadId: params.threadId,
+    turnId: params.turnId,
+    itemId: params.itemId,
+    approvalId: params.approvalId,
+    command: params.command,
+    cwd: params.cwd,
+    sandbox: params.sandbox,
+    sandboxMode: params.sandboxMode,
+    reason: params.reason,
+    tool: params.tool,
+    toolName: params.toolName,
+    grantRoot: params.grantRoot,
+    environmentId: params.environmentId,
+    permissions: params.permissions,
+    additionalPermissions: params.additionalPermissions,
+    networkApprovalContext: params.networkApprovalContext,
+    availableDecisions: params.availableDecisions,
+  };
   return createHash("sha256")
+    .update(instanceName)
+    .update("\0")
     .update(request.method)
     .update("\0")
-    .update(stableApprovalJson(request.params))
+    .update(stableApprovalJson(identity))
     .digest("hex");
 }
 
@@ -6201,6 +6569,61 @@ function stableApprovalJson(value: unknown): string {
       .join(",")}}`;
   }
   return JSON.stringify(value) ?? "null";
+}
+
+function parseSupportedMcpForm(value: unknown): SupportedMcpForm | undefined {
+  const schema = readUnknownRecord(value);
+  const properties = readUnknownRecord(schema?.properties);
+  if (schema?.type !== "object" || !properties) return undefined;
+  const fields = Object.entries(properties);
+  if (fields.length !== 1) return undefined;
+
+  const [fieldName, rawField] = fields[0]!;
+  const field = readUnknownRecord(rawField);
+  if (!field) return undefined;
+  const label = readUnknownString(field.title) ?? fieldName;
+  const description = readUnknownString(field.description);
+  if (isSensitiveMcpField(fieldName, label, description)) return undefined;
+  const required = Array.isArray(schema.required) && schema.required.includes(fieldName);
+
+  if (field.type === "boolean") {
+    return { fieldName, label, description, required, input: { kind: "boolean" } };
+  }
+
+  if (field.type !== "string") return undefined;
+  const enumValues = Array.isArray(field.enum)
+    ? field.enum.filter((entry): entry is string => typeof entry === "string")
+    : [];
+  const oneOf = Array.isArray(field.oneOf)
+    ? field.oneOf
+        .map(readUnknownRecord)
+        .filter((entry): entry is Record<string, unknown> => Boolean(entry))
+        .map((entry) => ({ value: readUnknownString(entry.const), label: readUnknownString(entry.title) }))
+        .filter((entry): entry is { value: string; label: string } => Boolean(entry.value && entry.label))
+    : [];
+  const options = oneOf.length > 0
+    ? oneOf
+    : enumValues.map((entry) => ({ value: entry, label: entry }));
+  if (options.length > 0) {
+    if (options.length > 10) return undefined;
+    return { fieldName, label, description, required, input: { kind: "enum", options } };
+  }
+
+  if (field.format !== undefined) return undefined;
+  const minLength = readUnknownNumber(field.minLength);
+  const maxLength = readUnknownNumber(field.maxLength);
+  if ((maxLength ?? 500) > 500) return undefined;
+  return { fieldName, label, description, required, input: { kind: "string", minLength, maxLength } };
+}
+
+function isSensitiveMcpField(fieldName: string, label: string, description?: string): boolean {
+  return /password|passphrase|secret|token|api[ _-]?key|credential|private[ _-]?key|one[ _-]?time|otp/i.test(
+    [fieldName, label, description ?? ""].join(" "),
+  );
+}
+
+function readUnknownNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 function approvalMethodLabel(method: string): string {

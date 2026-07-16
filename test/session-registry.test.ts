@@ -8,13 +8,27 @@ import type { TeleCodexConfig } from "../src/config.js";
 const mockFsState = vi.hoisted(() => {
   const files = new Map<string, string>();
   const directories = new Set<string>();
+  const descriptors = new Map<number, string>();
+  let nextDescriptor = 10;
 
   return {
     files,
     directories,
+    descriptors,
+    open: (targetPath: string) => {
+      if (files.has(targetPath)) {
+        throw Object.assign(new Error(`EEXIST: ${targetPath}`), { code: "EEXIST" });
+      }
+      files.set(targetPath, "");
+      const descriptor = nextDescriptor++;
+      descriptors.set(descriptor, targetPath);
+      return descriptor;
+    },
     reset: () => {
       files.clear();
       directories.clear();
+      descriptors.clear();
+      nextDescriptor = 10;
     },
   };
 });
@@ -60,6 +74,10 @@ vi.mock("node:fs", () => ({
   mkdirSync: vi.fn((targetPath: string) => {
     mockFsState.directories.add(targetPath);
   }),
+  openSync: vi.fn((targetPath: string) => mockFsState.open(targetPath)),
+  closeSync: vi.fn((descriptor: number) => {
+    mockFsState.descriptors.delete(descriptor);
+  }),
   readFileSync: vi.fn((targetPath: string) => {
     const content = mockFsState.files.get(targetPath);
     if (content === undefined) {
@@ -67,9 +85,16 @@ vi.mock("node:fs", () => ({
     }
     return content;
   }),
-  writeFileSync: vi.fn((targetPath: string, content: string) => {
+  writeFileSync: vi.fn((target: string | number, content: string) => {
+    const targetPath = typeof target === "number" ? mockFsState.descriptors.get(target) : target;
+    if (!targetPath) {
+      throw new Error(`EBADF: ${target}`);
+    }
     mockFsState.files.set(targetPath, content);
     mockFsState.directories.add(path.dirname(targetPath));
+  }),
+  unlinkSync: vi.fn((targetPath: string) => {
+    mockFsState.files.delete(targetPath);
   }),
 }));
 
@@ -469,6 +494,47 @@ describe("SessionRegistry", () => {
     expect(session.dispose).toHaveBeenCalledTimes(1);
     expect(registry.has("123")).toBe(false);
     expect(registry.listContexts()).toEqual([]);
+  });
+
+  it("rejects cross-instance ownership of the same Codex thread until the owner releases it", () => {
+    const config = createConfig();
+    const firstSession = createMockSession({
+      threadId: "shared-thread",
+      workspace: config.workspace,
+      model: "o3",
+      launchProfileId: "default",
+      launchProfileLabel: "Default",
+      launchProfileBehavior: "workspace-write / never",
+      sandboxMode: "workspace-write",
+      approvalPolicy: "never",
+      unsafeLaunch: false,
+    });
+    const secondSession = createMockSession({
+      threadId: "shared-thread",
+      workspace: config.workspace,
+      model: "o3",
+      launchProfileId: "default",
+      launchProfileLabel: "Default",
+      launchProfileBehavior: "workspace-write / never",
+      sandboxMode: "workspace-write",
+      approvalPolicy: "never",
+      unsafeLaunch: false,
+    });
+
+    process.env.TELECODEX_INSTANCE = "first";
+    const firstRegistry = new SessionRegistry(config);
+    firstRegistry.updateMetadata("100", firstSession as never);
+
+    process.env.TELECODEX_INSTANCE = "second";
+    const secondRegistry = new SessionRegistry(config);
+    expect(() => secondRegistry.updateMetadata("200", secondSession as never)).toThrow(
+      "already attached to another Teleco instance",
+    );
+
+    process.env.TELECODEX_INSTANCE = "first";
+    firstRegistry.remove("100");
+    process.env.TELECODEX_INSTANCE = "second";
+    expect(() => secondRegistry.updateMetadata("200", secondSession as never)).not.toThrow();
   });
 
   it("persists metadata and reloads it in a new registry", async () => {

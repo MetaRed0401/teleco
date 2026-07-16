@@ -1,14 +1,19 @@
 import { spawn } from "node:child_process";
-import { constants } from "node:fs";
+import { constants, readFileSync } from "node:fs";
 import { access, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { escapeHTML } from "./format.js";
+import { readUnknownAppServerEvents, type UnknownAppServerEvent } from "./app-server-observability.js";
+import {
+  MINIMUM_COMPATIBLE_CODEX_CLI_VERSION,
+  RECOMMENDED_CODEX_CLI_VERSION,
+} from "./codex-version-policy.js";
 
 const COMMAND_TIMEOUT_MS = 1800;
 const OUTPUT_LIMIT = 4000;
-const MIN_RECOMMENDED_CODEX_CLI_VERSION = "0.144.1";
 const APP_SERVER_APPROVAL_BRIDGE_DETAIL =
   "Codex app-server exposes approval server requests that TeleCodex can forward to Telegram inline buttons.";
 const CODEX_BASELINE_REASON =
@@ -49,6 +54,7 @@ export type RuntimeDoctorReport = {
       detail: string;
     };
   };
+  unknownAppServerEvents: UnknownAppServerEvent[];
 };
 
 export type RuntimeLockReport = {
@@ -133,6 +139,7 @@ export async function collectRuntimeDoctor(options: {
       approvalBridgeDetail: APP_SERVER_APPROVAL_BRIDGE_DETAIL,
       minimumVersionRequirement: getCodexVersionRequirement(codex.available, codex.version),
     },
+    unknownAppServerEvents: readUnknownAppServerEvents(options.workspace, options.instanceName),
   };
 }
 
@@ -187,6 +194,14 @@ export function renderRuntimeDoctor(report: RuntimeDoctorReport): { html: string
     `node_modules: ${formatBoolean(report.project.hasNodeModules)}`,
   ];
   const codexVersionRequirement = formatCodexVersionRequirement(report.codex.minimumVersionRequirement);
+  const installedCodexCliVersion = parseVersion(report.commands.find((command) => command.name === "codex")?.version);
+  const codexCompatibilityLines = [
+    `Installed Codex CLI: ${installedCodexCliVersion ?? "unavailable"}`,
+    `Installed Codex SDK: ${getInstalledCodexSdkVersion() ?? "unavailable"}`,
+    `Minimum compatible Codex CLI: ${MINIMUM_COMPATIBLE_CODEX_CLI_VERSION}`,
+    `Recommended Codex CLI: ${RECOMMENDED_CODEX_CLI_VERSION}`,
+    `Compatibility: ${codexVersionRequirement}`,
+  ];
   const gitLines = [
     `available: ${formatBoolean(report.git.available)}`,
     report.git.insideWorkTree !== undefined ? `worktree: ${formatBoolean(report.git.insideWorkTree)}` : undefined,
@@ -201,6 +216,11 @@ export function renderRuntimeDoctor(report: RuntimeDoctorReport): { html: string
   const approvalLine = report.codex.approvalBridgeSupported
     ? `approval bridge: supported - ${report.codex.approvalBridgeDetail}`
     : `approval bridge: unsupported - ${report.codex.approvalBridgeDetail}`;
+  const unknownEventLines = report.unknownAppServerEvents.length > 0
+    ? report.unknownAppServerEvents.slice(0, 8).map((event) =>
+        `${event.kind}:${event.name} count=${event.count} codex=${event.codexVersion}`,
+      )
+    : ["none"];
 
   const plain = [
     "TeleCodex doctor",
@@ -229,9 +249,11 @@ export function renderRuntimeDoctor(report: RuntimeDoctorReport): { html: string
     "",
     "Codex app-server:",
     `- ${approvalLine}`,
+    "- Unknown protocol events:",
+    ...unknownEventLines.map((line) => `  - ${line}`),
     "",
-    "Codex CLI baseline:",
-    `- ${codexVersionRequirement}`,
+    "Codex compatibility:",
+    ...codexCompatibilityLines.map((line) => `- ${line}`),
   ]
     .filter((line): line is string => line !== undefined)
     .join("\n");
@@ -259,10 +281,10 @@ export function renderRuntimeDoctor(report: RuntimeDoctorReport): { html: string
     "<b>Secret env presence</b>",
     `<pre>${escapeHTML(envLines.map((line) => `- ${line}`).join("\n"))}</pre>`,
     "<b>Codex app-server</b>",
-    `<pre>${escapeHTML(`- ${approvalLine}`)}</pre>`,
+    `<pre>${escapeHTML([`- ${approvalLine}`, "- Unknown protocol events:", ...unknownEventLines.map((line) => `  - ${line}`)].join("\n"))}</pre>`,
     "",
-    "<b>Codex CLI baseline</b>",
-    `<pre>${escapeHTML(`- ${codexVersionRequirement}`)}</pre>`,
+    "<b>Codex compatibility</b>",
+    `<pre>${escapeHTML(codexCompatibilityLines.map((line) => `- ${line}`).join("\n"))}</pre>`,
   ].join("\n");
 
   return { html, plain };
@@ -517,7 +539,7 @@ function getCodexVersionRequirement(
   if (!available) {
     return {
       status: "unknown",
-      detail: `Codex CLI not found. Install ${MIN_RECOMMENDED_CODEX_CLI_VERSION}+ for the WebSocket trace log privacy fix.`,
+      detail: `Codex CLI not found. Install at least ${MINIMUM_COMPATIBLE_CODEX_CLI_VERSION}; ${RECOMMENDED_CODEX_CLI_VERSION} is recommended.`,
     };
   }
 
@@ -526,24 +548,43 @@ function getCodexVersionRequirement(
     return {
       status: "unknown",
       detail:
-        `Unable to parse codex --version output. Confirm ${MIN_RECOMMENDED_CODEX_CLI_VERSION}+ for a WebSocket trace log privacy fix.`,
+        `Unable to parse codex --version output. Confirm at least ${MINIMUM_COMPATIBLE_CODEX_CLI_VERSION}; ${RECOMMENDED_CODEX_CLI_VERSION} is recommended.`,
     };
   }
 
   const current = toVersionParts(parsed);
-  const minimum = toVersionParts(MIN_RECOMMENDED_CODEX_CLI_VERSION);
+  const minimum = toVersionParts(MINIMUM_COMPATIBLE_CODEX_CLI_VERSION);
   if (isLessThan(current, minimum)) {
     return {
       status: "warn",
       detail:
-        `Detected ${parsed}; upgrade to ${MIN_RECOMMENDED_CODEX_CLI_VERSION}+ to ${CODEX_BASELINE_REASON}.`,
+        `Detected ${parsed}; upgrade to ${MINIMUM_COMPATIBLE_CODEX_CLI_VERSION}+ to ${CODEX_BASELINE_REASON}.`,
+    };
+  }
+
+  const recommended = toVersionParts(RECOMMENDED_CODEX_CLI_VERSION);
+  if (isLessThan(current, recommended)) {
+    return {
+      status: "ok",
+      detail: `Detected ${parsed}; compatible, with ${RECOMMENDED_CODEX_CLI_VERSION} recommended for the latest stable fixes.`,
     };
   }
 
   return {
     status: "ok",
-    detail: `Detected ${parsed}; includes the WebSocket trace log privacy fix (${CODEX_BASELINE_REASON}).`,
+    detail: `Detected ${parsed}; meets the recommended ${RECOMMENDED_CODEX_CLI_VERSION} stable baseline.`,
   };
+}
+
+function getInstalledCodexSdkVersion(): string | undefined {
+  try {
+    const entryPath = fileURLToPath(import.meta.resolve("@openai/codex-sdk"));
+    const packagePath = path.resolve(path.dirname(entryPath), "..", "package.json");
+    const packageInfo = JSON.parse(readFileSync(packagePath, "utf8")) as { version?: unknown };
+    return typeof packageInfo.version === "string" ? packageInfo.version : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function parseVersion(raw: string | undefined): string | undefined {

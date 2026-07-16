@@ -11,6 +11,9 @@ LOCK_DIR="${REPO_DIR}/.telecodex"
 LOCK_FILE="${LOCK_DIR}/service-update.lock"
 BIN_DIR="${HOME}/.local/bin"
 BIN_LINK="${BIN_DIR}/telecodex-launchd"
+RUNTIME_LABEL="${LAUNCHD_DOMAIN}.${SERVICE_BASENAME}.codex-app-server"
+RUNTIME_PLIST_PATH="${LAUNCH_AGENT_DIR}/${RUNTIME_LABEL}.plist"
+RUNTIME_DAEMON="${REPO_DIR}/scripts/codex-app-server-daemon.sh"
 
 section() {
   printf '\n==> %s\n' "$*"
@@ -52,6 +55,9 @@ Control:
   status [instance|--all]  Show launchd service state
   logs <instance>          Follow stdout/stderr logs for one instance
   update [instance|--all]  Install deps, build, rewrite plist(s), and restart selected service(s)
+  runtime-status           Show the persistent Codex app-server LaunchAgent state
+  runtime-restart [--force]
+                           Restart the persistent runtime after active-work checks
 
 Bin:
   bin-install              Register telecodex-launchd in ~/.local/bin
@@ -234,6 +240,10 @@ write_plist() {
     <string>$(xml_escape "${HOME}")</string>
     <key>NODE_ENV</key>
     <string>production</string>
+    <key>NODE_OPTIONS</key>
+    <string>--dns-result-order=ipv4first --no-network-family-autoselection</string>
+    <key>TELECODEX_PERSISTENT_APP_SERVER</key>
+    <string>1</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -246,6 +256,48 @@ write_plist() {
   <string>$(xml_escape "${stdout_path}")</string>
   <key>StandardErrorPath</key>
   <string>$(xml_escape "${stderr_path}")</string>
+</dict>
+</plist>
+PLIST
+}
+
+write_runtime_plist() {
+  run_cmd mkdir -p "${LAUNCH_AGENT_DIR}" "${LOG_DIR}"
+  detail "+ write ${RUNTIME_PLIST_PATH}"
+  cat >"${RUNTIME_PLIST_PATH}" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$(xml_escape "${RUNTIME_LABEL}")</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$(xml_escape "${RUNTIME_DAEMON}")</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>$(xml_escape "${REPO_DIR}")</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>$(xml_escape "${HOME}")</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$(xml_escape "${HOME}")/.local/bin:$(xml_escape "${HOME}")/bin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>StandardOutPath</key>
+  <string>$(xml_escape "${LOG_DIR}/codex-app-server.out.log")</string>
+  <key>StandardErrorPath</key>
+  <string>$(xml_escape "${LOG_DIR}/codex-app-server.err.log")</string>
 </dict>
 </plist>
 PLIST
@@ -431,9 +483,18 @@ service_state() {
   launchctl print "$(launchd_service_target "${label}")" >/dev/null 2>&1 && printf 'loaded' || printf 'unloaded'
 }
 
+ensure_runtime_started() {
+  write_runtime_plist
+  if [[ "$(service_state "${RUNTIME_LABEL}")" == "loaded" ]]; then
+    return
+  fi
+  bootstrap_service_with_retry "${RUNTIME_LABEL}" || kickstart_service "${RUNTIME_LABEL}"
+}
+
 install_command() {
   section "Installing TeleCodex LaunchAgent support"
   build_project
+  ensure_runtime_started
 
   if [[ -f "${REPO_DIR}/.env" && "$(env_mode)" != "multi" ]]; then
     write_plist default
@@ -533,6 +594,7 @@ service_command() {
     section "${action} ${instance}"
     case "${action}" in
       start)
+        ensure_runtime_started
         [[ -f "${plist_path}" ]] || write_plist "${instance}"
         bootstrap_service_with_retry "${label}" || kickstart_service "${label}"
         ;;
@@ -540,6 +602,7 @@ service_command() {
         bootout_service "${label}"
         ;;
       restart)
+        ensure_runtime_started
         [[ -f "${plist_path}" ]] || write_plist "${instance}"
         bootout_service "${label}"
         bootstrap_service_with_retry "${label}"
@@ -613,10 +676,38 @@ update_command() {
 
   acquire_lock "update" "${target}"
   build_project
+  ensure_runtime_started
   for instance in "${instances[@]}"; do
     write_plist "${instance}"
     service_command restart "${instance}"
   done
+}
+
+runtime_status_command() {
+  section "Persistent Codex app-server runtime"
+  detail "Label: ${RUNTIME_LABEL}"
+  detail "State: $(service_state "${RUNTIME_LABEL}")"
+  detail "Listener: ws://127.0.0.1:45123"
+  detail "Plist: ${RUNTIME_PLIST_PATH}"
+}
+
+runtime_restart_command() {
+  local force="${1:-}"
+  if [[ -n "${force}" && "${force}" != "--force" ]]; then
+    fail "runtime-restart accepts only --force."
+  fi
+  if [[ "${force}" != "--force" ]]; then
+    local instance
+    while IFS= read -r instance; do
+      [[ -n "${instance}" ]] && guard_instance_active_work "${instance}" ""
+    done < <(target_instances --all)
+  fi
+
+  acquire_lock "runtime-restart" "all"
+  section "Restarting persistent Codex app-server runtime"
+  write_runtime_plist
+  bootout_service "${RUNTIME_LABEL}"
+  bootstrap_service_with_retry "${RUNTIME_LABEL}"
 }
 
 bin_install_command() {
@@ -641,6 +732,8 @@ uninstall_command() {
     bootout_service "${label}"
     run_cmd rm -f "${plist_path}"
   done < <(all_instances)
+  bootout_service "${RUNTIME_LABEL}"
+  run_cmd rm -f "${RUNTIME_PLIST_PATH}"
   section "Uninstall complete"
   detail "Env files were kept."
 }
@@ -675,6 +768,12 @@ case "${command}" in
     ;;
   update)
     update_command "${1:-}" "${2:-}"
+    ;;
+  runtime-status)
+    runtime_status_command
+    ;;
+  runtime-restart)
+    runtime_restart_command "${1:-}"
     ;;
   bin-install)
     bin_install_command

@@ -2,6 +2,8 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { accessSync, constants, existsSync, realpathSync } from "node:fs";
 import path from "node:path";
 
+import { recordUnknownAppServerEvent, type UnknownAppServerEventKind } from "./app-server-observability.js";
+
 export type AppServerMessage = Record<string, unknown>;
 export type AppServerNotification = { method: string; params?: unknown };
 export type AppServerRequest = { id: string | number; method: string; params?: unknown };
@@ -42,6 +44,7 @@ export class CodexAppServerClient {
   private transportReady: Promise<void> | null = null;
   private transportMode: AppServerTransportMode = "direct-stdio";
   private transportDetail: string | undefined;
+  private codexVersion = "unknown";
 
   constructor(private readonly options: CodexAppServerClientOptions) {}
 
@@ -59,7 +62,7 @@ export class CodexAppServerClient {
 
     const resolvedCodexCli = resolveCodexCliPath();
     const childEnv = {
-      ...process.env,
+      ...buildCodexAppServerEnvironment(process.env),
       PATH: resolvedCodexCli.path,
       TERM: process.env.TERM === "dumb" || !process.env.TERM ? "xterm-256color" : process.env.TERM,
     };
@@ -188,6 +191,7 @@ export class CodexAppServerClient {
         mcpServerOpenaiFormElicitation: false,
       },
     });
+    this.codexVersion = extractCodexVersion(result);
     this.notify("initialized", {});
     return result;
   }
@@ -261,6 +265,16 @@ export class CodexAppServerClient {
     return this.transportDetail;
   }
 
+  recordUnknownEvent(kind: UnknownAppServerEventKind, name: string): void {
+    recordUnknownAppServerEvent({
+      workspace: this.options.cwd,
+      instanceName: process.env.TELECODEX_INSTANCE?.trim() || "default",
+      kind,
+      name,
+      codexVersion: this.codexVersion,
+    });
+  }
+
   close(): void {
     this.closedReason = "Codex app-server client closed.";
     this.failPending(new Error("Codex app-server client closed."));
@@ -315,11 +329,9 @@ export class CodexAppServerClient {
     let message: AppServerMessage;
     try {
       message = JSON.parse(line) as AppServerMessage;
-    } catch (error) {
-      this.notifications.push({
-        method: "parse/error",
-        params: { line, error: error instanceof Error ? error.message : String(error) },
-      });
+    } catch {
+      this.recordUnknownEvent("parse", "invalid-json");
+      this.notifications.push({ method: "parse/error" });
       return;
     }
 
@@ -425,7 +437,23 @@ function resolveAppServerLaunch(): { args: string[]; mode: AppServerTransportMod
 }
 
 function shouldUsePersistentWebSocket(): boolean {
-  return process.platform === "linux";
+  return process.platform === "linux" || process.env.TELECODEX_PERSISTENT_APP_SERVER === "1";
+}
+
+export function buildCodexAppServerEnvironment(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const environment = { ...baseEnv };
+  const overrides = [
+    ["CODEX_HTTP_PROXY", "HTTP_PROXY"],
+    ["CODEX_HTTPS_PROXY", "HTTPS_PROXY"],
+    ["CODEX_NO_PROXY", "NO_PROXY"],
+    ["CODEX_NODE_EXTRA_CA_CERTS", "NODE_EXTRA_CA_CERTS"],
+  ] as const;
+  for (const [source, target] of overrides) {
+    const value = baseEnv[source];
+    if (value) environment[target] = value;
+    delete environment[source];
+  }
+  return environment;
 }
 
 function resolvePersistentWebSocketUrl(): string {
@@ -452,6 +480,12 @@ function defaultServerRequestResult(method: string): unknown {
     return { currentTimeAt: Math.floor(Date.now() / 1000) };
   }
   throw new Error(`Unsupported app-server request: ${method}`);
+}
+
+function extractCodexVersion(value: unknown): string {
+  const record = value && typeof value === "object" ? value as Record<string, unknown> : undefined;
+  const userAgent = typeof record?.userAgent === "string" ? record.userAgent : "";
+  return userAgent.match(/\b\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?\b/)?.[0] ?? "unknown";
 }
 
 function resolveCodexCliPath(): { command: string; path: string; checked: string[] } {

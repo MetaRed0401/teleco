@@ -5,6 +5,7 @@ import { findLaunchProfile } from "./codex-launch.js";
 import { CodexSessionService } from "./codex-session.js";
 import type { FinalResponseMode, ResponsePreviewMode, TeleCodexConfig, ToolActivityMode } from "./config.js";
 import type { TelegramContextKey } from "./context-key.js";
+import { claimThreadOwnership, releaseThreadOwnership } from "./thread-ownership.js";
 import {
   DEFAULT_TELEGRAM_RESPONSE_FORMAT,
   normalizeTelegramPrettyMode,
@@ -51,15 +52,25 @@ export class SessionRegistry {
 
     const meta = this.resolveMetadata(contextKey);
     const launchProfileId = resolveLaunchProfileId(this.config, meta);
-    session = await CodexSessionService.create(this.config, {
-      workspace: meta?.workspace,
-      model: meta?.model,
-      reasoningEffort: meta?.reasoningEffort,
-      fastMode: meta?.fastMode,
-      launchProfileId,
-      deferThreadStart: options?.deferThreadStart && !meta?.threadId,
-      resumeThreadId: meta?.threadId ?? undefined,
-    });
+    const newlyClaimed = meta?.threadId
+      ? claimThreadOwnership(this.config.workspace, contextKey, meta.threadId)
+      : false;
+    try {
+      session = await CodexSessionService.create(this.config, {
+        workspace: meta?.workspace,
+        model: meta?.model,
+        reasoningEffort: meta?.reasoningEffort,
+        fastMode: meta?.fastMode,
+        launchProfileId,
+        deferThreadStart: options?.deferThreadStart && !meta?.threadId,
+        resumeThreadId: meta?.threadId ?? undefined,
+      });
+    } catch (error) {
+      if (newlyClaimed && meta?.threadId) {
+        releaseThreadOwnership(this.config.workspace, contextKey, meta.threadId);
+      }
+      throw error;
+    }
 
     this.sessions.set(contextKey, session);
     return session;
@@ -80,6 +91,12 @@ export class SessionRegistry {
   updateMetadata(contextKey: TelegramContextKey, session: CodexSessionService): void {
     const info = session.getInfo();
     const existing = this.metadata.get(contextKey);
+    if (info.threadId && info.threadId !== existing?.threadId) {
+      claimThreadOwnership(this.config.workspace, contextKey, info.threadId);
+    }
+    if (existing?.threadId && existing.threadId !== info.threadId) {
+      releaseThreadOwnership(this.config.workspace, contextKey, existing.threadId);
+    }
     this.metadata.set(contextKey, {
       contextKey,
       threadId: info.threadId,
@@ -222,11 +239,31 @@ export class SessionRegistry {
 
   remove(contextKey: TelegramContextKey): void {
     const session = this.sessions.get(contextKey);
+    const threadId = this.metadata.get(contextKey)?.threadId;
     session?.dispose();
     this.sessions.delete(contextKey);
     this.metadata.delete(contextKey);
     this.onRemoveCallback?.(contextKey);
+    if (threadId) {
+      releaseThreadOwnership(this.config.workspace, contextKey, threadId);
+    }
     this.persistMetadata();
+  }
+
+  async resumeThread(
+    contextKey: TelegramContextKey,
+    session: CodexSessionService,
+    threadId: string,
+  ): Promise<ReturnType<CodexSessionService["getInfo"]>> {
+    return this.withThreadOwnership(contextKey, threadId, () => session.resumeThread(threadId));
+  }
+
+  async switchSession(
+    contextKey: TelegramContextKey,
+    session: CodexSessionService,
+    threadId: string,
+  ): Promise<ReturnType<CodexSessionService["getInfo"]>> {
+    return this.withThreadOwnership(contextKey, threadId, () => session.switchSession(threadId));
   }
 
   disposeAll(): void {
@@ -287,6 +324,22 @@ export class SessionRegistry {
     this.metadata.set(contextKey, fallback);
     this.persistMetadata();
     return fallback;
+  }
+
+  private async withThreadOwnership(
+    contextKey: TelegramContextKey,
+    threadId: string,
+    action: () => Promise<ReturnType<CodexSessionService["getInfo"]>>,
+  ): Promise<ReturnType<CodexSessionService["getInfo"]>> {
+    const newlyClaimed = claimThreadOwnership(this.config.workspace, contextKey, threadId);
+    try {
+      return await action();
+    } catch (error) {
+      if (newlyClaimed) {
+        releaseThreadOwnership(this.config.workspace, contextKey, threadId);
+      }
+      throw error;
+    }
   }
 }
 

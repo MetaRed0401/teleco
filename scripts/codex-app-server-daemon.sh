@@ -24,13 +24,44 @@ resolve_codex() {
   exit 127
 }
 
-runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/telecodex"
-mkdir -p "$runtime_dir"
-exec 9>"$runtime_dir/codex-app-server.lock"
-if ! flock -n 9; then
-  echo "A TeleCodex Codex app-server runtime is already active." >&2
-  exit 75
+if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+  runtime_dir="${XDG_RUNTIME_DIR}/telecodex"
+elif [[ "$(uname -s)" == "Darwin" ]]; then
+  runtime_dir="${TMPDIR:-/tmp}/telecodex-$(id -u)"
+else
+  runtime_dir="/run/user/$(id -u)/telecodex"
 fi
+mkdir -p -m 0700 "$runtime_dir"
+
+lock_dir="$runtime_dir/codex-app-server.lock"
+if ! mkdir -m 0700 "$lock_dir" 2>/dev/null; then
+  owner_pid="$(cat "$lock_dir/pid" 2>/dev/null || true)"
+  if [[ "$owner_pid" =~ ^[0-9]+$ ]] && kill -0 "$owner_pid" 2>/dev/null; then
+    echo "A TeleCodex Codex app-server runtime is already active (pid $owner_pid)." >&2
+    exit 75
+  fi
+  rm -f "$lock_dir/pid"
+  if ! rmdir "$lock_dir" 2>/dev/null || ! mkdir -m 0700 "$lock_dir" 2>/dev/null; then
+    echo "Unable to reclaim stale TeleCodex app-server lock: $lock_dir" >&2
+    exit 75
+  fi
+fi
+printf '%s\n' "$$" >"$lock_dir/pid"
+
+apply_codex_environment_override() {
+  local source_name="$1"
+  local target_name="$2"
+  local value="${!source_name:-}"
+  if [[ -n "$value" ]]; then
+    export "$target_name=$value"
+  fi
+  unset "$source_name"
+}
+
+apply_codex_environment_override CODEX_HTTP_PROXY HTTP_PROXY
+apply_codex_environment_override CODEX_HTTPS_PROXY HTTPS_PROXY
+apply_codex_environment_override CODEX_NO_PROXY NO_PROXY
+apply_codex_environment_override CODEX_NODE_EXTRA_CA_CERTS NODE_EXTRA_CA_CERTS
 
 codex_bin="$(resolve_codex)"
 exec "$codex_bin" app-server --listen "ws://127.0.0.1:45123"

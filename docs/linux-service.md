@@ -1,6 +1,6 @@
 # Linux user service
 
-TeleCodex is usually most useful as a host user service. Running on the host lets Codex use the same `codex` auth state, workspace files, shell tools, and language CLIs that you use in your terminal. Keep the host service aligned to Codex CLI/app-server 0.144.1+ for canonical app-server compatibility.
+TeleCodex is usually most useful as a host user service. Running on the host lets Codex use the same `codex` auth state, workspace files, shell tools, and language CLIs that you use in your terminal. Codex CLI/app-server 0.144.1 is the minimum compatible baseline; 0.144.4 is the recommended stable version.
 
 ## Install service support
 

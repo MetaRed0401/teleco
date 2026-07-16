@@ -8,6 +8,7 @@ Wants=network-online.target telecodex-codex-app-server.service
 Type=simple
 WorkingDirectory=%h/telecodex
 Environment=NODE_ENV=production
+Environment="NODE_OPTIONS=--dns-result-order=ipv4first --no-network-family-autoselection"
 EnvironmentFile=%h/telecodex/.env.%i
 ExecStart=/usr/bin/env TELECODEX_INSTANCE=%i node dist/index.js
 Restart=on-failure

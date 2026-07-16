@@ -6,8 +6,13 @@ import type { TelegramContextKey } from "./context-key.js";
 
 export type PersistedApprovalStatus = "pending" | "interrupted" | "resolved" | "expired";
 
+export const APPROVAL_REQUEST_TTL_MS = 5 * 60 * 1000;
+const APPROVAL_HISTORY_TTL_MS = 24 * 60 * 60 * 1000;
+const MAX_APPROVAL_STATE_RECORDS = 50;
+
 export interface PersistedApprovalState {
   id: string;
+  instanceName: string;
   fingerprint: string;
   contextKey: TelegramContextKey | null;
   chatId: number | string;
@@ -52,6 +57,7 @@ export function findInterruptedApproval(
   return readApprovalStates(config)
     .filter((record) =>
       record.status === "interrupted"
+      && record.instanceName === currentInstanceName()
       && record.fingerprint === fingerprint
       && record.contextKey === contextKey
       && record.expiresAt > now,
@@ -59,13 +65,28 @@ export function findInterruptedApproval(
     .sort((left, right) => right.updatedAt - left.updatedAt)[0];
 }
 
+export function findPersistedApprovalState(
+  config: TeleCodexConfig,
+  id: string,
+  contextKey: TelegramContextKey | null,
+): PersistedApprovalState | undefined {
+  return readApprovalStates(config)
+    .filter((record) =>
+      record.id === id
+      && record.instanceName === currentInstanceName()
+      && record.contextKey === contextKey,
+    )
+    .sort((left, right) => right.updatedAt - left.updatedAt)[0];
+}
+
 export function persistPendingApproval(
   config: TeleCodexConfig,
-  input: Omit<PersistedApprovalState, "status" | "ownerPid" | "updatedAt">,
+  input: Omit<PersistedApprovalState, "instanceName" | "status" | "ownerPid" | "updatedAt">,
 ): void {
   const now = Date.now();
   const record: PersistedApprovalState = {
     ...input,
+    instanceName: currentInstanceName(),
     status: "pending",
     ownerPid: process.pid,
     updatedAt: now,
@@ -114,10 +135,10 @@ function writeApprovalStates(config: TeleCodexConfig, records: PersistedApproval
     .filter((record) =>
       record.status === "pending"
       || (record.status === "interrupted" && record.expiresAt > now)
-      || record.updatedAt > now - 24 * 60 * 60 * 1000,
+      || record.updatedAt > now - APPROVAL_HISTORY_TTL_MS,
     )
     .sort((left, right) => left.updatedAt - right.updatedAt)
-    .slice(-50);
+    .slice(-MAX_APPROVAL_STATE_RECORDS);
 
   try {
     const dir = path.dirname(filePath);
@@ -138,6 +159,10 @@ function getApprovalStatePath(config: TeleCodexConfig): string {
   return path.join(config.workspace, ".telecodex", instance, "approval-states.json");
 }
 
+function currentInstanceName(): string {
+  return process.env.TELECODEX_INSTANCE?.trim() || "default";
+}
+
 function isPersistedApprovalState(value: unknown): value is PersistedApprovalState {
   if (!value || typeof value !== "object") {
     return false;
@@ -145,6 +170,7 @@ function isPersistedApprovalState(value: unknown): value is PersistedApprovalSta
   const record = value as Partial<PersistedApprovalState>;
   return (
     typeof record.id === "string"
+    && typeof record.instanceName === "string"
     && typeof record.fingerprint === "string"
     && (typeof record.chatId === "number" || typeof record.chatId === "string")
     && typeof record.messageId === "number"

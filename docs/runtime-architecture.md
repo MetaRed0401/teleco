@@ -14,13 +14,13 @@ Telegram user
 
 The app-server runtime is the primary path. It provides structured turn lifecycle events, assistant deltas, tool activity, file-change events, token usage, account/rate-limit status, approval requests, and native context compact.
 
-Teleco uses a persistent app-server listener as the turn owner. Linux hosts run one listener in the independent `telecodex-codex-app-server.service`, and bridge instances connect directly over a local WebSocket. A Teleco bridge restart closes only its client connection. On startup, persisted operation thread/turn IDs are reconciled through `thread/read(includeTurns: true)`; active turns are polled and offline-completed final responses are returned to the originating Telegram context. Non-Linux direct stdio remains a compatibility path and cannot preserve an active turn when Teleco exits.
+Teleco uses a persistent app-server listener as the turn owner. Linux hosts use `telecodex-codex-app-server.service`; macOS service installs use a dedicated Codex app-server LaunchAgent. Bridge instances connect directly over one loopback WebSocket, and a bridge restart closes only its client connection. On startup, persisted operation thread/turn IDs are reconciled through `thread/read(includeTurns: true)`; active turns are polled and offline-completed final responses are returned to the originating Telegram context. Direct macOS development runs retain stdio compatibility unless started through the launchd helper.
 
 App-server approval server requests are connection-scoped. Teleco persists a bounded fingerprint and Telegram route for pending approvals. After a bridge restart, old approval buttons are marked expired because their original request ID cannot be answered on the new connection. If app-server reissues the same approval, Teleco matches the fingerprint and sends a restored approval prompt; otherwise the user is directed to `/retry`.
 
 The legacy SDK fallback is kept only as a compatibility path. New operation should use `ENABLE_CODEX_APP_SERVER_RUNTIME=true`.
 
-The supported Codex runtime baseline for this branch is 0.144.1. It uses canonical app-server items for tool activity and includes the `0.142.5` protection against full `Responses` WebSocket request payloads being written to trace logs.
+The minimum compatible Codex CLI/app-server version for this branch is 0.144.1, and the recommended stable version is 0.144.4. The minimum baseline uses canonical app-server items for tool activity and includes the `0.142.5` protection against full `Responses` WebSocket request payloads being written to trace logs. Codex CLI and SDK versions are reported separately and are not required to match exactly.
 
 TeleCodex keeps app-server handling conservative across Codex releases. Canonical command, file change, MCP, dynamic tool, collaboration, sub-agent, web search, review, hook, and compact activity is normalized into one item-ID lifecycle. Aggregated completion output contributes only the suffix not already received through delta notifications. Unknown MCP/plugin/status notifications are ignored unless they are useful and safe to show on mobile.
 
@@ -97,4 +97,4 @@ Service updates are guarded by `.telecodex/service-update.lock`. In multi-instan
 
 Telegram-facing operational messages should prefer explicit timestamps and workspace paths because mobile users may return to a session much later. Relative wording is fine for compact labels, but recovery and status messages should include enough absolute context to resume.
 
-When running through Docker, launchd, systemd, or a remote executor, prefer runtime-provided absolute paths over manual path assembly. Behind PAC/WPAD/static proxies, set proxy environment variables for the service/container before starting Codex app-server.
+When running through Docker, launchd, systemd, or a remote executor, prefer runtime-provided absolute paths over manual path assembly. Standard proxy variables affect the service environment. `CODEX_HTTP_PROXY`, `CODEX_HTTPS_PROXY`, `CODEX_NO_PROXY`, and `CODEX_NODE_EXTRA_CA_CERTS` are mapped only into the Codex child or persistent daemon so Telegram networking remains independent.

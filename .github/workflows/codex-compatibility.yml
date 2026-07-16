@@ -1,0 +1,50 @@
+name: Codex compatibility
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  policy:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.matrix.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: matrix
+        shell: bash
+        run: |
+          value="$(node -e 'const p=require("./codex-versions.json"); process.stdout.write(JSON.stringify({include:[{label:"minimum",version:p.minimum,experimental:false},{label:"recommended",version:p.recommended,experimental:false},{label:"next",version:p.alpha,experimental:true}]}))')"
+          echo "value=$value" >> "$GITHUB_OUTPUT"
+
+  compatibility:
+    needs: policy
+    runs-on: ubuntu-24.04
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.policy.outputs.matrix) }}
+    name: Codex ${{ matrix.label }} (${{ matrix.version }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.13.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: npm install --global "@openai/codex@${{ matrix.version }}"
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build
+      - name: Focused compatibility tests
+        run: |
+          pnpm exec vitest run test/app-server-client.test.ts test/app-server-observability.test.ts test/approval-state.test.ts
+          pnpm exec vitest run test/codex-session.test.ts -t 'canonical app-server|unknown canonical|releases canonical'
+      - name: Real app-server smoke
+        run: node scripts/codex-app-server-smoke.mjs

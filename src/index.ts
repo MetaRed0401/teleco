@@ -3,8 +3,10 @@ import { createHash } from "node:crypto";
 import { createBot, registerCommands, sendRecoveredTurnItem } from "./bot.js";
 import {
   acknowledgeActiveOperationItem,
+  claimActiveOperationRecovery,
   finishActiveOperation,
   markInterruptedOperations,
+  setActiveOperationDeliveryState,
   updateActiveOperation,
   type ActiveOperationRecord,
 } from "./active-operations.js";
@@ -16,18 +18,27 @@ import { escapeHTML } from "./format.js";
 import { consumeServiceOperationMarkers, type ServiceOperationMarker } from "./service-operation-marker.js";
 import { SessionRegistry } from "./session-registry.js";
 import { installRuntimeFileLogger } from "./runtime-log.js";
+import {
+  claimTelegramDelivery,
+  completeTelegramDelivery,
+  failTelegramDelivery,
+  scheduleTelegramDeliveryCleanup,
+} from "./telegram-delivery-store.js";
 
 let registry: SessionRegistry | undefined;
 let bot: ReturnType<typeof createBot> | undefined;
 let config: TeleCodexConfig | undefined;
 let shuttingDown = false;
+const COMMAND_REGISTRATION_TIMEOUT_MS = 10_000;
+const RECOVERY_DELIVERY_MAX_ATTEMPTS = 3;
+const recoveringOperationIds = new Set<string>();
 
 try {
   config = loadConfig();
   const runtimeLogPath = installRuntimeFileLogger(config);
   registry = new SessionRegistry(config);
   bot = createBot(config, registry);
-  await registerCommands(bot);
+  await registerCommandsSafely(bot);
 
   console.log("TeleCodex running");
   if (runtimeLogPath) {
@@ -85,6 +96,28 @@ process.once("SIGTERM", () => shutdown("SIGTERM"));
 const MAX_RESTART_ATTEMPTS = 5;
 const RESTART_DELAY_MS = 3000;
 let restartAttempts = 0;
+
+async function registerCommandsSafely(telegramBot: NonNullable<typeof bot>): Promise<void> {
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      registerCommands(telegramBot),
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error(`timed out after ${COMMAND_REGISTRATION_TIMEOUT_MS / 1000}s`)),
+          COMMAND_REGISTRATION_TIMEOUT_MS,
+        );
+      }),
+    ]);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`Failed to register Telegram commands; continuing with polling: ${message}`);
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  }
+}
 
 async function startPolling(): Promise<void> {
   try {
@@ -175,8 +208,33 @@ async function notifyInterruptedOperations(): Promise<void> {
 }
 
 async function recoverInterruptedOperation(operation: ActiveOperationRecord): Promise<void> {
+  if (recoveringOperationIds.has(operation.id)) {
+    return;
+  }
+  const releaseRecoveryClaim = claimActiveOperationRecovery(config!, operation.id);
+  if (!releaseRecoveryClaim) {
+    return;
+  }
+  recoveringOperationIds.add(operation.id);
+  try {
+    await recoverClaimedInterruptedOperation(operation);
+  } finally {
+    recoveringOperationIds.delete(operation.id);
+    releaseRecoveryClaim();
+    if (config) {
+      scheduleTelegramDeliveryCleanup(config);
+    }
+  }
+}
+
+async function recoverClaimedInterruptedOperation(operation: ActiveOperationRecord): Promise<void> {
   if (!bot || !config || !registry || !operation.threadId || operation.operation !== "turn") {
     await sendInterruptedOperationFallback(operation);
+    return;
+  }
+
+  if (operation.deliveryState === "delivered") {
+    finishActiveOperation(config, operation.id, "completed");
     return;
   }
 
@@ -185,7 +243,7 @@ async function recoverInterruptedOperation(operation: ActiveOperationRecord): Pr
   try {
     const session = await registry.getOrCreate(operation.contextKey, { deferThreadStart: true });
     if (session.getInfo().threadId !== operation.threadId) {
-      await session.resumeThread(operation.threadId);
+      await registry.resumeThread(operation.contextKey, session, operation.threadId);
       registry.updateMetadata(operation.contextKey, session);
     }
 
@@ -227,9 +285,19 @@ async function recoverInterruptedOperation(operation: ActiveOperationRecord): Pr
         await bot.api.deleteMessage(operation.chatId, recoveryMessageId).catch(() => undefined);
       }
       if (snapshot.turnStatus === "completed") {
+        setActiveOperationDeliveryState(config, operation.id, "completed-undelivered");
         if (snapshot.items.length === 0 && snapshot.agentText) {
-          await deliverRecoveredResponse(operation, snapshot.agentText);
+          const delivered = await deliverRecoveredResponseWithRetry(operation, snapshot.agentText);
+          if (!delivered) {
+            await sendInterruptedOperationFallback(
+              operation,
+              `Final response delivery failed after ${RECOVERY_DELIVERY_MAX_ATTEMPTS} attempts.`,
+            );
+            finishActiveOperation(config, operation.id, "failed");
+            return;
+          }
         }
+        setActiveOperationDeliveryState(config, operation.id, "delivered");
         finishActiveOperation(config, operation.id, "completed");
         return;
       }
@@ -276,15 +344,97 @@ async function replayRecoveredItems(
     if (deliveredItemIds.has(item.id)) {
       continue;
     }
-    await sendRecoveredTurnItem(bot, registry, operation, item);
+    const deliveryKey = `operation:${operation.id}:item:${item.id}`;
+    const claim = claimTelegramDelivery(config, {
+      deliveryKey,
+      contextKey: operation.contextKey,
+      chatId: operation.chatId,
+      messageThreadId: operation.messageThreadId,
+      operationId: operation.id,
+      itemId: item.id,
+      kind: "recovered-item",
+      payload: item.kind === "response" ? item.text : `${item.toolName}\n${item.detail}\n${item.isError ? "error" : "ok"}`,
+    });
+    if (claim !== "send") {
+      deliveredItemIds.add(item.id);
+      acknowledgeActiveOperationItem(config, operation.id, item.id);
+      continue;
+    }
+    try {
+      const messageId = await retryRecoveryTelegramCall(() => sendRecoveredTurnItem(bot!, registry!, operation, item));
+      completeTelegramDelivery(config, deliveryKey, messageId);
+    } catch (error) {
+      failTelegramDelivery(config, deliveryKey, error);
+      throw error;
+    }
     deliveredItemIds.add(item.id);
     acknowledgeActiveOperationItem(config, operation.id, item.id);
   }
 }
 
-async function deliverRecoveredResponse(operation: ActiveOperationRecord, agentText: string): Promise<void> {
+async function deliverRecoveredResponseWithRetry(
+  operation: ActiveOperationRecord,
+  agentText: string,
+): Promise<boolean> {
+  if (!config) {
+    return false;
+  }
+
+  const previousAttempts = operation.deliveryAttempts ?? 0;
+  const deliveryKey = `operation:${operation.id}:final`;
+  for (let attempt = previousAttempts; attempt < RECOVERY_DELIVERY_MAX_ATTEMPTS; attempt += 1) {
+    setActiveOperationDeliveryState(config, operation.id, "delivery-in-progress");
+    const claim = claimTelegramDelivery(config, {
+      deliveryKey,
+      contextKey: operation.contextKey,
+      chatId: operation.chatId,
+      messageThreadId: operation.messageThreadId,
+      operationId: operation.id,
+      kind: "recovered-final",
+      payload: agentText,
+    });
+    if (claim !== "send") {
+      return true;
+    }
+    try {
+      const messageId = await deliverRecoveredResponse(operation, agentText);
+      completeTelegramDelivery(config, deliveryKey, messageId);
+      return true;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      failTelegramDelivery(config, deliveryKey, error);
+      setActiveOperationDeliveryState(config, operation.id, "delivery-failed", detail);
+      if (isPermanentTelegramDeliveryError(error) || attempt + 1 >= RECOVERY_DELIVERY_MAX_ATTEMPTS) {
+        return false;
+      }
+      await delay(1000 * 2 ** attempt);
+    }
+  }
+  return false;
+}
+
+async function retryRecoveryTelegramCall<T>(action: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; attempt < RECOVERY_DELIVERY_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      return await action();
+    } catch (error) {
+      if (isPermanentTelegramDeliveryError(error) || attempt + 1 >= RECOVERY_DELIVERY_MAX_ATTEMPTS) {
+        throw error;
+      }
+      await delay(1000 * 2 ** attempt);
+    }
+  }
+  throw new Error("Telegram recovery delivery exhausted without a result.");
+}
+
+function isPermanentTelegramDeliveryError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /\b(?:400|401|403)\b|bot was blocked|chat not found|topic.*(?:closed|deleted)|message thread not found/i.test(message);
+}
+
+async function deliverRecoveredResponse(operation: ActiveOperationRecord, agentText: string): Promise<number | undefined> {
   if (!bot || !config) {
-    return;
+    return undefined;
   }
 
   const chunks = splitRecoveryText(agentText || "Codex completed the turn, but no final agent message was stored.");
@@ -307,11 +457,13 @@ async function deliverRecoveredResponse(operation: ActiveOperationRecord, agentT
   }
 
   for (const chunk of chunks.slice(1)) {
-    await bot.api.sendMessage(operation.chatId, escapeHTML(chunk), {
+    const sent = await bot.api.sendMessage(operation.chatId, escapeHTML(chunk), {
       parse_mode: "HTML",
       ...(operation.messageThreadId ? { message_thread_id: operation.messageThreadId } : {}),
     });
+    responseMessageId = sent.message_id;
   }
+  return responseMessageId;
 }
 
 async function sendInterruptedOperationFallback(operation: ActiveOperationRecord, detail?: string): Promise<void> {

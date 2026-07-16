@@ -9,7 +9,7 @@ vi.mock("node:child_process", () => ({
   spawn: mockSpawn,
 }));
 
-import { CodexAppServerClient } from "../src/codex-app-server-client.js";
+import { buildCodexAppServerEnvironment, CodexAppServerClient } from "../src/codex-app-server-client.js";
 
 describe("CodexAppServerClient", () => {
   beforeEach(() => {
@@ -56,5 +56,25 @@ describe("CodexAppServerClient", () => {
         }),
       }),
     );
+  });
+
+  it("maps Codex-only proxy settings without mutating Telegram process settings", () => {
+    const base = {
+      HTTP_PROXY: "http://telegram-proxy.invalid",
+      CODEX_HTTP_PROXY: "http://codex-proxy.invalid",
+      CODEX_HTTPS_PROXY: "https://codex-proxy.invalid",
+      CODEX_NO_PROXY: "127.0.0.1,localhost",
+      CODEX_NODE_EXTRA_CA_CERTS: "/run/secrets/codex-ca.pem",
+    };
+
+    const result = buildCodexAppServerEnvironment(base);
+    expect(result).toMatchObject({
+      HTTP_PROXY: "http://codex-proxy.invalid",
+      HTTPS_PROXY: "https://codex-proxy.invalid",
+      NO_PROXY: "127.0.0.1,localhost",
+      NODE_EXTRA_CA_CERTS: "/run/secrets/codex-ca.pem",
+    });
+    expect(result.CODEX_HTTP_PROXY).toBeUndefined();
+    expect(base.HTTP_PROXY).toBe("http://telegram-proxy.invalid");
   });
 });
