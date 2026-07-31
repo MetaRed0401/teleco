@@ -86,6 +86,7 @@ const mockState = vi.hoisted(() => {
 
 const mockAppServerState = vi.hoisted(() => {
   let notifications: Array<{ method: string; params?: unknown }> = [];
+  let requestHandler: ((method: string, params?: unknown) => unknown | Promise<unknown>) | undefined;
 
   const CodexAppServerClient = vi.fn().mockImplementation(function () {
     const listeners = new Set<(notification: { method: string; params?: unknown }) => void>();
@@ -99,7 +100,7 @@ const mockAppServerState = vi.hoisted(() => {
         listeners.add(listener);
         return () => listeners.delete(listener);
       }),
-      request: vi.fn().mockImplementation(async (method: string) => {
+      request: vi.fn().mockImplementation(async (method: string, params?: unknown) => {
         if (method === "thread/start") {
           return { thread: { id: "thread-app-server" } };
         }
@@ -113,6 +114,9 @@ const mockAppServerState = vi.hoisted(() => {
           }, 0);
           return { turn: { id: "turn-app-server" } };
         }
+        if (requestHandler) {
+          return requestHandler(method, params);
+        }
         throw new Error(`Unexpected app-server request: ${method}`);
       }),
     };
@@ -124,8 +128,12 @@ const mockAppServerState = vi.hoisted(() => {
     setNotifications: (next: Array<{ method: string; params?: unknown }>) => {
       notifications = next;
     },
+    setRequestHandler: (handler: (method: string, params?: unknown) => unknown | Promise<unknown>) => {
+      requestHandler = handler;
+    },
     reset: () => {
       notifications = [];
+      requestHandler = undefined;
       CodexAppServerClient.mockClear();
     },
   };
@@ -668,6 +676,229 @@ describe("CodexSessionService", () => {
     expect(callbacks.onToolEnd).toHaveBeenCalledWith("canonical-command", false);
   });
 
+  it("deduplicates 0.146 agent message snapshots across item and turn completion", async () => {
+    const service = await createAppServerService();
+    const callbacks = createCallbacks();
+    const finalItem = {
+      id: "agent-final",
+      type: "agentMessage",
+      text: "first second",
+    };
+    mockAppServerState.setNotifications([
+      {
+        method: "item/agentMessage/delta",
+        params: {
+          threadId: "thread-app-server",
+          turnId: "turn-app-server",
+          itemId: "agent-final",
+          delta: "first",
+        },
+      },
+      {
+        method: "item/completed",
+        params: {
+          threadId: "thread-app-server",
+          turnId: "turn-app-server",
+          item: finalItem,
+        },
+      },
+      {
+        method: "turn/completed",
+        params: {
+          threadId: "thread-app-server",
+          turn: {
+            id: "turn-app-server",
+            status: "completed",
+            items: [finalItem],
+          },
+        },
+      },
+    ]);
+
+    await service.prompt("complete once", callbacks);
+
+    expect(callbacks.onTextDelta.mock.calls).toEqual([
+      ["first", { agentMessageId: "agent-final", startsNewMessage: true }],
+      [" second", { agentMessageId: "agent-final", startsNewMessage: false }],
+    ]);
+    expect(callbacks.onAgentEnd).toHaveBeenCalledTimes(1);
+  });
+
+  it("emits a summary-only 0.146 final agent message once", async () => {
+    const service = await createAppServerService();
+    const callbacks = createCallbacks();
+    mockAppServerState.setNotifications([
+      {
+        method: "turn/completed",
+        params: {
+          threadId: "thread-app-server",
+          turn: {
+            id: "turn-app-server",
+            status: "completed",
+            items: [{ id: "summary-agent", type: "agentMessage", text: "summary final" }],
+          },
+        },
+      },
+    ]);
+
+    await service.prompt("summary only", callbacks);
+
+    expect(callbacks.onTextDelta).toHaveBeenCalledTimes(1);
+    expect(callbacks.onTextDelta).toHaveBeenCalledWith(
+      "summary final",
+      { agentMessageId: "summary-agent", startsNewMessage: true },
+    );
+  });
+
+  it("reads a target recovery turn through 0.146 pagination", async () => {
+    const service = await createAppServerService();
+    const requests = vi.fn(async (method: string, params?: unknown) => {
+      const input = params as Record<string, unknown>;
+      if (method === "thread/read") {
+        return { thread: { id: "thread-app-server", status: { type: "idle" } } };
+      }
+      if (method === "thread/turns/list" && !input.cursor) {
+        return {
+          data: [{ id: "turn-new", status: "completed", items: [] }],
+          nextCursor: "page-2",
+        };
+      }
+      if (method === "thread/turns/list" && input.cursor === "page-2") {
+        return {
+          data: [{
+            id: "turn-target",
+            status: "completed",
+            items: [{ id: "recovered-agent", type: "agentMessage", text: "recovered final" }],
+          }],
+          nextCursor: null,
+        };
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    mockAppServerState.setRequestHandler(requests);
+
+    const snapshot = await service.getTurnRecoverySnapshot("turn-target");
+
+    expect(snapshot).toMatchObject({
+      threadId: "thread-app-server",
+      turnId: "turn-target",
+      threadStatus: "idle",
+      turnStatus: "completed",
+      agentText: "recovered final",
+    });
+    expect(requests).toHaveBeenCalledWith(
+      "thread/turns/list",
+      expect.objectContaining({ cursor: "page-2", itemsView: "full", sortDirection: "desc" }),
+    );
+  });
+
+  it("falls back to 0.145 thread/read history when pagination is unsupported", async () => {
+    const service = await createAppServerService();
+    const requests = vi.fn(async (method: string, params?: unknown) => {
+      const input = params as Record<string, unknown>;
+      if (method === "thread/turns/list") {
+        throw new Error("Unsupported app-server request: thread/turns/list");
+      }
+      if (method === "thread/read" && input.includeTurns === false) {
+        return { thread: { id: "thread-app-server", status: { type: "idle" } } };
+      }
+      if (method === "thread/read" && input.includeTurns === true) {
+        return {
+          thread: {
+            id: "thread-app-server",
+            status: { type: "idle" },
+            turns: [{
+              id: "legacy-turn",
+              status: "completed",
+              items: [{ id: "legacy-agent", type: "agentMessage", text: "legacy final" }],
+            }],
+          },
+        };
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    mockAppServerState.setRequestHandler(requests);
+
+    const snapshot = await service.getTurnRecoverySnapshot("legacy-turn");
+
+    expect(snapshot).toMatchObject({
+      turnId: "legacy-turn",
+      turnStatus: "completed",
+      agentText: "legacy final",
+    });
+    expect(requests).toHaveBeenCalledWith(
+      "thread/read",
+      { threadId: "thread-app-server", includeTurns: true },
+    );
+  });
+
+  it("uses native 0.146 thread metadata and MCP refresh requests", async () => {
+    const service = await createAppServerService();
+    const requests = vi.fn(async (method: string) => {
+      if (method === "thread/name/set" || method === "thread/metadata/update" || method === "config/mcpServer/reload") {
+        return {};
+      }
+      if (method === "mcpServerStatus/list") {
+        return {
+          data: [
+            { name: "docs", authStatus: "oAuth" },
+            { name: "local", authStatus: "unsupported" },
+          ],
+        };
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    mockAppServerState.setRequestHandler(requests);
+
+    await expect(service.setThreadName("  Release\u0007 session  ")).resolves.toBe("Release session");
+    await expect(service.setThreadPinned(true)).resolves.toBeUndefined();
+    await expect(service.refreshMcpServers()).resolves.toEqual({
+      supported: true,
+      statuses: [
+        { name: "docs", authStatus: "oAuth" },
+        { name: "local", authStatus: "unsupported" },
+      ],
+    });
+    await expect(service.getStatusDetails()).resolves.toMatchObject({
+      mcp: { total: 2, authenticationRequired: 0 },
+    });
+
+    expect(requests).toHaveBeenCalledWith(
+      "thread/name/set",
+      { threadId: "thread-app-server", name: "Release session" },
+    );
+    expect(requests).toHaveBeenCalledWith(
+      "thread/metadata/update",
+      { threadId: "thread-app-server", isPinned: true },
+    );
+  });
+
+  it("reports unsupported MCP refresh without resetting the app-server", async () => {
+    const service = await createAppServerService();
+    mockAppServerState.setRequestHandler(async (method: string) => {
+      throw new Error(`Unsupported app-server request: ${method}`);
+    });
+
+    await expect(service.refreshMcpServers()).resolves.toEqual({ supported: false, statuses: [] });
+  });
+
+  it("terminates an active app-server prompt when its thread is deleted", async () => {
+    const service = await createAppServerService();
+    const callbacks = createCallbacks();
+    mockAppServerState.setNotifications([
+      {
+        method: "thread/deleted",
+        params: { threadId: "thread-app-server" },
+      },
+    ]);
+
+    await expect(service.prompt("deleted during work", callbacks)).rejects.toThrow(
+      "The active Codex thread was deleted.",
+    );
+    expect(service.getInfo().threadId).toBeNull();
+    expect(service.isProcessing()).toBe(false);
+  });
+
   it("keeps context usage pending until the selected model reports a fresh app-server window", async () => {
     const service = await createAppServerService();
     const callbacks = createCallbacks();
@@ -790,6 +1021,44 @@ describe("CodexSessionService", () => {
 
     expect(callbacks.onToolStart).toHaveBeenCalledTimes(1);
     expect(callbacks.onToolUpdate).toHaveBeenCalledTimes(1);
+    expect(callbacks.onToolEnd).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores canonical deltas that arrive after completion", async () => {
+    const service = await createAppServerService();
+    const callbacks = createCallbacks();
+    mockAppServerState.setNotifications([
+      {
+        method: "item/completed",
+        params: {
+          threadId: "thread-app-server",
+          turnId: "turn-app-server",
+          item: {
+            id: "completed-command",
+            type: "commandExecution",
+            command: "echo complete",
+            aggregatedOutput: "complete\n",
+            status: "completed",
+          },
+        },
+      },
+      {
+        method: "item/commandExecution/outputDelta",
+        params: {
+          threadId: "thread-app-server",
+          turnId: "turn-app-server",
+          itemId: "completed-command",
+          delta: "late duplicate\n",
+        },
+      },
+      completedAppServerTurn,
+    ]);
+
+    await service.prompt("late delta", callbacks);
+
+    expect(callbacks.onToolUpdate.mock.calls).toEqual([
+      ["completed-command", "complete\n", { kind: "output" }],
+    ]);
     expect(callbacks.onToolEnd).toHaveBeenCalledTimes(1);
   });
 

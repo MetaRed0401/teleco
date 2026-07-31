@@ -203,6 +203,10 @@ export interface CodexStatusDetails {
     modelContextWindow?: number;
     autoCompactTokenLimit?: number;
   };
+  mcp?: {
+    total: number;
+    authenticationRequired: number;
+  };
   error?: string;
 }
 
@@ -232,8 +236,13 @@ export interface CodexPermissionProfile {
   description?: string;
 }
 
+export interface CodexMcpServerStatus {
+  name: string;
+  authStatus: string;
+}
+
 type AppServerToolLifecycle = {
-  completed: boolean;
+  status: "started" | "streaming" | "completed" | "failed";
   output: string;
   diff: string;
 };
@@ -264,6 +273,8 @@ export class CodexSessionService {
   private appServerCurrentTurnId: string | null = null;
   private appServerCallbacks: CodexSessionCallbacks | undefined;
   private readonly appServerToolLifecycles = new Map<string, AppServerToolLifecycle>();
+  private readonly appServerAgentMessages = new Map<string, string>();
+  private readonly threadMetadataOverrides = new Map<string, { name?: string; isPinned?: boolean }>();
   private appServerInstructionSources: string[] = [];
   private appServerActivePermissionProfile: string | undefined;
   private appServerApprovalsReviewer: string | undefined;
@@ -403,22 +414,42 @@ export class CodexSessionService {
     }
 
     await this.ensureAppServerThreadReady();
-    const response = await this.getAppServerClient().request(
+    const client = this.getAppServerClient();
+    const response = await client.request(
       "thread/read",
-      { threadId: this.currentThreadId, includeTurns: true },
+      { threadId: this.currentThreadId, includeTurns: false },
       10_000,
     );
-    const thread = readRecord(readRecord(response)?.thread);
+    let thread = readRecord(readRecord(response)?.thread);
     if (!thread) {
       throw new Error("Codex thread recovery snapshot is unavailable.");
     }
 
-    const turns = Array.isArray(thread.turns)
-      ? thread.turns.map(readRecord).filter((turn): turn is Record<string, unknown> => Boolean(turn))
-      : [];
+    const paginatedTurns = await this.readPaginatedRecoveryTurns(client, this.currentThreadId, turnId);
+    let turns: Record<string, unknown>[];
+    let newestFirst = true;
+    if (paginatedTurns) {
+      turns = paginatedTurns;
+    } else {
+      const legacyResponse = await client.request(
+        "thread/read",
+        { threadId: this.currentThreadId, includeTurns: true },
+        10_000,
+      );
+      thread = readRecord(readRecord(legacyResponse)?.thread);
+      if (!thread) {
+        throw new Error("Codex thread recovery snapshot is unavailable.");
+      }
+      turns = Array.isArray(thread.turns)
+        ? thread.turns.map(readRecord).filter((turn): turn is Record<string, unknown> => Boolean(turn))
+        : [];
+      newestFirst = false;
+    }
     const turn = turnId
       ? turns.find((candidate) => readString(candidate.id) === turnId)
-      : turns.at(-1);
+      : newestFirst
+        ? turns[0]
+        : turns.at(-1);
     const items = Array.isArray(turn?.items)
       ? turn.items.map(readRecord).filter((item): item is Record<string, unknown> => Boolean(item))
       : [];
@@ -443,6 +474,59 @@ export class CodexSessionService {
     };
   }
 
+  private async readPaginatedRecoveryTurns(
+    client: CodexAppServerClient,
+    threadId: string,
+    targetTurnId?: string,
+  ): Promise<Record<string, unknown>[] | undefined> {
+    const turns: Record<string, unknown>[] = [];
+    const seenCursors = new Set<string>();
+    let cursor: string | undefined;
+
+    for (let page = 0; page < 20; page += 1) {
+      let response: unknown;
+      try {
+        response = await client.request(
+          "thread/turns/list",
+          {
+            threadId,
+            limit: 50,
+            sortDirection: "desc",
+            itemsView: "full",
+            ...(cursor ? { cursor } : {}),
+          },
+          10_000,
+        );
+      } catch (error) {
+        if (page === 0) {
+          return undefined;
+        }
+        throw error;
+      }
+
+      const result = readRecord(response);
+      const pageTurns = Array.isArray(result?.data)
+        ? result.data.map(readRecord).filter((turn): turn is Record<string, unknown> => Boolean(turn))
+        : [];
+      turns.push(...pageTurns);
+      if (!targetTurnId || turns.some((turn) => readString(turn.id) === targetTurnId)) {
+        return turns;
+      }
+
+      const nextCursor = readString(result?.nextCursor);
+      if (!nextCursor) {
+        return turns;
+      }
+      if (seenCursors.has(nextCursor)) {
+        throw new Error("Codex thread history returned a repeated pagination cursor.");
+      }
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
+    }
+
+    throw new Error("Codex thread history exceeded the recovery page limit.");
+  }
+
   getCurrentWorkspace(): string {
     return this.currentWorkspace;
   }
@@ -455,7 +539,7 @@ export class CodexSessionService {
     try {
       await this.ensureAppServerInitialized();
       const client = this.getAppServerClient();
-      const [accountResponse, usageResponse, rateLimitResponse, configResponse, threadResponse] = await Promise.all([
+      const [accountResponse, usageResponse, rateLimitResponse, configResponse, threadResponse, mcpResponse] = await Promise.all([
         client.request("account/read", { refreshToken: false }, 5000).catch((error) => ({ error })),
         client.request("account/usage/read", undefined, 5000).catch((error) => ({ error })),
         client.request("account/rateLimits/read", undefined, 5000).catch((error) => ({ error })),
@@ -463,6 +547,7 @@ export class CodexSessionService {
         this.currentThreadId
           ? client.request("thread/read", { threadId: this.currentThreadId, includeTurns: false }, 5000).catch((error) => ({ error }))
           : Promise.resolve(undefined),
+        client.request("mcpServerStatus/list", {}, 5000).catch((error) => ({ error })),
       ]);
 
       const details: CodexStatusDetails = {
@@ -471,6 +556,16 @@ export class CodexSessionService {
         rateLimits: parseRateLimitStatus(rateLimitResponse),
       };
       details.config = parseConfigStatus(configResponse);
+      const mcpData = readRecord(mcpResponse)?.data;
+      if (Array.isArray(mcpData)) {
+        details.mcp = {
+          total: mcpData.length,
+          authenticationRequired: mcpData.filter((value) => {
+            const authStatus = readString(readRecord(value)?.authStatus);
+            return authStatus === "notLoggedIn";
+          }).length,
+        };
+      }
       if (details.config?.model && !this.currentModel) {
         this.currentModel = details.config.model;
       }
@@ -977,7 +1072,10 @@ export class CodexSessionService {
   }
 
   listAllSessions(limit?: number): CodexThreadRecord[] {
-    return listThreads(limit ?? 20);
+    return listThreads(limit ?? 20).map((thread) => {
+      const override = this.threadMetadataOverrides.get(thread.id);
+      return override ? { ...thread, ...override } : thread;
+    });
   }
 
   listWorkspaces(): string[] {
@@ -1146,6 +1244,81 @@ export class CodexSessionService {
     return this.getInfo();
   }
 
+  async refreshMcpServers(): Promise<{ supported: boolean; statuses: CodexMcpServerStatus[] }> {
+    if (!this.config.enableCodexAppServerRuntime) {
+      return { supported: false, statuses: [] };
+    }
+
+    await this.ensureAppServerInitialized();
+    const client = this.getAppServerClient();
+    try {
+      await client.request("config/mcpServer/reload", {}, 10_000);
+    } catch (error) {
+      if (isUnsupportedAppServerRequest(error, "config/mcpServer/reload")) {
+        return { supported: false, statuses: [] };
+      }
+      throw error;
+    }
+
+    const response = await client.request("mcpServerStatus/list", {}, 10_000);
+    const data = readRecord(response)?.data;
+    const statuses = Array.isArray(data)
+      ? data.flatMap((value) => {
+          const status = readRecord(value);
+          const name = readString(status?.name);
+          if (!name) {
+            return [];
+          }
+          return [{ name, authStatus: readString(status?.authStatus) ?? "unknown" }];
+        })
+      : [];
+    return { supported: true, statuses };
+  }
+
+  async setThreadName(name: string): Promise<string> {
+    this.ensureIdle("rename a thread");
+    const normalizedName = name.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim();
+    if (!normalizedName) {
+      throw new Error("Thread name cannot be empty.");
+    }
+    if (normalizedName.length > 80) {
+      throw new Error("Thread name must be 80 characters or fewer.");
+    }
+    if (!this.currentThreadId || !this.config.enableCodexAppServerRuntime) {
+      throw new Error("Native thread naming requires an active app-server thread.");
+    }
+
+    await this.ensureAppServerThreadReady();
+    await this.getAppServerClient().request(
+      "thread/name/set",
+      { threadId: this.currentThreadId, name: normalizedName },
+      5000,
+    );
+    this.threadMetadataOverrides.set(this.currentThreadId, {
+      ...this.threadMetadataOverrides.get(this.currentThreadId),
+      name: normalizedName,
+    });
+    return normalizedName;
+  }
+
+  async setThreadPinned(isPinned: boolean): Promise<void> {
+    this.ensureIdle(isPinned ? "pin a thread" : "unpin a thread");
+    if (!this.currentThreadId || !this.config.enableCodexAppServerRuntime) {
+      throw new Error("Native thread pinning requires an active app-server thread.");
+    }
+
+    await this.ensureAppServerThreadReady();
+    await this.getAppServerClient().request(
+      "thread/metadata/update",
+      { threadId: this.currentThreadId, isPinned },
+      5000,
+    );
+    this.threadMetadataOverrides.set(this.currentThreadId, {
+      ...this.threadMetadataOverrides.get(this.currentThreadId),
+      isPinned,
+    });
+  }
+
   private buildSdkInput(input: CodexPromptInput): Input {
     const safetyInstructions = buildSafetyInstructions(this.activeThreadLaunchProfile ?? this.currentLaunchProfile);
     if (typeof input === "string") {
@@ -1246,6 +1419,7 @@ export class CodexSessionService {
     this.appServerCurrentTurnId = null;
     this.appServerCallbacks = undefined;
     this.appServerToolLifecycles.clear();
+    this.appServerAgentMessages.clear();
   }
 
   private resetUsageState(model = this.currentModel ?? this.config.codexModel): void {
@@ -1308,6 +1482,7 @@ export class CodexSessionService {
     this.abortController = controller;
     let client = this.getAppServerClient(callbacks);
     this.appServerToolLifecycles.clear();
+    this.appServerAgentMessages.clear();
     let unsubscribe = client.onNotification((notification) => {
       this.handleAppServerNotification(notification, callbacks);
     });
@@ -1349,6 +1524,7 @@ export class CodexSessionService {
         callbacks.onTurnStarted?.(this.appServerCurrentTurnId);
       }
 
+      const activeThreadId = this.currentThreadId;
       await new Promise<void>((resolve, reject) => {
         const onAbort = (): void => {
           reject(new Error("Codex turn was aborted."));
@@ -1356,6 +1532,15 @@ export class CodexSessionService {
         controller.signal.addEventListener("abort", onAbort, { once: true });
         const done = client.onNotification((notification) => {
           const params = readRecord(notification.params);
+          if (
+            notification.method === "thread/deleted" &&
+            readString(params?.threadId) === activeThreadId
+          ) {
+            controller.signal.removeEventListener("abort", onAbort);
+            done();
+            reject(new Error("The active Codex thread was deleted."));
+            return;
+          }
           if (notification.method === "error") {
             controller.signal.removeEventListener("abort", onAbort);
             done();
@@ -1404,6 +1589,7 @@ export class CodexSessionService {
       unsubscribe();
       this.appServerCurrentTurnId = null;
       this.appServerToolLifecycles.clear();
+      this.appServerAgentMessages.clear();
       if (this.abortController === controller) {
         this.abortController = null;
       }
@@ -1595,6 +1781,9 @@ export class CodexSessionService {
     if (notificationTurnId && this.appServerCurrentTurnId && notificationTurnId !== this.appServerCurrentTurnId) {
       return;
     }
+    if (notificationTurnId && !this.appServerCurrentTurnId) {
+      this.appServerCurrentTurnId = notificationTurnId;
+    }
 
     switch (notification.method) {
       case "thread/started": {
@@ -1609,7 +1798,7 @@ export class CodexSessionService {
         const delta = readString(params?.delta);
         const itemId = readString(params?.itemId) ?? "agent-message";
         if (delta) {
-          callbacks.onTextDelta(delta, { agentMessageId: itemId, startsNewMessage: false });
+          this.emitAppServerAgentDelta(callbacks, itemId, delta);
         }
         break;
       }
@@ -1702,7 +1891,9 @@ export class CodexSessionService {
         const item = readRecord(params?.item);
         const id = readString(item?.id) ?? randomItemId();
         const type = readString(item?.type);
-        if (type === "commandExecution") {
+        if (type === "agentMessage") {
+          this.emitAppServerAgentSnapshot(callbacks, id, readString(item?.text) ?? "");
+        } else if (type === "commandExecution") {
           this.emitAppServerToolStart(callbacks, readString(item?.command) ?? "shell", id);
           const output = readString(item?.aggregatedOutput);
           if (output) {
@@ -1834,6 +2025,17 @@ export class CodexSessionService {
         const status = readString(turn?.status);
         const turnError = readRecord(turn?.error);
         const message = readString(turnError?.message) ?? readString(turnError?.additionalDetails);
+        const turnItems = Array.isArray(turn?.items)
+          ? turn.items.map(readRecord).filter((item): item is Record<string, unknown> => Boolean(item))
+          : [];
+        const finalAgentItem = turnItems.filter((item) => readString(item.type) === "agentMessage").at(-1);
+        if (finalAgentItem) {
+          this.emitAppServerAgentSnapshot(
+            callbacks,
+            readString(finalAgentItem.id) ?? "agent-message",
+            readString(finalAgentItem.text) ?? "",
+          );
+        }
         if ((status === "failed" || status === "interrupted") && message) {
           const id = `app-server-turn-${status}-${Date.now()}`;
           this.emitAppServerToolStart(callbacks, `app_server_turn_${status}`, id);
@@ -1849,15 +2051,18 @@ export class CodexSessionService {
           this.appServerThreadLoaded = false;
           this.appServerCurrentTurnId = null;
           this.appServerToolLifecycles.clear();
+          this.appServerAgentMessages.clear();
         }
         break;
       }
       case "thread/status/changed":
       case "thread/settings/updated":
+      case "thread/name/updated":
       case "turn/diff/updated":
       case "turn/plan/updated":
       case "account/rateLimits/updated":
       case "mcp/server/status/updated":
+      case "mcpServer/startupStatus/updated":
         break;
       case "model/rerouted": {
         const toModel = readString(params?.toModel);
@@ -1913,10 +2118,11 @@ export class CodexSessionService {
   }
 
   private emitAppServerToolStart(callbacks: CodexSessionCallbacks, toolName: string, toolCallId: string): void {
-    if (this.appServerToolLifecycles.has(toolCallId)) {
+    const lifecycleKey = this.getAppServerItemLifecycleKey(toolCallId);
+    if (this.appServerToolLifecycles.has(lifecycleKey)) {
       return;
     }
-    this.appServerToolLifecycles.set(toolCallId, { completed: false, output: "", diff: "" });
+    this.appServerToolLifecycles.set(lifecycleKey, { status: "started", output: "", diff: "" });
     callbacks.onToolStart(toolName, toolCallId);
   }
 
@@ -1926,10 +2132,11 @@ export class CodexSessionService {
     delta: string,
     kind: "output" | "diff" = "output",
   ): void {
-    const state = this.appServerToolLifecycles.get(toolCallId);
-    if (!state || state.completed || !delta) {
+    const state = this.appServerToolLifecycles.get(this.getAppServerItemLifecycleKey(toolCallId));
+    if (!state || state.status === "completed" || state.status === "failed" || !delta) {
       return;
     }
+    state.status = "streaming";
     state[kind] += delta;
     callbacks.onToolUpdate(toolCallId, delta, { kind });
   }
@@ -1940,24 +2147,70 @@ export class CodexSessionService {
     snapshot: string,
     kind: "output" | "diff" = "output",
   ): void {
-    const state = this.appServerToolLifecycles.get(toolCallId);
-    if (!state || state.completed || !snapshot) {
+    const state = this.appServerToolLifecycles.get(this.getAppServerItemLifecycleKey(toolCallId));
+    if (!state || state.status === "completed" || state.status === "failed" || !snapshot) {
       return;
     }
     const delta = computeTextDelta(state[kind], snapshot);
     state[kind] = snapshot;
     if (delta) {
+      state.status = "streaming";
       callbacks.onToolUpdate(toolCallId, delta, { kind });
     }
   }
 
   private emitAppServerToolEnd(callbacks: CodexSessionCallbacks, toolCallId: string, isError: boolean): void {
-    const state = this.appServerToolLifecycles.get(toolCallId);
-    if (!state || state.completed) {
+    const state = this.appServerToolLifecycles.get(this.getAppServerItemLifecycleKey(toolCallId));
+    if (!state || state.status === "completed" || state.status === "failed") {
       return;
     }
-    state.completed = true;
+    state.status = isError ? "failed" : "completed";
     callbacks.onToolEnd(toolCallId, isError);
+  }
+
+  private emitAppServerAgentDelta(
+    callbacks: CodexSessionCallbacks,
+    agentMessageId: string,
+    delta: string,
+  ): void {
+    if (!delta) {
+      return;
+    }
+    const lifecycleKey = this.getAppServerItemLifecycleKey(agentMessageId);
+    const previous = this.appServerAgentMessages.get(lifecycleKey);
+    this.appServerAgentMessages.set(lifecycleKey, `${previous ?? ""}${delta}`);
+    callbacks.onTextDelta(delta, {
+      agentMessageId,
+      startsNewMessage: previous === undefined,
+    });
+  }
+
+  private emitAppServerAgentSnapshot(
+    callbacks: CodexSessionCallbacks,
+    agentMessageId: string,
+    snapshot: string,
+  ): void {
+    if (!snapshot) {
+      return;
+    }
+    const lifecycleKey = this.getAppServerItemLifecycleKey(agentMessageId);
+    const previous = this.appServerAgentMessages.get(lifecycleKey);
+    const delta = previous === undefined ? snapshot : computeTextDelta(previous, snapshot);
+    this.appServerAgentMessages.set(lifecycleKey, snapshot);
+    if (delta) {
+      callbacks.onTextDelta(delta, {
+        agentMessageId,
+        startsNewMessage: previous === undefined,
+      });
+    }
+  }
+
+  private getAppServerItemLifecycleKey(itemId: string): string {
+    return [
+      this.currentThreadId ?? "thread",
+      this.appServerCurrentTurnId ?? "turn",
+      itemId,
+    ].join(":");
   }
 
   private buildAppServerSandboxPolicy(): Record<string, unknown> {
@@ -2662,6 +2915,16 @@ function buildCodexEnv(apiKey?: string): Record<string, string> {
 
 function computeTextDelta(previousText: string, nextText: string): string {
   return nextText.startsWith(previousText) ? nextText.slice(previousText.length) : nextText;
+}
+
+function isUnsupportedAppServerRequest(error: unknown, method: string): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  const normalized = message.toLowerCase();
+  return normalized.includes(method.toLowerCase()) && (
+    normalized.includes("unsupported") ||
+    normalized.includes("unknown method") ||
+    normalized.includes("method not found")
+  );
 }
 
 function truncate(text: string, maxLength: number): string {

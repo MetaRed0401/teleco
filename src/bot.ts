@@ -38,12 +38,7 @@ import {
   type PersistedApprovalState,
 } from "./approval-state.js";
 import { collectArtifactReport, ensureOutDir, formatArtifactSummary } from "./artifacts.js";
-import {
-  formatSessionLabel,
-  renderHelpMessage,
-  renderWelcomeFirstTime,
-  renderWelcomeReturning,
-} from "./bot-ui.js";
+import { renderHelpMessage, renderWelcomeFirstTime, renderWelcomeReturning } from "./bot-ui.js";
 import {
   type CodexPromptInput,
   type CodexApprovalDecision,
@@ -100,6 +95,7 @@ import {
   type TelegramPrettyMode,
   type TelegramResponseFormat,
 } from "./telegram-formatting.js";
+import { isThreadOwnedElsewhere } from "./thread-ownership.js";
 import { ToolDiffPreviewStore } from "./tool-diff-store.js";
 import { getAvailableBackends, transcribeAudio } from "./voice.js";
 import {
@@ -207,6 +203,14 @@ type SessionWorkspaceGroup = {
   availability: WorkspaceAvailability;
 };
 
+type SessionSelectionPanel = {
+  workspace: string;
+  ownershipWorkspace: string;
+  contextKey: TelegramContextKey;
+  sessions: CodexThreadRecord[];
+  activeThreadId?: string;
+};
+
 type ToolState = {
   toolName: string;
   toolCallId: string;
@@ -292,9 +296,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     { processing: boolean; switching: boolean; transcribing: boolean; compacting: boolean }
   >();
   const pendingSessionPicks = new Map<TelegramContextKey, string[]>();
+  const pendingSessionPanels = new Map<TelegramContextKey, SessionSelectionPanel>();
   const pendingSessionWorkspacePicks = new Map<TelegramContextKey, SessionWorkspaceGroup[]>();
   const pendingWorkspacePicks = new Map<TelegramContextKey, string[]>();
-  const pendingSessionButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingSessionWorkspaceButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingWorkspaceButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingLaunchPicks = new Map<TelegramContextKey, string[]>();
@@ -321,6 +325,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
   registry.onRemove((key) => {
     contextBusy.delete(key);
+    pendingSessionPicks.delete(key);
+    pendingSessionPanels.delete(key);
+    pendingSessionWorkspacePicks.delete(key);
+    pendingSessionWorkspaceButtons.delete(key);
     pendingLaunchPicks.delete(key);
     pendingLaunchButtons.delete(key);
     pendingPermissionPicks.delete(key);
@@ -1798,23 +1806,16 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     };
 
     const commitAssistantSegmentAtToolBoundary = async (toolName: string): Promise<void> => {
-      const textDeltaQueueAtBoundary = textDeltaQueue;
-      const commitTask = segmentCommitQueue
+      const commitTask = textDeltaQueue
         .catch((error) => {
-          console.error("Previous assistant segment commit failed", error);
+          console.error("Failed to process text delta before assistant segment commit", error);
         })
-        .then(async () => {
-          try {
-            await textDeltaQueueAtBoundary;
-          } catch (error) {
-            console.error("Failed to process text delta before assistant segment commit", error);
-          }
-          await commitCurrentAssistantSegment();
-        })
+        .then(() => commitCurrentAssistantSegment())
         .catch((error) => {
           console.error(`Failed to commit assistant segment before tool ${toolName}`, error);
         });
 
+      textDeltaQueue = commitTask;
       segmentCommitQueue = commitTask;
       await commitTask;
     };
@@ -2601,14 +2602,33 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
 
     const { contextKey, session } = contextSession;
-    if (isBusy(contextKey)) {
-      await safeReply(ctx, "Cannot reconnect Codex app-server while this context is busy.", {
-        fallbackText: "Cannot reconnect Codex app-server while this context is busy.",
-      });
-      return;
-    }
-
     try {
+      const mcpRefresh = await session.refreshMcpServers();
+      if (mcpRefresh.supported) {
+        await safeReply(
+          ctx,
+          [
+            "<b>Codex MCP runtime refreshed.</b>",
+            "<b>App-server:</b> <code>kept running</code>",
+            `<b>MCP servers:</b> <code>${mcpRefresh.statuses.length}</code>`,
+          ].join("\n"),
+          {
+            fallbackText: [
+              "Codex MCP runtime refreshed.",
+              "App-server: kept running",
+              `MCP servers: ${mcpRefresh.statuses.length}`,
+            ].join("\n"),
+          },
+        );
+        return;
+      }
+      if (isBusy(contextKey)) {
+        await safeReply(ctx, "This Codex version requires a full reconnect, which is unavailable while work is active.", {
+          fallbackText: "This Codex version requires a full reconnect, which is unavailable while work is active.",
+        });
+        return;
+      }
+
       const info = await session.reconnectAppServer();
       updateSessionMetadata(contextKey, session);
       await safeReply(
@@ -2631,6 +2651,61 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         fallbackText: `Reconnect failed: ${friendlyErrorText(error)}`,
       });
     }
+  });
+
+  bot.command("rename", async (ctx) => {
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      return;
+    }
+    const name = commandArgs(ctx, "rename");
+    if (!name) {
+      await safeReply(ctx, "<b>Rename thread</b>\n\n<code>/rename &lt;name&gt;</code>", {
+        fallbackText: "Rename thread\n\n/rename <name>",
+        replyMarkup: new InlineKeyboard().text("Cancel", "ui_cancel"),
+      });
+      return;
+    }
+
+    const { contextKey, session } = contextSession;
+    try {
+      const normalizedName = await session.setThreadName(name);
+      updateSessionMetadata(contextKey, session);
+      await safeReply(ctx, `<b>Thread renamed:</b> ${escapeHTML(normalizedName)}`, {
+        fallbackText: `Thread renamed: ${normalizedName}`,
+      });
+    } catch (error) {
+      await safeReply(ctx, `<b>Rename failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: `Rename failed: ${friendlyErrorText(error)}`,
+      });
+    }
+  });
+
+  const setCurrentThreadPinned = async (ctx: Context, isPinned: boolean): Promise<void> => {
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      return;
+    }
+    const { contextKey, session } = contextSession;
+    try {
+      await session.setThreadPinned(isPinned);
+      updateSessionMetadata(contextKey, session);
+      const message = isPinned ? "Thread pinned." : "Thread unpinned.";
+      await safeReply(ctx, `<b>${escapeHTML(message)}</b>`, { fallbackText: message });
+    } catch (error) {
+      const action = isPinned ? "Pin" : "Unpin";
+      await safeReply(ctx, `<b>${action} failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: `${action} failed: ${friendlyErrorText(error)}`,
+      });
+    }
+  };
+
+  bot.command("pin", async (ctx) => {
+    await setCurrentThreadPinned(ctx, true);
+  });
+
+  bot.command("unpin", async (ctx) => {
+    await setCurrentThreadPinned(ctx, false);
   });
 
   bot.command("compact", async (ctx) => {
@@ -3803,10 +3878,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const groups: SessionWorkspaceGroup[] = [...groupedSessions.entries()]
       .map(([workspace, workspaceSessions]) => ({
         workspace,
-        sessions: [...workspaceSessions].sort(
-          (left, right) =>
-            (right.recencyAt ?? right.updatedAt).getTime() - (left.recencyAt ?? left.updatedAt).getTime(),
-        ),
+        sessions: [...workspaceSessions].sort(compareSessionRecords),
         availability: inspectWorkspace(workspace),
       }))
       .sort(
@@ -4417,7 +4489,24 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
   });
 
-  handlePageCallback(/^sess_page_(\d+)$/, "sess", pendingSessionButtons, "Expired, run /sessions again");
+  bot.callbackQuery(/^sess_page_(\d+)$/, async (ctx) => {
+    const contextKey = contextKeyFromCtx(ctx);
+    const chatId = ctx.chat?.id;
+    const messageId = ctx.callbackQuery.message?.message_id;
+    const page = Number.parseInt(ctx.match?.[1] ?? "", 10);
+    const panel = contextKey ? pendingSessionPanels.get(contextKey) : undefined;
+    if (!contextKey || !chatId || !messageId || Number.isNaN(page) || !panel) {
+      await ctx.answerCallbackQuery({ text: "Expired, run /sessions again" });
+      return;
+    }
+
+    await ctx.answerCallbackQuery();
+    const rendered = renderSessionSelectionPanel(panel, page);
+    await safeEditMessage(bot, chatId, messageId, rendered.html, {
+      fallbackText: rendered.plain,
+      replyMarkup: rendered.keyboard,
+    });
+  });
   handlePageCallback(/^sessws_page_(\d+)$/, "sessws", pendingSessionWorkspaceButtons, "Expired, run /sessions again");
   handlePageCallback(/^ws_page_(\d+)$/, "ws", pendingWorkspaceButtons, "Expired, run /new again");
   handlePageCallback(
@@ -4680,46 +4769,24 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     await ctx.answerCallbackQuery();
     const activeThreadId = session.getInfo().threadId;
-    const orderedSessions = [...group.sessions].sort(
-      (left, right) =>
-        (right.recencyAt ?? right.updatedAt).getTime() - (left.recencyAt ?? left.updatedAt).getTime(),
-    );
+    const orderedSessions = [...group.sessions].sort(compareSessionRecords);
 
     pendingSessionPicks.set(
       contextKey,
       orderedSessions.map((listedSession) => listedSession.id),
     );
-    const sessionButtons = orderedSessions.map((listedSession, sessionIndex) => ({
-      label: formatSessionLabel({
-        title:
-          listedSession.name ||
-          listedSession.preview ||
-          listedSession.title ||
-          listedSession.firstUserMessage ||
-          shortId(listedSession.id),
-        relativeTime: formatRelativeTime(listedSession.recencyAt ?? listedSession.updatedAt),
-        model: listedSession.model || undefined,
-        reasoningEffort: listedSession.reasoningEffort || undefined,
-        gitBranch: listedSession.gitBranch || undefined,
-        isPinned: listedSession.isPinned,
-        isActive: listedSession.id === activeThreadId,
-      }),
-      callbackData: `sess_${sessionIndex}`,
-    }));
-    pendingSessionButtons.set(contextKey, sessionButtons);
-
-    const html = [
-      "<b>Recent threads</b>",
-      `<b>Workspace:</b> <code>${escapeHTML(group.workspace)}</code>`,
-      "",
-      "Tap to switch.",
-    ].join("\n");
-    const plain = ["Recent threads", `Workspace: ${group.workspace}`, "", "Tap to switch."].join("\n");
-    const keyboard = paginateKeyboard(sessionButtons, 0, "sess");
-    keyboard.row().text("← Workspaces", "sessback");
-    await safeEditMessage(bot, chatId, messageId, html, {
-      fallbackText: plain,
-      replyMarkup: keyboard,
+    const panel: SessionSelectionPanel = {
+      workspace: group.workspace,
+      ownershipWorkspace: config.workspace,
+      contextKey,
+      sessions: orderedSessions,
+      ...(activeThreadId ? { activeThreadId } : {}),
+    };
+    pendingSessionPanels.set(contextKey, panel);
+    const rendered = renderSessionSelectionPanel(panel, 0);
+    await safeEditMessage(bot, chatId, messageId, rendered.html, {
+      fallbackText: rendered.plain,
+      replyMarkup: rendered.keyboard,
     });
   });
 
@@ -4739,6 +4806,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
 
     await ctx.answerCallbackQuery();
+    pendingSessionPicks.delete(contextKey);
+    pendingSessionPanels.delete(contextKey);
     await safeEditMessage(bot, chatId, messageId, "<b>Recent workspaces</b>:\nChoose a project first.", {
       fallbackText: "Recent workspaces:\nChoose a project first.",
       replyMarkup: paginateKeyboard(buttons, 0, "sessws"),
@@ -4774,7 +4843,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     await ctx.answerCallbackQuery({ text: "Switching..." });
     pendingSessionPicks.delete(contextKey);
-    pendingSessionButtons.delete(contextKey);
+    pendingSessionPanels.delete(contextKey);
     pendingSessionWorkspacePicks.delete(contextKey);
     pendingSessionWorkspaceButtons.delete(contextKey);
 
@@ -5707,6 +5776,9 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "doctor", description: "Check runtime environment" },
     { command: "locks", description: "Show runtime lock files" },
     { command: "reconnect", description: "Reconnect Codex app-server" },
+    { command: "rename", description: "Rename current Codex thread" },
+    { command: "pin", description: "Pin current Codex thread" },
+    { command: "unpin", description: "Unpin current Codex thread" },
     { command: "compact", description: "Compact controls" },
     { command: "session", description: "Current thread details" },
     { command: "sessions", description: "Browse & switch threads" },
@@ -6079,6 +6151,11 @@ function renderMobileStatus(options: {
   const appServer = summarizeAppServerStatus(options.appServerStatus);
   const approvals = summarizeApprovalBridge(options.approvalBridge, info.approvalPolicy);
   const agents = formatAgentsSummary(details.thread?.instructionSources ?? []);
+  const mcp = details.mcp
+    ? `${details.mcp.total} server${details.mcp.total === 1 ? "" : "s"}${
+        details.mcp.authenticationRequired > 0 ? ` · ${details.mcp.authenticationRequired} auth required` : ""
+      }`
+    : undefined;
   const limits = formatRateLimitsCompact(details.rateLimits);
   const usage = details.accountUsage ? formatAccountUsageCompact(details.accountUsage) : undefined;
 
@@ -6099,6 +6176,7 @@ function renderMobileStatus(options: {
     "Runtime",
     `State: ${options.runtime} · ${options.runtimeBackend}`,
     `App-server: ${appServer}`,
+    mcp ? `MCP: ${mcp}` : undefined,
     `Launch: ${info.launchProfileLabel} · ${info.launchProfileBehavior}`,
     `Compact: ${options.compactState} · Approval: ${approvals}`,
     details.thread?.approvalsReviewer ? `Reviewer: ${details.thread.approvalsReviewer}` : undefined,
@@ -6125,6 +6203,7 @@ function renderMobileStatus(options: {
     "<b>Runtime</b>",
     `<b>State:</b> <code>${escapeHTML(options.runtime)} · ${escapeHTML(options.runtimeBackend)}</code>`,
     `<b>App-server:</b> <code>${escapeHTML(appServer)}</code>`,
+    mcp ? `<b>MCP:</b> <code>${escapeHTML(mcp)}</code>` : undefined,
     `<b>Launch:</b> <code>${escapeHTML(`${info.launchProfileLabel} · ${info.launchProfileBehavior}`)}</code>`,
     `<b>Compact:</b> <code>${escapeHTML(options.compactState)}</code> · <b>Approval:</b> <code>${escapeHTML(approvals)}</code>`,
     details.thread?.approvalsReviewer
@@ -7790,6 +7869,91 @@ function formatWorkspaceEntryHTML(entry: WorkspaceEntry): string {
   const marker = entry.type === "dir" ? "dir " : entry.type === "symlink" ? "link" : "file";
   const suffix = entry.type === "dir" ? "/" : "";
   return `<code>${escapeHTML(marker)}</code> <code>${escapeHTML(`${entry.relativePath}${suffix}`)}</code>`;
+}
+
+function compareSessionRecords(left: CodexThreadRecord, right: CodexThreadRecord): number {
+  const pinnedOrder = Number(Boolean(right.isPinned)) - Number(Boolean(left.isPinned));
+  if (pinnedOrder !== 0) {
+    return pinnedOrder;
+  }
+  const recencyOrder =
+    (right.recencyAt ?? right.updatedAt).getTime() - (left.recencyAt ?? left.updatedAt).getTime();
+  return recencyOrder !== 0
+    ? recencyOrder
+    : (left.name ?? left.title).localeCompare(right.name ?? right.title);
+}
+
+function renderSessionSelectionPanel(
+  panel: SessionSelectionPanel,
+  requestedPage: number,
+): { html: string; plain: string; keyboard: InlineKeyboard } {
+  const totalPages = Math.max(1, Math.ceil(panel.sessions.length / KEYBOARD_PAGE_SIZE));
+  const page = Math.min(Math.max(requestedPage, 0), totalPages - 1);
+  const start = page * KEYBOARD_PAGE_SIZE;
+  const sessions = panel.sessions.slice(start, start + KEYBOARD_PAGE_SIZE);
+  const htmlLines = [
+    `<b>Recent threads</b> · <code>${page + 1}/${totalPages}</code>`,
+    `<b>Workspace:</b> <code>${escapeHTML(panel.workspace)}</code>`,
+  ];
+  const plainLines = [`Recent threads · ${page + 1}/${totalPages}`, `Workspace: ${panel.workspace}`];
+
+  sessions.forEach((session, localIndex) => {
+    const number = start + localIndex + 1;
+    const isLocked = isThreadOwnedElsewhere(panel.ownershipWorkspace, panel.contextKey, session.id);
+    const marker = session.id === panel.activeThreadId ? "✅" : isLocked ? "🔒" : session.isPinned ? "📌" : "📁";
+    const title = trimLine(
+      session.name || session.title || session.preview || session.firstUserMessage || shortId(session.id),
+      72,
+    );
+    const metadata = [
+      session.model || undefined,
+      session.reasoningEffort || undefined,
+      formatRelativeTime(session.recencyAt ?? session.updatedAt),
+    ].filter((value): value is string => Boolean(value));
+    const source = [session.gitBranch || undefined, shortId(session.id)].filter(
+      (value): value is string => Boolean(value),
+    );
+
+    htmlLines.push(
+      "",
+      `<b>${number}. ${marker} ${escapeHTML(title || "(untitled)")}</b>`,
+      `<code>${escapeHTML(metadata.join(" · "))}</code>`,
+      `<code>${escapeHTML(source.join(" · "))}</code>`,
+    );
+    plainLines.push(
+      "",
+      `${number}. ${marker} ${title || "(untitled)"}`,
+      metadata.join(" · "),
+      source.join(" · "),
+    );
+  });
+
+  const keyboard = new InlineKeyboard();
+  sessions.forEach((session, localIndex) => {
+    const index = start + localIndex;
+    const isLocked = isThreadOwnedElsewhere(panel.ownershipWorkspace, panel.contextKey, session.id);
+    const marker = session.id === panel.activeThreadId ? "✅ " : isLocked ? "🔒 " : session.isPinned ? "📌 " : "";
+    keyboard.text(`${marker}${index + 1}`, `sess_${index}`);
+    if ((localIndex + 1) % 3 === 0 && localIndex < sessions.length - 1) {
+      keyboard.row();
+    }
+  });
+  if (sessions.length > 0) {
+    keyboard.row();
+  }
+  if (totalPages > 1) {
+    if (page > 0) {
+      keyboard.text("◀️ Prev", `sess_page_${page - 1}`);
+    }
+    keyboard.text(`${page + 1}/${totalPages}`, NOOP_PAGE_CALLBACK_DATA);
+    if (page < totalPages - 1) {
+      keyboard.text("Next ▶️", `sess_page_${page + 1}`);
+    }
+    keyboard.row();
+  }
+  keyboard.text("← Workspaces", "sessback").text("Cancel", "ui_cancel");
+
+  return { html: htmlLines.join("\n"), plain: plainLines.join("\n"), keyboard };
 }
 
 function formatSessionWorkspaceLabel(group: SessionWorkspaceGroup): string {

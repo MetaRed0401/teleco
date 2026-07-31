@@ -19,7 +19,7 @@ jobs:
       - id: matrix
         shell: bash
         run: |
-          value="$(node -e 'const p=require("./codex-versions.json"); process.stdout.write(JSON.stringify({include:[{label:"minimum",version:p.minimum,experimental:false},{label:"previous",version:p.previous,experimental:false},{label:"recommended",version:p.recommended,experimental:false},{label:"next",version:p.alpha,experimental:true}]}))')"
+          value="$(node -e 'const p=require("./codex-versions.json"); const include=[{label:"minimum",version:p.minimum,experimental:false},{label:"previous",version:p.previous,experimental:false},{label:"candidate",version:p.candidate,experimental:false}]; if (!include.some(item=>item.version===p.recommended)) include.push({label:"recommended",version:p.recommended,experimental:false}); include.push({label:"next",version:p.alpha,experimental:true}); process.stdout.write(JSON.stringify({include}))')"
           echo "value=$value" >> "$GITHUB_OUTPUT"
 
   compatibility:
@@ -44,7 +44,9 @@ jobs:
       - run: pnpm run build
       - name: Focused compatibility tests
         run: |
-          pnpm exec vitest run test/app-server-client.test.ts test/app-server-observability.test.ts test/approval-state.test.ts
-          pnpm exec vitest run test/codex-session.test.ts -t 'canonical app-server|unknown canonical|releases canonical'
+          pnpm exec vitest run test/codex-app-server-client.test.ts test/app-server-observability.test.ts test/approval-state.test.ts
+          pnpm exec vitest run test/codex-session.test.ts -t '0.146|pagination|canonical app-server|canonical completion|unknown canonical|releases canonical'
       - name: Real app-server smoke
+        env:
+          CODEX_EXPECT_0146: ${{ matrix.label == 'candidate' }}
         run: node scripts/codex-app-server-smoke.mjs

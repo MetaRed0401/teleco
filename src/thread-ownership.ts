@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { closeSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 import type { TelegramContextKey } from "./context-key.js";
@@ -64,6 +64,23 @@ export function releaseThreadOwnership(
   } catch {
     // A concurrent handback or cleanup may already have removed the claim.
   }
+}
+
+export function isThreadOwnedElsewhere(
+  workspace: string,
+  contextKey: TelegramContextKey,
+  threadId: string,
+): boolean {
+  const ownerPath = getOwnerPath(workspace, threadId);
+  if (!existsSync(ownerPath)) {
+    return false;
+  }
+
+  const owner = readThreadOwnership(ownerPath);
+  if (!owner) {
+    return true;
+  }
+  return owner.instanceName !== currentInstanceName() || owner.contextKey !== contextKey;
 }
 
 function getOwnerPath(workspace: string, threadId: string): string {

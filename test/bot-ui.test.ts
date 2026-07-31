@@ -30,10 +30,10 @@ describe("bot-ui", () => {
       expect(plain).toContain("/restart");
     });
 
-    it("lists all 37 primary commands", () => {
+    it("lists all 40 primary commands", () => {
       const { plain } = renderHelpMessage();
       const commandMatches = plain.match(/^  \/[a-z_]+/gm) ?? [];
-      expect(commandMatches.length).toBe(37);
+      expect(commandMatches.length).toBe(40);
     });
 
     it("returns valid HTML with bold tags", () => {
