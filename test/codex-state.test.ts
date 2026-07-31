@@ -10,6 +10,8 @@ type ThreadFixture = {
   updated_at: number;
   first_user_message: string;
   archived?: number;
+  source?: string | null;
+  thread_source?: string | null;
 };
 
 type LoadOptions = {
@@ -17,6 +19,7 @@ type LoadOptions = {
   files?: string[];
   stats?: Record<string, number>;
   threads?: ThreadFixture[];
+  threadSourceColumn?: boolean;
   modelsJson?: string;
   betterSqliteAvailable?: boolean;
   openThrows?: boolean;
@@ -26,6 +29,7 @@ const originalHome = process.env.HOME;
 
 afterEach(() => {
   vi.doUnmock("node:fs");
+  vi.doUnmock("node:module");
   vi.doUnmock("better-sqlite3");
   vi.resetModules();
 
@@ -74,13 +78,12 @@ async function loadCodexState(options: LoadOptions = {}) {
     }),
   }));
 
-  if (options.betterSqliteAvailable === false) {
-    vi.doMock("better-sqlite3", () => {
-      throw Object.assign(new Error("Cannot find package 'better-sqlite3'"), { code: "ERR_MODULE_NOT_FOUND" });
-    });
-  } else {
-    vi.doMock("better-sqlite3", () => ({
-      default: class MockDatabase {
+  vi.doMock("node:module", () => ({
+    createRequire: () => (specifier: string) => {
+      if (specifier !== "better-sqlite3" || options.betterSqliteAvailable === false) {
+        throw Object.assign(new Error(`Cannot find package '${specifier}'`), { code: "ERR_MODULE_NOT_FOUND" });
+      }
+      return class MockDatabase {
         constructor(_databasePath: string) {
           if (options.openThrows) {
             throw new Error("open failed");
@@ -89,30 +92,54 @@ async function loadCodexState(options: LoadOptions = {}) {
 
         prepare(sql: string) {
           return {
-            all: (...args: unknown[]) => runAllQuery(sql, threads, args),
-            get: (...args: unknown[]) => runGetQuery(sql, threads, args),
+            all: (...args: unknown[]) => runAllQuery(sql, threads, args, options),
+            get: (...args: unknown[]) => runGetQuery(sql, threads, args, options),
           };
         }
 
         close(): void {}
-      },
-    }));
-  }
+      };
+    },
+  }));
 
   return await import("../src/codex-state.js");
 }
 
-function runAllQuery(sql: string, threads: ThreadFixture[], args: unknown[]) {
+function runAllQuery(
+  sql: string,
+  threads: ThreadFixture[],
+  args: unknown[],
+  options: LoadOptions,
+) {
+  if (sql.includes("PRAGMA table_info(threads)")) {
+    const columns = [
+      "id",
+      "title",
+      "cwd",
+      "model",
+      "created_at",
+      "updated_at",
+      "first_user_message",
+      "archived",
+      "source",
+    ];
+    if (options.threadSourceColumn !== false) {
+      columns.push("thread_source");
+    }
+    return columns.map((name, cid) => ({ cid, name }));
+  }
+
+  const filteredThreads = filterThreads(sql, threads, options);
+
   if (sql.includes("SELECT DISTINCT cwd")) {
-    return [...new Set(threads.filter((thread) => thread.archived !== 1).map((thread) => thread.cwd).filter(Boolean))]
+    return [...new Set(filteredThreads.map((thread) => thread.cwd).filter(Boolean))]
       .sort()
       .map((cwd) => ({ cwd }));
   }
 
   if (sql.includes("FROM threads")) {
     const limit = typeof args[0] === "number" ? args[0] : 20;
-    return threads
-      .filter((thread) => thread.archived !== 1)
+    return filteredThreads
       .sort((left, right) => right.updated_at - left.updated_at)
       .slice(0, limit);
   }
@@ -120,13 +147,44 @@ function runAllQuery(sql: string, threads: ThreadFixture[], args: unknown[]) {
   return [];
 }
 
-function runGetQuery(sql: string, threads: ThreadFixture[], args: unknown[]) {
-  if (sql.includes("WHERE archived = 0 AND id = ?")) {
+function runGetQuery(
+  sql: string,
+  threads: ThreadFixture[],
+  args: unknown[],
+  options: LoadOptions,
+) {
+  if (sql.includes("WHERE archived = 0") && sql.includes("AND id = ?")) {
     const id = String(args[0] ?? "");
-    return threads.find((thread) => thread.archived !== 1 && thread.id === id);
+    return filterThreads(sql, threads, options).find((thread) => thread.id === id);
   }
 
   return undefined;
+}
+
+function filterThreads(sql: string, threads: ThreadFixture[], options: LoadOptions) {
+  return threads.filter((thread) => {
+    if (thread.archived === 1) {
+      return false;
+    }
+
+    if (
+      sql.includes("source IS NULL") &&
+      typeof thread.source === "string" &&
+      thread.source.toLowerCase().includes("subagent")
+    ) {
+      return false;
+    }
+
+    if (
+      options.threadSourceColumn !== false &&
+      sql.includes("thread_source IS NULL") &&
+      thread.thread_source?.trim().toLowerCase() === "subagent"
+    ) {
+      return false;
+    }
+
+    return true;
+  });
 }
 
 describe("codex-state", () => {
@@ -214,6 +272,59 @@ describe("codex-state", () => {
         firstUserMessage: "older",
       },
     ]);
+  });
+
+  it("listThreads excludes cli threads marked as subagent in thread_source", async () => {
+    const state = await loadCodexState({
+      files: ["state_main.sqlite"],
+      threads: [
+        {
+          id: "user-thread",
+          title: "User thread",
+          cwd: "/workspace/project",
+          model: "gpt-5.4",
+          created_at: 1,
+          updated_at: 3,
+          first_user_message: "user",
+          source: "cli",
+          thread_source: "cli",
+        },
+        {
+          id: "subagent-thread",
+          title: "Subagent thread",
+          cwd: "/workspace/project",
+          model: "gpt-5.4",
+          created_at: 1,
+          updated_at: 4,
+          first_user_message: "subagent",
+          source: "cli",
+          thread_source: "subagent",
+        },
+      ],
+    });
+
+    expect(state.listThreads(10).map((thread) => thread.id)).toEqual(["user-thread"]);
+  });
+
+  it("keeps cli user threads when legacy schema has no thread_source column", async () => {
+    const state = await loadCodexState({
+      files: ["state_main.sqlite"],
+      threadSourceColumn: false,
+      threads: [
+        {
+          id: "legacy-user-thread",
+          title: "Legacy user thread",
+          cwd: "/workspace/legacy",
+          model: "gpt-5.4",
+          created_at: 1,
+          updated_at: 2,
+          first_user_message: "legacy user",
+          source: "cli",
+        },
+      ],
+    });
+
+    expect(state.listThreads(10).map((thread) => thread.id)).toEqual(["legacy-user-thread"]);
   });
 
   it("listWorkspaces returns unique sorted active workspaces", async () => {

@@ -23,17 +23,17 @@ describe("bot-ui", () => {
       expect(plain).toContain("/queue");
       expect(plain).toContain("/steer");
       expect(plain).toContain("/stop");
-      expect(plain).toContain("/launch_profiles");
+      expect(plain).toContain("/permission");
       expect(plain).toContain("/files");
       expect(plain).toContain("/grep");
       expect(plain).toContain("/update");
-      expect(plain).toContain("/service_update");
+      expect(plain).toContain("/restart");
     });
 
-    it("lists all 28 commands", () => {
+    it("lists all 37 primary commands", () => {
       const { plain } = renderHelpMessage();
-      const commandMatches = plain.match(/\/\w+/g) ?? [];
-      expect(commandMatches.length).toBe(28);
+      const commandMatches = plain.match(/^  \/[a-z_]+/gm) ?? [];
+      expect(commandMatches.length).toBe(37);
     });
 
     it("returns valid HTML with bold tags", () => {

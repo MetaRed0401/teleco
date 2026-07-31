@@ -17,7 +17,7 @@ export type ClaimTelegramDeliveryInput = {
   messageThreadId?: number;
   operationId: string;
   itemId?: string;
-  kind: "live-final" | "recovered-final" | "recovered-item";
+  kind: "live-final" | "live-item" | "recovered-final" | "recovered-item";
   payload: string;
 };
 

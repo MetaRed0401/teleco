@@ -509,6 +509,7 @@ function resolveCodexCliPath(): { command: string; path: string; checked: string
 function buildCodexCliPath(): string {
   const home = process.env.HOME;
   const candidates = [
+    path.join(process.cwd(), "node_modules", ".bin"),
     process.env.PATH,
     "/opt/homebrew/bin",
     "/opt/homebrew/sbin",

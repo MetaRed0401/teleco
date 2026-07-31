@@ -22,7 +22,11 @@ const ERROR_PATTERNS: Array<{ pattern: RegExp; message: string }> = [
     message: "Authentication failed. Use /login to re-authenticate or check your API key.",
   },
   {
-    pattern: /403|forbidden|permission/i,
+    pattern: /workspace unavailable|EACCES|EPERM|permission denied/i,
+    message: "Workspace unavailable. Check that the project path exists and the service can access it.",
+  },
+  {
+    pattern: /403|forbidden/i,
     message: "Access denied. Check your API key permissions.",
   },
   {

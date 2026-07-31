@@ -1,17 +1,27 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { accessSync, constants, existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 
 export interface CodexThreadRecord {
   id: string;
+  name?: string;
   title: string;
+  preview?: string;
   cwd: string;
   model: string | null;
+  reasoningEffort?: string;
+  gitBranch?: string;
+  isPinned?: boolean;
   createdAt: Date;
   updatedAt: Date;
+  recencyAt?: Date;
   firstUserMessage: string;
 }
+
+export type WorkspaceAvailability =
+  | { available: true; reason: "available" }
+  | { available: false; reason: "invalid" | "missing" | "not-directory" | "access-denied" | "unavailable" };
 
 export interface CodexModelRecord {
   slug: string;
@@ -43,16 +53,26 @@ type DatabaseCtor = new (
 type DatabaseInstance = InstanceType<DatabaseCtor>;
 type ThreadRow = {
   id: unknown;
+  name: unknown;
   title: unknown;
+  preview: unknown;
   cwd: unknown;
   model: unknown;
+  reasoning_effort: unknown;
+  git_branch: unknown;
+  is_pinned: unknown;
   created_at: unknown;
   updated_at: unknown;
+  recency_at: unknown;
   first_user_message: unknown;
 };
 
 type WorkspaceRow = {
   cwd: unknown;
+};
+
+type TableInfoRow = {
+  name: unknown;
 };
 
 const require = createRequire(import.meta.url);
@@ -87,11 +107,15 @@ export function listThreads(limit = 20): CodexThreadRecord[] {
   return (
     withDatabase(
       (db) => {
+        const columns = getThreadColumns(db);
+        const userThreadFilter = buildUserThreadFilter(columns);
+        const threadSelect = buildThreadSelect(columns);
         const query = db.prepare(`
-          SELECT id, title, cwd, model, created_at, updated_at, first_user_message
+          SELECT ${threadSelect}
           FROM threads
           WHERE (archived = 0 OR archived IS NULL)
-          ORDER BY updated_at DESC
+            ${userThreadFilter}
+          ORDER BY recency_at DESC
           LIMIT ?
         `);
 
@@ -99,13 +123,17 @@ export function listThreads(limit = 20): CodexThreadRecord[] {
         return rows.map(mapThreadRow);
       },
       (databasePath) => {
+        const columns = getThreadColumnsWithSqliteCli(databasePath);
+        const userThreadFilter = buildUserThreadFilter(columns);
+        const threadSelect = buildThreadSelect(columns);
         const rows = queryJsonWithSqliteCli<ThreadRow>(
           databasePath,
           `
-            SELECT id, title, cwd, model, created_at, updated_at, first_user_message
+            SELECT ${threadSelect}
             FROM threads
             WHERE (archived = 0 OR archived IS NULL)
-            ORDER BY updated_at DESC
+              ${userThreadFilter}
+            ORDER BY recency_at DESC
             LIMIT ${safeLimit}
           `,
         );
@@ -119,10 +147,15 @@ export function getThread(id: string): CodexThreadRecord | null {
   return (
     withDatabase(
       (db) => {
+        const columns = getThreadColumns(db);
+        const userThreadFilter = buildUserThreadFilter(columns);
+        const threadSelect = buildThreadSelect(columns);
         const query = db.prepare(`
-          SELECT id, title, cwd, model, created_at, updated_at, first_user_message
+          SELECT ${threadSelect}
           FROM threads
-          WHERE archived = 0 AND id = ?
+          WHERE archived = 0
+            ${userThreadFilter}
+            AND id = ?
           LIMIT 1
         `);
 
@@ -130,12 +163,17 @@ export function getThread(id: string): CodexThreadRecord | null {
         return row ? mapThreadRow(row) : null;
       },
       (databasePath) => {
+        const columns = getThreadColumnsWithSqliteCli(databasePath);
+        const userThreadFilter = buildUserThreadFilter(columns);
+        const threadSelect = buildThreadSelect(columns);
         const rows = queryJsonWithSqliteCli<ThreadRow>(
           databasePath,
           `
-            SELECT id, title, cwd, model, created_at, updated_at, first_user_message
+            SELECT ${threadSelect}
             FROM threads
-            WHERE archived = 0 AND id = ${sqlStringLiteral(id)}
+            WHERE archived = 0
+              ${userThreadFilter}
+              AND id = ${sqlStringLiteral(id)}
             LIMIT 1
           `,
         );
@@ -146,14 +184,40 @@ export function getThread(id: string): CodexThreadRecord | null {
   );
 }
 
+export function inspectWorkspace(workspace: string): WorkspaceAvailability {
+  const candidate = workspace.trim();
+  if (!candidate || !path.isAbsolute(candidate)) {
+    return { available: false, reason: "invalid" };
+  }
+  if (!existsSync(candidate)) {
+    return { available: false, reason: "missing" };
+  }
+
+  try {
+    if (!statSync(candidate).isDirectory()) {
+      return { available: false, reason: "not-directory" };
+    }
+    accessSync(candidate, constants.R_OK | constants.X_OK);
+    return { available: true, reason: "available" };
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return {
+      available: false,
+      reason: code === "EACCES" || code === "EPERM" ? "access-denied" : "unavailable",
+    };
+  }
+}
+
 export function listWorkspaces(): string[] {
   return (
     withDatabase(
       (db) => {
+        const userThreadFilter = buildUserThreadFilter(getThreadColumns(db));
         const query = db.prepare(`
           SELECT DISTINCT cwd
           FROM threads
           WHERE (archived = 0 OR archived IS NULL) AND cwd IS NOT NULL AND cwd != ''
+            ${userThreadFilter}
           ORDER BY cwd ASC
         `);
 
@@ -163,12 +227,14 @@ export function listWorkspaces(): string[] {
           .filter(Boolean);
       },
       (databasePath) => {
+        const userThreadFilter = buildUserThreadFilter(getThreadColumnsWithSqliteCli(databasePath));
         const rows = queryJsonWithSqliteCli<WorkspaceRow>(
           databasePath,
           `
             SELECT DISTINCT cwd
             FROM threads
             WHERE (archived = 0 OR archived IS NULL) AND cwd IS NOT NULL AND cwd != ''
+              ${userThreadFilter}
             ORDER BY cwd ASC
           `,
         );
@@ -220,19 +286,35 @@ export function listModels(): CodexModelRecord[] {
 }
 
 function mapThreadRow(row: ThreadRow): CodexThreadRecord {
+  const name = typeof row.name === "string" ? row.name.trim() : "";
+  const preview = typeof row.preview === "string" ? row.preview.trim() : "";
+  const reasoningEffort = typeof row.reasoning_effort === "string" ? row.reasoning_effort.trim() : "";
+  const gitBranch = typeof row.git_branch === "string" ? row.git_branch.trim() : "";
+  const recencyAt = fromOptionalUnixSeconds(row.recency_at);
+
   return {
     id: typeof row.id === "string" ? row.id : String(row.id ?? ""),
+    ...(name ? { name } : {}),
     title: typeof row.title === "string" ? row.title : "",
+    ...(preview ? { preview } : {}),
     cwd: typeof row.cwd === "string" ? row.cwd : "",
     model: typeof row.model === "string" ? row.model : null,
+    ...(reasoningEffort ? { reasoningEffort } : {}),
+    ...(gitBranch ? { gitBranch } : {}),
+    ...(row.is_pinned === 1 || row.is_pinned === true ? { isPinned: true } : {}),
     createdAt: fromUnixSeconds(row.created_at),
     updatedAt: fromUnixSeconds(row.updated_at),
+    ...(recencyAt ? { recencyAt } : {}),
     firstUserMessage: typeof row.first_user_message === "string" ? row.first_user_message : "",
   };
 }
 
 function fromUnixSeconds(value: unknown): Date {
   return typeof value === "number" ? new Date(value * 1000) : new Date(0);
+}
+
+function fromOptionalUnixSeconds(value: unknown): Date | undefined {
+  return typeof value === "number" ? new Date(value * 1000) : undefined;
 }
 
 function withDatabase<T>(fn: (db: DatabaseInstance) => T, fallback?: (databasePath: string) => T): T | null {
@@ -297,6 +379,50 @@ function normalizeLimit(limit: number): number {
   }
 
   return Math.max(1, Math.min(200, Math.floor(limit)));
+}
+
+function getThreadColumns(db: DatabaseInstance): Set<string> {
+  const rows = db.prepare("PRAGMA table_info(threads)").all() as TableInfoRow[];
+  return new Set(rows.map((row) => (typeof row.name === "string" ? row.name : "")).filter(Boolean));
+}
+
+function getThreadColumnsWithSqliteCli(databasePath: string): Set<string> {
+  const rows = queryJsonWithSqliteCli<TableInfoRow>(databasePath, "PRAGMA table_info(threads)");
+  return new Set(rows.map((row) => (typeof row.name === "string" ? row.name : "")).filter(Boolean));
+}
+
+function buildThreadSelect(columns: Set<string>): string {
+  const optionalColumn = (name: string, fallback: string) =>
+    columns.has(name) ? name : `${fallback} AS ${name}`;
+
+  return [
+    "id",
+    optionalColumn("name", "NULL"),
+    "title",
+    optionalColumn("preview", "''"),
+    "cwd",
+    "model",
+    optionalColumn("reasoning_effort", "NULL"),
+    optionalColumn("git_branch", "NULL"),
+    optionalColumn("is_pinned", "0"),
+    "created_at",
+    "updated_at",
+    optionalColumn("recency_at", "updated_at"),
+    "first_user_message",
+  ].join(", ");
+}
+
+function buildUserThreadFilter(columns: Set<string>): string {
+  const conditions: string[] = [];
+  if (columns.size === 0 || columns.has("source")) {
+    conditions.push("(source IS NULL OR LOWER(CAST(source AS TEXT)) NOT LIKE '%subagent%')");
+  }
+  if (columns.has("thread_source")) {
+    conditions.push(
+      "(thread_source IS NULL OR TRIM(LOWER(CAST(thread_source AS TEXT))) != 'subagent')",
+    );
+  }
+  return conditions.map((condition) => `AND ${condition}`).join("\n            ");
 }
 
 function queryJsonWithSqliteCli<T>(databasePath: string, sql: string): T[] {

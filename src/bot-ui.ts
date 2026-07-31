@@ -187,30 +187,40 @@ export function renderWelcomeReturning(
 
 /**
  * Format a session button label for /sessions list.
- * Wider workspace name (12 chars), model tag, short thread snippet.
+ * Keep the selected workspace out of the thread label and preserve room for runtime metadata.
  */
 export function formatSessionLabel(
   options: {
-    workspace: string;
+    workspace?: string;
     title: string;
     relativeTime: string;
     model?: string;
+    reasoningEffort?: string;
+    gitBranch?: string;
+    isPinned?: boolean;
     isActive: boolean;
   },
 ): string {
-  const prefix = options.isActive ? "✅" : "📁";
-  const workspaceName = trimLabel(getWorkspaceShortName(options.workspace), 12) || "(unknown)";
+  const prefix = options.isActive ? "✅" : options.isPinned ? "📌" : "📁";
+  const workspaceName = options.workspace
+    ? trimLabel(options.workspace.split(/[\\/]/).filter(Boolean).pop() ?? options.workspace, 12)
+    : "";
   const title = trimLabel(options.title || "(untitled)", 20) || "(untitled)";
   const time = options.relativeTime;
 
-  let label = `${prefix} ${workspaceName} · ${title} · ${time}`;
+  let label = `${prefix} ${workspaceName ? `${workspaceName} · ` : ""}${title} · ${time}`;
 
-  if (options.model) {
-    const shortModel = trimLabel(options.model, 10);
-    label += ` · ${shortModel}`;
+  if (options.gitBranch) {
+    label += ` · ${trimLabel(options.gitBranch, 10)}`;
   }
 
-  return label;
+  const model = options.model ? trimLabel(options.model, 10) : "";
+  const reasoning = options.reasoningEffort ? trimLabel(options.reasoningEffort, 6) : "";
+  if (model || reasoning) {
+    label += ` · ${[model, reasoning].filter(Boolean).join("/")}`;
+  }
+
+  return trimLabel(label, 64);
 }
 
 function trimLabel(text: string, maxLength: number): string {
@@ -219,8 +229,4 @@ function trimLabel(text: string, maxLength: number): string {
     return singleLine;
   }
   return `${singleLine.slice(0, maxLength - 1)}…`;
-}
-
-function getWorkspaceShortName(workspace: string): string {
-  return workspace.split(/[\\/]/).filter(Boolean).pop() ?? workspace;
 }

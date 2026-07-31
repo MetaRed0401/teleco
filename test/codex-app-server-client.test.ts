@@ -21,6 +21,7 @@ describe("CodexAppServerClient", () => {
   });
 
   it("rejects initialize when the Codex app-server process cannot spawn", async () => {
+    vi.spyOn(process, "platform", "get").mockReturnValue("darwin");
     mockSpawn.mockImplementation(() => {
       const child = new EventEmitter() as EventEmitter & {
         stdin: PassThrough;

@@ -12,6 +12,7 @@ import {
 import type { TeleCodexConfig } from "./config.js";
 import {
   getThread,
+  inspectWorkspace,
   listModels,
   listThreads,
   listWorkspaces,
@@ -35,7 +36,18 @@ export interface CodexApprovalRequest {
   params?: unknown;
 }
 
-export type CodexApprovalResponse = { decision: "accept" | "acceptForSession" | "decline" | "cancel" };
+export type CodexApprovalDecision = "accept" | "acceptForSession" | "decline" | "cancel";
+
+export type CodexApprovalResponse =
+  | { decision: CodexApprovalDecision }
+  | {
+      permissions: {
+        fileSystem?: unknown | null;
+        network?: unknown | null;
+      };
+      scope?: "turn" | "session";
+      strictAutoReview?: boolean | null;
+    };
 
 export interface CodexMcpElicitationRequest {
   method: "mcpServer/elicitation/request";
@@ -84,6 +96,10 @@ export interface CodexSessionInfo {
   nextLaunchProfileLabel?: string;
   nextLaunchProfileBehavior?: string;
   nextUnsafeLaunch?: boolean;
+  selectedPermissionProfileId?: string;
+  permissionProfileId?: string;
+  nextPermissionProfileId?: string;
+  permissionProfilePending?: boolean;
   sessionTokens?: {
     input: number;
     cached: number;
@@ -110,6 +126,7 @@ export interface CodexCompactResult {
   threadId: string;
   turnId?: string;
   elapsedMs: number;
+  eventObserved: boolean;
 }
 
 export interface CodexRuntimeStatus {
@@ -202,11 +219,18 @@ export interface CreateOptions {
   reasoningEffort?: string;
   fastMode?: boolean;
   launchProfileId?: string;
+  permissionProfileId?: string;
   deferThreadStart?: boolean;
   resumeThreadId?: string;
 }
 
 export type CodexPromptInput = string | { text?: string; imagePaths?: string[]; stagedFileInstructions?: string };
+
+export interface CodexPermissionProfile {
+  id: string;
+  allowed: boolean;
+  description?: string;
+}
 
 type AppServerToolLifecycle = {
   completed: boolean;
@@ -226,6 +250,8 @@ export class CodexSessionService {
   private fastOnce = false;
   private currentLaunchProfile: CodexLaunchProfile;
   private activeThreadLaunchProfile: CodexLaunchProfile | null = null;
+  private currentPermissionProfileId: string | undefined;
+  private activeThreadPermissionProfileId: string | undefined;
   private sessionTokens = { input: 0, cached: 0, output: 0 };
   private lastTurnTokens: { input: number; cached: number; output: number } | undefined;
   private contextTokensUsed: number | undefined;
@@ -259,6 +285,9 @@ export class CodexSessionService {
       config,
       options?.launchProfileId ?? config.defaultLaunchProfileId,
     );
+    service.currentPermissionProfileId = config.enableCodexAppServerRuntime
+      ? options?.permissionProfileId
+      : undefined;
     service.resetCodexClient();
 
     if (options?.resumeThreadId) {
@@ -305,6 +334,23 @@ export class CodexSessionService {
       info.nextUnsafeLaunch = this.currentLaunchProfile.unsafe;
     }
 
+    if (this.currentPermissionProfileId) {
+      info.selectedPermissionProfileId = this.currentPermissionProfileId;
+    }
+    if (this.activeThreadLaunchProfile) {
+      if (this.activeThreadPermissionProfileId) {
+        info.permissionProfileId = this.activeThreadPermissionProfileId;
+      }
+      if (this.activeThreadPermissionProfileId !== this.currentPermissionProfileId) {
+        info.permissionProfilePending = true;
+        if (this.currentPermissionProfileId) {
+          info.nextPermissionProfileId = this.currentPermissionProfileId;
+        }
+      }
+    } else if (this.currentPermissionProfileId) {
+      info.permissionProfileId = this.currentPermissionProfileId;
+    }
+
     if (this.sessionTokens.input > 0 || this.sessionTokens.cached > 0 || this.sessionTokens.output > 0) {
       info.sessionTokens = { ...this.sessionTokens };
     }
@@ -329,7 +375,7 @@ export class CodexSessionService {
   }
 
   hasActiveThread(): boolean {
-    return this.thread !== null || (this.config.enableCodexAppServerRuntime && this.currentThreadId !== null);
+    return Boolean(this.thread !== null || (this.config.enableCodexAppServerRuntime && this.currentThreadId !== null));
   }
 
   getRuntimeStatus(): CodexRuntimeStatus {
@@ -707,6 +753,7 @@ export class CodexSessionService {
     const record = getThread(threadId);
     const workspace = record?.cwd ?? this.currentWorkspace;
     const model = record?.model || this.currentModel;
+    assertWorkspaceAvailable(workspace);
 
     if (this.config.enableCodexAppServerRuntime) {
       this.resetAppServerClient();
@@ -764,8 +811,12 @@ export class CodexSessionService {
     const record = getThread(threadId);
     const workspace = record?.cwd ?? this.currentWorkspace;
     const model = record?.model || undefined;
+    assertWorkspaceAvailable(workspace);
 
     if (this.config.enableCodexAppServerRuntime) {
+      if (workspace !== this.currentWorkspace) {
+        this.resetAppServerClient();
+      }
       await this.ensureAppServerInitialized();
       const response = await this.requestAppServerThreadResume({
         threadId,
@@ -822,15 +873,13 @@ export class CodexSessionService {
     this.abortController = controller;
 
     let turnId: string | undefined;
-    let finish: (result: { turnId?: string }) => void = () => undefined;
+    let finish: (result: { turnId?: string; eventObserved: true }) => void = () => undefined;
     let fail: (error: Error) => void = () => undefined;
-    const completed = new Promise<{ turnId?: string }>((resolve, reject) => {
+    const completed = new Promise<{ turnId?: string; eventObserved: true }>((resolve, reject) => {
       finish = resolve;
       fail = reject;
     });
-    const timeout = setTimeout(() => {
-      fail(new Error("Timed out waiting for native context compaction completion."));
-    }, 20 * 60 * 1000);
+    let completionTimeout: NodeJS.Timeout | undefined;
 
     const abort = (): void => {
       controller.abort();
@@ -864,6 +913,7 @@ export class CodexSessionService {
         if (readString(item?.type) === "contextCompaction") {
           finish({
             turnId: turnId ?? readString(params?.turnId),
+            eventObserved: true,
           });
         }
         return;
@@ -872,6 +922,7 @@ export class CodexSessionService {
       if (notification.method === "thread/compacted") {
         finish({
           turnId: readString(params?.turnId) ?? turnId,
+          eventObserved: true,
         });
         return;
       }
@@ -890,13 +941,21 @@ export class CodexSessionService {
 
     try {
       await client.request("thread/compact/start", { threadId });
-      const result = await completed;
-      this.lastTurnTokens = undefined;
-      this.contextTokensUsed = undefined;
+      const result = await Promise.race([
+        completed,
+        new Promise<{ turnId?: string; eventObserved: false }>((resolve) => {
+          completionTimeout = setTimeout(() => resolve({ turnId, eventObserved: false }), 60_000);
+        }),
+      ]);
+      if (result.eventObserved) {
+        this.lastTurnTokens = undefined;
+        this.contextTokensUsed = undefined;
+      }
       return {
         threadId,
         turnId: result.turnId,
         elapsedMs: Date.now() - startedAt,
+        eventObserved: result.eventObserved,
       };
     } catch (error) {
       if (options.signal?.aborted || controller.signal.aborted) {
@@ -904,7 +963,7 @@ export class CodexSessionService {
       }
       throw error;
     } finally {
-      clearTimeout(timeout);
+      if (completionTimeout) clearTimeout(completionTimeout);
       unsubscribe();
       options.signal?.removeEventListener("abort", abort);
       controller.signal.removeEventListener("abort", interrupt);
@@ -938,6 +997,40 @@ export class CodexSessionService {
       await this.ensureAppServerInitialized();
       const response = await this.getAppServerClient().request("model/list", { includeHidden: false }, 5000);
       return parseReasoningEfforts(response, this.currentModel ?? this.config.codexModel);
+    } catch {
+      return [];
+    }
+  }
+
+  async listPermissionProfiles(): Promise<CodexPermissionProfile[]> {
+    if (!this.config.enableCodexAppServerRuntime) {
+      return [];
+    }
+
+    try {
+      await this.ensureAppServerInitialized();
+      const response = await this.getAppServerClient().request(
+        "permissionProfile/list",
+        { cwd: this.currentWorkspace, limit: 100 },
+        5000,
+      );
+      const data = readRecord(response)?.data;
+      if (!Array.isArray(data)) {
+        return [];
+      }
+      return data.flatMap((value) => {
+        const profile = readRecord(value);
+        const id = readString(profile?.id);
+        if (!id) {
+          return [];
+        }
+        const description = readString(profile?.description);
+        return [{
+          id,
+          allowed: profile?.allowed === true,
+          ...(description ? { description } : {}),
+        }];
+      });
     } catch {
       return [];
     }
@@ -981,6 +1074,7 @@ export class CodexSessionService {
 
   setLaunchProfile(profileId: string): CodexLaunchProfile {
     this.currentLaunchProfile = getLaunchProfile(this.config, profileId);
+    this.currentPermissionProfileId = undefined;
     this.resetCodexClient();
     return this.currentLaunchProfile;
   }
@@ -988,6 +1082,7 @@ export class CodexSessionService {
   async setLaunchProfileAndReattach(profileId: string): Promise<CodexSessionInfo> {
     this.ensureIdle("change launch profile");
     this.currentLaunchProfile = getLaunchProfile(this.config, profileId);
+    this.currentPermissionProfileId = undefined;
 
     const threadId = this.currentThreadId ?? this.thread?.id ?? null;
     if (!threadId) {
@@ -1002,6 +1097,23 @@ export class CodexSessionService {
     return this.currentLaunchProfile;
   }
 
+  setPermissionProfile(profileId: string | undefined): CodexSessionInfo {
+    this.currentPermissionProfileId = profileId;
+    return this.getInfo();
+  }
+
+  async setPermissionProfileAndReattach(profileId: string | undefined): Promise<CodexSessionInfo> {
+    this.ensureIdle("change permission profile");
+    this.currentPermissionProfileId = profileId;
+
+    const threadId = this.currentThreadId ?? this.thread?.id ?? null;
+    if (!threadId) {
+      return this.getInfo();
+    }
+
+    return this.resumeThread(threadId);
+  }
+
   handback(): { threadId: string | null; workspace: string } {
     const info = { threadId: this.currentThreadId, workspace: this.currentWorkspace };
     this.abortController?.abort();
@@ -1009,6 +1121,7 @@ export class CodexSessionService {
     this.thread = null;
     this.currentThreadId = null;
     this.activeThreadLaunchProfile = null;
+    this.activeThreadPermissionProfileId = undefined;
     return info;
   }
 
@@ -1018,6 +1131,7 @@ export class CodexSessionService {
     this.thread = null;
     this.currentThreadId = null;
     this.activeThreadLaunchProfile = null;
+    this.activeThreadPermissionProfileId = undefined;
     this.resetAppServerClient();
   }
 
@@ -1343,54 +1457,92 @@ export class CodexSessionService {
   }
 
   private async requestAppServerThreadStart(params: Record<string, unknown>): Promise<unknown> {
+    const requestParams = this.applyAppServerPermissionProfile(params, "thread");
     try {
-      return await this.getAppServerClient().request("thread/start", params);
+      const response = await this.getAppServerClient().request("thread/start", requestParams);
+      this.activeThreadPermissionProfileId = this.currentPermissionProfileId;
+      return response;
     } catch (error) {
-      if (!isRuntimeWorkspaceRootsError(error) || !("runtimeWorkspaceRoots" in params)) {
+      if (!isRuntimeWorkspaceRootsError(error) || !("runtimeWorkspaceRoots" in requestParams)) {
         throw error;
       }
-      const retryParams = { ...params };
+      const retryParams = { ...requestParams };
       delete retryParams.runtimeWorkspaceRoots;
-      return this.getAppServerClient().request("thread/start", retryParams);
+      const response = await this.getAppServerClient().request("thread/start", retryParams);
+      this.activeThreadPermissionProfileId = this.currentPermissionProfileId;
+      return response;
     }
   }
 
   private async requestAppServerThreadResume(params: Record<string, unknown>): Promise<unknown> {
+    const requestParams = this.applyAppServerPermissionProfile(params, "thread");
     try {
-      return await this.getAppServerClient().request("thread/resume", params);
+      const response = await this.getAppServerClient().request("thread/resume", requestParams);
+      this.activeThreadPermissionProfileId = this.currentPermissionProfileId;
+      return response;
     } catch (error) {
-      if (!isRuntimeWorkspaceRootsError(error) || !("runtimeWorkspaceRoots" in params)) {
+      if (!isRuntimeWorkspaceRootsError(error) || !("runtimeWorkspaceRoots" in requestParams)) {
         throw error;
       }
-      const retryParams = { ...params };
+      const retryParams = { ...requestParams };
       delete retryParams.runtimeWorkspaceRoots;
-      return this.getAppServerClient().request("thread/resume", retryParams);
+      const response = await this.getAppServerClient().request("thread/resume", retryParams);
+      this.activeThreadPermissionProfileId = this.currentPermissionProfileId;
+      return response;
     }
   }
 
   private async requestAppServerTurnStart(client: CodexAppServerClient, params: Record<string, unknown>): Promise<unknown> {
+    const requestParams = this.applyAppServerPermissionProfile(params, "turn");
     try {
-      return await client.request("turn/start", params);
+      const response = await client.request("turn/start", requestParams);
+      this.activeThreadPermissionProfileId = this.currentPermissionProfileId;
+      return response;
     } catch (error) {
-      if (!isRuntimeWorkspaceRootsError(error) || !("runtimeWorkspaceRoots" in params)) {
+      if (!isRuntimeWorkspaceRootsError(error) || !("runtimeWorkspaceRoots" in requestParams)) {
         throw error;
       }
-      const retryParams = { ...params };
+      const retryParams = { ...requestParams };
       delete retryParams.runtimeWorkspaceRoots;
-      return client.request("turn/start", retryParams);
+      const response = await client.request("turn/start", retryParams);
+      this.activeThreadPermissionProfileId = this.currentPermissionProfileId;
+      return response;
     }
+  }
+
+  private applyAppServerPermissionProfile(
+    params: Record<string, unknown>,
+    target: "thread" | "turn",
+  ): Record<string, unknown> {
+    const next = { ...params };
+    if (!this.currentPermissionProfileId) {
+      delete next.permissions;
+      return next;
+    }
+
+    next.permissions = this.currentPermissionProfileId;
+    if (target === "turn") {
+      delete next.sandboxPolicy;
+    } else {
+      delete next.sandbox;
+    }
+    return next;
   }
 
   private async handleAppServerRequest(
     request: AppServerRequest,
     callbacks?: CodexSessionCallbacks,
   ): Promise<unknown> {
+    const defaultApprovalResponse = (): CodexApprovalResponse =>
+      request.method === "item/permissions/requestApproval"
+        ? { permissions: {}, scope: "turn" }
+        : { decision: "decline" };
     const requestThreadId = readString(readRecord(request.params)?.threadId);
     if (requestThreadId && this.currentThreadId && requestThreadId !== this.currentThreadId) {
       if (request.method === "mcpServer/elicitation/request") {
         return { action: "cancel", content: null, _meta: null };
       }
-      return { decision: "decline" };
+      return defaultApprovalResponse();
     }
 
     if (
@@ -1403,7 +1555,7 @@ export class CodexSessionService {
         method: request.method,
         params: request.params,
       });
-      return response ?? { decision: "decline" };
+      return response ?? defaultApprovalResponse();
     }
 
     if (request.method === "mcpServer/elicitation/request") {
@@ -2414,6 +2566,13 @@ function parseReasoningEfforts(value: unknown, currentModel?: string): string[] 
 function isRuntimeWorkspaceRootsError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /runtimeWorkspaceRoots|experimentalApi|experimental api|unknown field|invalid params/i.test(message);
+}
+
+function assertWorkspaceAvailable(workspace: string): void {
+  const availability = inspectWorkspace(workspace);
+  if (!availability.available) {
+    throw new Error(`Workspace unavailable (${availability.reason}): ${workspace}`);
+  }
 }
 
 function summarizeAppServerProblem(notification: AppServerNotification): string {

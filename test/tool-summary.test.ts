@@ -50,6 +50,6 @@ describe("tool summary formatting", () => {
         cachedInputTokens: 3,
         outputTokens: 9,
       }),
-    ).toBe("🪙 in: 12 · cached: 3 · out: 9");
+    ).toBe("🪙 Turn: 12 in · 9 out · 3 cached");
   });
 });

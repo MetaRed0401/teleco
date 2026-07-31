@@ -46,6 +46,7 @@ import {
 } from "./bot-ui.js";
 import {
   type CodexPromptInput,
+  type CodexApprovalDecision,
   type CodexApprovalRequest,
   type CodexApprovalResponse,
   type CodexMcpElicitationRequest,
@@ -65,7 +66,12 @@ import {
   formatLaunchProfileLabel,
   type CodexLaunchProfile,
 } from "./codex-launch.js";
-import { getThread, type CodexThreadRecord } from "./codex-state.js";
+import {
+  getThread,
+  inspectWorkspace,
+  type CodexThreadRecord,
+  type WorkspaceAvailability,
+} from "./codex-state.js";
 import type { FinalResponseMode, ResponsePreviewMode, TeleCodexConfig, ToolActivityMode, ToolVerbosity } from "./config.js";
 import { contextKeyFromCtx, isTopicContextKey, parseContextKey, type TelegramContextKey } from "./context-key.js";
 import { friendlyErrorText } from "./error-messages.js";
@@ -131,6 +137,7 @@ type TelegramParseMode = "HTML" | "MarkdownV2";
 type TelegramReaction = NonNullable<Parameters<Context["api"]["setMessageReaction"]>[2]>[number];
 type TelegramReactionEmoji = Extract<TelegramReaction, { type: "emoji" }>["emoji"];
 type KeyboardItem = { label: string; callbackData: string };
+type PermissionProfilePick = { id: string | null; label: string; description?: string };
 type PendingApproval = {
   resolve: (response: CodexApprovalResponse) => void;
   timeout: NodeJS.Timeout;
@@ -142,6 +149,32 @@ type PendingApproval = {
   rendered: { html: string; plain: string };
   createdAt: number;
 };
+
+function buildApprovalResponse(
+  request: CodexApprovalRequest,
+  decision: CodexApprovalDecision,
+): CodexApprovalResponse {
+  if (request.method !== "item/permissions/requestApproval") {
+    return { decision };
+  }
+
+  const permissions: { fileSystem?: unknown | null; network?: unknown | null } = {};
+  if (decision === "accept" || decision === "acceptForSession") {
+    const params = readUnknownRecord(request.params);
+    const requestedPermissions = readUnknownRecord(params?.permissions);
+    if (requestedPermissions && "fileSystem" in requestedPermissions) {
+      permissions.fileSystem = requestedPermissions.fileSystem;
+    }
+    if (requestedPermissions && "network" in requestedPermissions) {
+      permissions.network = requestedPermissions.network;
+    }
+  }
+
+  return {
+    permissions,
+    scope: decision === "acceptForSession" ? "session" : "turn",
+  };
+}
 type PendingMcpElicitation = {
   resolve: (response: CodexMcpElicitationResponse) => void;
   timeout: NodeJS.Timeout;
@@ -171,6 +204,7 @@ type QueuedPrompt = {
 type SessionWorkspaceGroup = {
   workspace: string;
   sessions: CodexThreadRecord[];
+  availability: WorkspaceAvailability;
 };
 
 type ToolState = {
@@ -265,6 +299,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   const pendingWorkspaceButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingLaunchPicks = new Map<TelegramContextKey, string[]>();
   const pendingLaunchButtons = new Map<TelegramContextKey, KeyboardItem[]>();
+  const pendingPermissionPicks = new Map<TelegramContextKey, PermissionProfilePick[]>();
+  const pendingPermissionButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingUnsafeLaunchConfirmations = new Map<TelegramContextKey, string>();
   const pendingModelButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingEffortButtons = new Map<TelegramContextKey, KeyboardItem[]>();
@@ -287,6 +323,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     contextBusy.delete(key);
     pendingLaunchPicks.delete(key);
     pendingLaunchButtons.delete(key);
+    pendingPermissionPicks.delete(key);
+    pendingPermissionButtons.delete(key);
     pendingUnsafeLaunchConfirmations.delete(key);
     pendingFastButtons.delete(key);
     pendingFormattingButtons.delete(key);
@@ -344,6 +382,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     pendingLaunchPicks.delete(contextKey);
     pendingLaunchButtons.delete(contextKey);
     pendingUnsafeLaunchConfirmations.delete(contextKey);
+  };
+
+  const clearPermissionSelectionState = (contextKey: TelegramContextKey): void => {
+    pendingPermissionPicks.delete(contextKey);
+    pendingPermissionButtons.delete(contextKey);
   };
 
   const handlePageCallback = (
@@ -691,16 +734,19 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       const nativeResult = await session.compactCurrentThread({ signal: compactAbortController.signal });
       registry.updateMetadata(contextKey, session);
       if (sendStepUpdates) {
+        const nativeStatus = nativeResult.eventObserved
+          ? "Native compact completed."
+          : "Native compact request returned without a completion event.";
         await safeReply(
           ctx,
           [
-            "<b>Native compact completed.</b>",
+            `<b>${nativeStatus}</b>`,
             "<b>Step:</b> <code>2/2 Codex CLI PTY compact</code>",
             `<b>Elapsed:</b> <code>${escapeHTML(formatDuration(nativeResult.elapsedMs))}</code>`,
           ].join("\n"),
           {
             fallbackText: [
-              "Native compact completed.",
+              nativeStatus,
               "Step: 2/2 Codex CLI PTY compact",
               `Elapsed: ${formatDuration(nativeResult.elapsedMs)}`,
             ].join("\n"),
@@ -718,6 +764,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         [
           `<b>${options.automatic ? "Auto compact completed." : "Compact completed."}</b>`,
           `<b>Thread:</b> <code>${escapeHTML(cliResult.threadId)}</code>`,
+          `<b>Native event:</b> <code>${nativeResult.eventObserved ? "observed" : "not observed"}</code>`,
           `<b>Native elapsed:</b> <code>${escapeHTML(formatDuration(nativeResult.elapsedMs))}</code>`,
           `<b>CLI elapsed:</b> <code>${escapeHTML(formatDuration(cliResult.elapsedMs))}</code>`,
         ].join("\n"),
@@ -725,6 +772,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
           fallbackText: [
             options.automatic ? "Auto compact completed." : "Compact completed.",
             `Thread: ${cliResult.threadId}`,
+            `Native event: ${nativeResult.eventObserved ? "observed" : "not observed"}`,
             `Native elapsed: ${formatDuration(nativeResult.elapsedMs)}`,
             `CLI elapsed: ${formatDuration(cliResult.elapsedMs)}`,
           ].join("\n"),
@@ -812,7 +860,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       const timeout = setTimeout(() => {
         pendingApprovals.delete(approvalId);
         finishPersistedApproval(config, approvalId, "expired", "decline");
-        resolve({ decision: "decline" });
+        resolve(buildApprovalResponse(request, "decline"));
       }, APPROVAL_REQUEST_TTL_MS);
       pendingApprovals.set(approvalId, {
         resolve,
@@ -1690,6 +1738,24 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       if (!segmentText) {
         return;
       }
+      const segmentItemId = currentAgentMessageId;
+      const segmentDeliveryKey =
+        activeOperationId && segmentItemId
+          ? `operation:${activeOperationId}:item:${segmentItemId}`
+          : undefined;
+      const segmentDeliveryClaim =
+        segmentDeliveryKey && activeOperationId && segmentItemId
+          ? claimTelegramDelivery(config, {
+              deliveryKey: segmentDeliveryKey,
+              contextKey,
+              chatId,
+              messageThreadId,
+              operationId: activeOperationId,
+              itemId: segmentItemId,
+              kind: "live-item",
+              payload: segmentText,
+            })
+          : "send";
 
       accumulatedText = "";
       clearFlushTimer();
@@ -1702,10 +1768,22 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         }
       }
 
-      await deliverRichRenderedChunks(
-        splitRichMarkdownForTelegram(segmentText, registry.getResponseFormat(contextKey)),
-      );
-      acknowledgeActiveOperationItem(config, activeOperationId, currentAgentMessageId);
+      if (segmentDeliveryClaim === "send") {
+        try {
+          await deliverRichRenderedChunks(
+            splitRichMarkdownForTelegram(segmentText, registry.getResponseFormat(contextKey)),
+          );
+          if (segmentDeliveryKey) {
+            completeTelegramDelivery(config, segmentDeliveryKey, responseMessageId);
+          }
+        } catch (error) {
+          if (segmentDeliveryKey) {
+            failTelegramDelivery(config, segmentDeliveryKey, error);
+          }
+          throw error;
+        }
+      }
+      acknowledgeActiveOperationItem(config, activeOperationId, segmentItemId);
       currentAgentMessageId = undefined;
       assistantSegments.push(segmentText);
       resetResponseState();
@@ -3316,13 +3394,13 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const keyboard = paginateKeyboard(launchButtons, 0, "launch");
     const htmlLines = [
-      `<b>Selected permission profile:</b> <code>${escapeHTML(selectedLaunchProfile.label)}</code>`,
+      `<b>Selected launch profile:</b> <code>${escapeHTML(selectedLaunchProfile.label)}</code>`,
       `<b>Behavior:</b> <code>${escapeHTML(formatLaunchProfileBehavior(selectedLaunchProfile))}</code>`,
       "",
       "Select a profile. Active threads are reattached immediately when idle:",
     ];
     const plainLines = [
-      `Selected permission profile: ${selectedLaunchProfile.label}`,
+      `Selected launch profile: ${selectedLaunchProfile.label}`,
       `Behavior: ${formatLaunchProfileBehavior(selectedLaunchProfile)}`,
       "",
       "Select a profile. Active threads are reattached immediately when idle:",
@@ -3374,7 +3452,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         ? "danger-full-access confirmed for this Telegram context."
         : undefined;
       const html = [
-        `<b>Permission profile applied:</b> <code>${escapeHTML(info.launchProfileLabel)}</code>`,
+        `<b>Launch profile applied:</b> <code>${escapeHTML(info.launchProfileLabel)}</code>`,
         `<b>Behavior:</b> <code>${escapeHTML(info.launchProfileBehavior)}</code>${info.unsafeLaunch ? " ⚠️" : ""}`,
         "",
         escapeHTML(appliedLine),
@@ -3383,7 +3461,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         .filter((line): line is string => Boolean(line))
         .join("\n");
       const plain = [
-        `Permission profile applied: ${info.launchProfileLabel}`,
+        `Launch profile applied: ${info.launchProfileLabel}`,
         `Behavior: ${info.launchProfileBehavior}${info.unsafeLaunch ? " [unsafe]" : ""}`,
         "",
         appliedLine,
@@ -3398,7 +3476,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         await safeReply(ctx, html, { fallbackText: plain });
       }
     } catch (error) {
-      await ctx.answerCallbackQuery({ text: "Failed to change permission profile" }).catch(() => undefined);
+      await ctx.answerCallbackQuery({ text: "Failed to change launch profile" }).catch(() => undefined);
       const message = friendlyErrorText(error);
       const html = `<b>Failed:</b> ${escapeHTML(message)}`;
       const plain = `Failed: ${message}`;
@@ -3412,9 +3490,79 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
   };
 
-  bot.command(["launch", "launch_profiles", "permission", "profile"], openLaunchProfilesPicker);
+  const openPermissionProfilesPicker = async (ctx: Context): Promise<void> => {
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      return;
+    }
+
+    const { contextKey, session } = contextSession;
+    const profiles = (await session.listPermissionProfiles()).filter((profile) => profile.allowed);
+    if (profiles.length === 0) {
+      await openLaunchProfilesPicker(ctx);
+      return;
+    }
+
+    const info = session.getInfo();
+    const selectedId = info.selectedPermissionProfileId;
+    const picks: PermissionProfilePick[] = [
+      {
+        id: null,
+        label: "Sandbox launch profile",
+        description: "Use the sandbox and approval settings from /launch_profiles.",
+      },
+      ...profiles.map((profile) => ({
+        id: profile.id,
+        label: profile.id,
+        description: profile.description,
+      })),
+    ];
+    const buttons = picks.map((profile, index) => ({
+      label: `${profile.id === (selectedId ?? null) ? "✓ " : ""}${profile.label}`,
+      callbackData: `permission_${index}`,
+    }));
+    pendingPermissionPicks.set(contextKey, picks);
+    pendingPermissionButtons.set(contextKey, buttons);
+
+    const busy = isBusy(contextKey);
+    const selectedLabel = selectedId ?? "Sandbox launch profile";
+    const htmlLines = [
+      `<b>Runtime permission:</b> <code>${escapeHTML(selectedLabel)}</code>`,
+      busy
+        ? "A selection made now will apply to the next turn."
+        : "An active thread will be reattached immediately.",
+      "",
+      ...picks.map((profile) => {
+        const description = profile.description ? ` — ${profile.description}` : "";
+        return `• <code>${escapeHTML(profile.label)}</code>${escapeHTML(description)}`;
+      }),
+    ];
+    const plainLines = [
+      `Runtime permission: ${selectedLabel}`,
+      busy
+        ? "A selection made now will apply to the next turn."
+        : "An active thread will be reattached immediately.",
+      "",
+      ...picks.map((profile) =>
+        `- ${profile.label}${profile.description ? ` - ${profile.description}` : ""}`),
+    ];
+
+    if (info.permissionProfilePending) {
+      const activeLabel = info.permissionProfileId ?? info.launchProfileLabel;
+      htmlLines.splice(1, 0, `<b>Current turn uses:</b> <code>${escapeHTML(activeLabel)}</code>`);
+      plainLines.splice(1, 0, `Current turn uses: ${activeLabel}`);
+    }
+
+    await safeReply(ctx, htmlLines.join("\n"), {
+      fallbackText: plainLines.join("\n"),
+      replyMarkup: paginateKeyboard(buttons, 0, "permission"),
+    });
+  };
+
+  bot.command(["launch", "launch_profiles", "profile"], openLaunchProfilesPicker);
+  bot.command("permission", openPermissionProfilesPicker);
   bot.hears(/^\/launch-profiles(?:@\w+)?$/i, openLaunchProfilesPicker);
-  bot.hears(/^\/permission(?:@\w+)?$/i, openLaunchProfilesPicker);
+  bot.hears(/^\/permission(?:@\w+)?$/i, openPermissionProfilesPicker);
   bot.hears(/^\/profile(?:@\w+)?$/i, openLaunchProfilesPicker);
 
   bot.command("approvals", async (ctx) => {
@@ -3655,9 +3803,17 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const groups: SessionWorkspaceGroup[] = [...groupedSessions.entries()]
       .map(([workspace, workspaceSessions]) => ({
         workspace,
-        sessions: [...workspaceSessions].sort((left, right) => right.updatedAt.getTime() - left.updatedAt.getTime()),
+        sessions: [...workspaceSessions].sort(
+          (left, right) =>
+            (right.recencyAt ?? right.updatedAt).getTime() - (left.recencyAt ?? left.updatedAt).getTime(),
+        ),
+        availability: inspectWorkspace(workspace),
       }))
-      .sort((left, right) => right.sessions[0]!.updatedAt.getTime() - left.sessions[0]!.updatedAt.getTime());
+      .sort(
+        (left, right) =>
+          (right.sessions[0]!.recencyAt ?? right.sessions[0]!.updatedAt).getTime() -
+          (left.sessions[0]!.recencyAt ?? left.sessions[0]!.updatedAt).getTime(),
+      );
 
     pendingSessionWorkspacePicks.set(contextKey, groups);
     const workspaceButtons = groups.map((group, index) => ({
@@ -3667,8 +3823,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     pendingSessionWorkspaceButtons.set(contextKey, workspaceButtons);
     const keyboard = paginateKeyboard(workspaceButtons, 0, "sessws");
 
-    await safeReply(ctx, `<b>Recent workspaces</b> (${groups.length}):\nChoose a project first.`, {
-      fallbackText: `Recent workspaces (${groups.length}):\nChoose a project first.`,
+    const unavailableCount = groups.filter((group) => !group.availability.available).length;
+    const availabilityNotice = unavailableCount > 0
+      ? `\n⚠️ ${unavailableCount} unavailable workspace${unavailableCount === 1 ? "" : "s"} marked.`
+      : "";
+    await safeReply(ctx, `<b>Recent workspaces</b> (${groups.length}):\nChoose a project first.${availabilityNotice}`, {
+      fallbackText: `Recent workspaces (${groups.length}):\nChoose a project first.${availabilityNotice}`,
       replyMarkup: keyboard,
     });
   });
@@ -4266,6 +4426,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     pendingLaunchButtons,
     `Expired, run ${LAUNCH_PROFILES_COMMAND} again`,
   );
+  handlePageCallback(
+    /^permission_page_(\d+)$/,
+    "permission",
+    pendingPermissionButtons,
+    "Expired, run /permission again",
+  );
   handlePageCallback(/^model_page_(\d+)$/, "model", pendingModelButtons, "Expired, run /model again");
   handlePageCallback(/^effort_page_(\d+)$/, "effort", pendingEffortButtons, "Expired, run /think again");
   handlePageCallback(/^fast_page_(\d+)$/, "fast", pendingFastButtons, "Expired, run /fast again");
@@ -4296,7 +4462,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
   bot.callbackQuery(/^approval:([^:]+):(accept|acceptForSession|decline|cancel)$/, async (ctx) => {
     const approvalId = ctx.match?.[1];
-    const decision = ctx.match?.[2] as CodexApprovalResponse["decision"] | undefined;
+    const decision = ctx.match?.[2] as CodexApprovalDecision | undefined;
     if (!approvalId || !decision) {
       await ctx.answerCallbackQuery();
       return;
@@ -4347,7 +4513,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     pendingApprovals.delete(approvalId);
     clearTimeout(pending.timeout);
     finishPersistedApproval(config, approvalId, "resolved", decision);
-    pending.resolve({ decision });
+    pending.resolve(buildApprovalResponse(pending.request, decision));
     await ctx.answerCallbackQuery({ text: `Sent: ${decision}` });
     if (ctx.chat && ctx.callbackQuery.message?.message_id) {
       await safeEditMessage(
@@ -4496,10 +4662,27 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return;
     }
 
+    const availability = inspectWorkspace(group.workspace);
+    if (!availability.available) {
+      await ctx.answerCallbackQuery({ text: "Workspace unavailable" });
+      const reason = formatWorkspaceAvailabilityReason(availability.reason);
+      const html = [
+        "<b>Workspace unavailable</b>",
+        `<code>${escapeHTML(group.workspace)}</code>`,
+        "",
+        escapeHTML(reason),
+      ].join("\n");
+      const plain = ["Workspace unavailable", group.workspace, "", reason].join("\n");
+      const keyboard = new InlineKeyboard().text("← Workspaces", "sessback").row().text("Cancel", "ui_cancel");
+      await safeEditMessage(bot, chatId, messageId, html, { fallbackText: plain, replyMarkup: keyboard });
+      return;
+    }
+
     await ctx.answerCallbackQuery();
     const activeThreadId = session.getInfo().threadId;
     const orderedSessions = [...group.sessions].sort(
-      (left, right) => right.updatedAt.getTime() - left.updatedAt.getTime(),
+      (left, right) =>
+        (right.recencyAt ?? right.updatedAt).getTime() - (left.recencyAt ?? left.updatedAt).getTime(),
     );
 
     pendingSessionPicks.set(
@@ -4508,10 +4691,17 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     );
     const sessionButtons = orderedSessions.map((listedSession, sessionIndex) => ({
       label: formatSessionLabel({
-        workspace: listedSession.cwd,
-        title: listedSession.title || listedSession.firstUserMessage || "",
-        relativeTime: formatRelativeTime(listedSession.updatedAt),
+        title:
+          listedSession.name ||
+          listedSession.preview ||
+          listedSession.title ||
+          listedSession.firstUserMessage ||
+          shortId(listedSession.id),
+        relativeTime: formatRelativeTime(listedSession.recencyAt ?? listedSession.updatedAt),
         model: listedSession.model || undefined,
+        reasoningEffort: listedSession.reasoningEffort || undefined,
+        gitBranch: listedSession.gitBranch || undefined,
+        isPinned: listedSession.isPinned,
         isActive: listedSession.id === activeThreadId,
       }),
       callbackData: `sess_${sessionIndex}`,
@@ -4602,6 +4792,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         await safeReply(ctx, html, { fallbackText: plainText });
       }
     } catch (error) {
+      const record = getThread(threadId);
+      console.warn(
+        `Session switch failed instance=${instanceName} context=${redactLogId(contextKey)} thread=${redactLogId(threadId)} workspace=${record?.cwd ?? "unknown"}: ${formatError(error)}`,
+      );
       const errHtml = `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`;
       const errPlain = `Failed: ${friendlyErrorText(error)}`;
       if (messageId) {
@@ -4746,6 +4940,72 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
 
     await applyLaunchProfileSelection(ctx, contextKey, session, profile, { chatId, messageId });
+  });
+
+  bot.callbackQuery(/^permission_(\d+)$/, async (ctx) => {
+    const chatId = ctx.chat?.id;
+    const messageId = ctx.callbackQuery.message?.message_id;
+    const index = Number.parseInt(ctx.match?.[1] ?? "", 10);
+    if (!chatId || Number.isNaN(index)) {
+      return;
+    }
+
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      return;
+    }
+    const { contextKey, session } = contextSession;
+    const picks = pendingPermissionPicks.get(contextKey);
+    if (!picks || index < 0 || index >= picks.length) {
+      await ctx.answerCallbackQuery({ text: "Expired, run /permission again" });
+      return;
+    }
+
+    const pick = picks[index];
+    const queued = isBusy(contextKey);
+    const busyState = getBusyState(contextKey);
+    if (!queued) {
+      busyState.switching = true;
+    }
+    try {
+      await ctx.answerCallbackQuery({
+        text: queued ? "Queued for the next turn" : `Applying ${pick.label}...`,
+      }).catch(() => undefined);
+      const info = queued
+        ? session.setPermissionProfile(pick.id ?? undefined)
+        : await session.setPermissionProfileAndReattach(pick.id ?? undefined);
+      updateSessionMetadata(contextKey, session);
+      clearPermissionSelectionState(contextKey);
+
+      const mode = pick.id
+        ? `Native permission profile: ${pick.label}`
+        : `Sandbox launch profile: ${info.launchProfileLabel}`;
+      const detail = queued
+        ? "The current turn is unchanged. This applies from the next turn."
+        : info.threadId
+          ? "The current thread was reattached with this permission."
+          : "This permission applies when a thread starts.";
+      const html = `<b>Runtime permission updated</b>\n<code>${escapeHTML(mode)}</code>\n\n${escapeHTML(detail)}`;
+      const plain = `Runtime permission updated\n${mode}\n\n${detail}`;
+      if (messageId) {
+        await safeEditMessage(bot, chatId, messageId, html, { fallbackText: plain });
+      } else {
+        await safeReply(ctx, html, { fallbackText: plain });
+      }
+    } catch (error) {
+      const message = friendlyErrorText(error);
+      await ctx.answerCallbackQuery({ text: "Failed to change runtime permission" }).catch(() => undefined);
+      const html = `<b>Failed:</b> ${escapeHTML(message)}`;
+      if (messageId) {
+        await safeEditMessage(bot, chatId, messageId, html, { fallbackText: `Failed: ${message}` });
+      } else {
+        await safeReply(ctx, html, { fallbackText: `Failed: ${message}` });
+      }
+    } finally {
+      if (!queued) {
+        busyState.switching = false;
+      }
+    }
   });
 
   bot.callbackQuery(/^launchconfirm_(yes|no):([a-z0-9_-]+)$/, async (ctx) => {
@@ -6867,22 +7127,24 @@ function formatAccountUsageCompact(usage: NonNullable<CodexStatusDetails["accoun
 
 function formatRateLimitPlain(limit: CodexStatusDetails["rateLimits"][number]): string[] {
   const name = limit.limitName ?? limit.limitId ?? "Codex";
-  return [
-    limit.primary ? `${name} 5h limit: ${formatRateLimitWindow(limit.primary)}` : undefined,
-    limit.secondary ? `${name} weekly limit: ${formatRateLimitWindow(limit.secondary)}` : undefined,
-  ].filter((line): line is string => Boolean(line));
+  const usage = selectUsageRateLimitWindow(limit);
+  if (!usage) {
+    return [];
+  }
+  const label = name.toLowerCase() === "codex" ? "Usage" : `${name} usage`;
+  return [`${label}: ${formatRateLimitWindow(usage)}`];
 }
 
 function formatRateLimitHTML(limit: CodexStatusDetails["rateLimits"][number]): string[] {
   const name = limit.limitName ?? limit.limitId ?? "Codex";
+  const usage = selectUsageRateLimitWindow(limit);
+  if (!usage) {
+    return [];
+  }
+  const label = name.toLowerCase() === "codex" ? "Usage" : `${name} usage`;
   return [
-    limit.primary
-      ? `<b>${escapeHTML(name)} 5h limit:</b> <code>${escapeHTML(formatRateLimitWindow(limit.primary))}</code>`
-      : undefined,
-    limit.secondary
-      ? `<b>${escapeHTML(name)} weekly limit:</b> <code>${escapeHTML(formatRateLimitWindow(limit.secondary))}</code>`
-      : undefined,
-  ].filter((line): line is string => Boolean(line));
+    `<b>🪙 ${escapeHTML(label)}:</b> <code>${escapeHTML(formatRateLimitWindow(usage))}</code>`,
+  ];
 }
 
 function formatRateLimitWindow(window: NonNullable<CodexStatusDetails["rateLimits"][number]["primary"]>): string {
@@ -6906,11 +7168,38 @@ function formatRateLimitsCompact(limits: CodexStatusDetails["rateLimits"]): stri
 
   return ordered.flatMap((limit) => {
     const name = shortenLimitName(limit.limitName ?? limit.limitId ?? "Codex");
-    return [
-      limit.primary ? `${name} 5h: ${formatRateLimitWindowCompact(limit.primary)}` : undefined,
-      limit.secondary ? `${name} week: ${formatRateLimitWindowCompact(limit.secondary)}` : undefined,
-    ].filter((line): line is string => Boolean(line));
+    const usage = selectUsageRateLimitWindow(limit);
+    if (!usage) {
+      return [];
+    }
+    const label = name.toLowerCase() === "codex" ? "Usage" : name;
+    return [`🪙 ${label}: ${formatRateLimitWindowCompact(usage)}`];
   });
+}
+
+function selectUsageRateLimitWindow(
+  limit: CodexStatusDetails["rateLimits"][number],
+): NonNullable<CodexStatusDetails["rateLimits"][number]["primary"]> | undefined {
+  const candidates = [limit.primary, limit.secondary].filter(
+    (window): window is NonNullable<CodexStatusDetails["rateLimits"][number]["primary"]> => Boolean(window),
+  );
+  const weeklyByDuration = candidates
+    .filter((window) => {
+      const duration = window.windowDurationMins;
+      return duration !== undefined && duration >= 6 * 24 * 60 && duration <= 8 * 24 * 60;
+    })
+    .sort(
+      (left, right) =>
+        Math.abs((left.windowDurationMins ?? 0) - 7 * 24 * 60) -
+        Math.abs((right.windowDurationMins ?? 0) - 7 * 24 * 60),
+    )[0];
+  if (weeklyByDuration) {
+    return weeklyByDuration;
+  }
+  if (limit.secondary) {
+    return limit.secondary;
+  }
+  return candidates.length === 1 ? candidates[0] : undefined;
 }
 
 function formatRateLimitWindowCompact(
@@ -7508,7 +7797,23 @@ function formatSessionWorkspaceLabel(group: SessionWorkspaceGroup): string {
   const workspaceName = trimLine(getWorkspaceShortName(group.workspace), 18) || "(unknown)";
   const count = group.sessions.length === 1 ? "1 thread" : `${group.sessions.length} threads`;
   const relativeTime = newest ? formatRelativeTime(newest.updatedAt) : "unknown";
-  return `📁 ${workspaceName} · ${count} · ${relativeTime}`;
+  const marker = group.availability.available ? "📁" : "⚠️";
+  return `${marker} ${workspaceName} · ${count} · ${relativeTime}`;
+}
+
+function formatWorkspaceAvailabilityReason(reason: Exclude<WorkspaceAvailability["reason"], "available">): string {
+  switch (reason) {
+    case "invalid":
+      return "The saved workspace path is invalid.";
+    case "missing":
+      return "The saved workspace no longer exists.";
+    case "not-directory":
+      return "The saved workspace path is not a directory.";
+    case "access-denied":
+      return "The TeleCodex service cannot read or enter this workspace.";
+    default:
+      return "The workspace could not be inspected.";
+  }
 }
 
 function parsePathAndDepth(raw: string): { pathArg: string; depth: number } {

@@ -22,6 +22,7 @@ export interface ContextMetadata {
   reasoningEffort?: string;
   fastMode?: boolean;
   launchProfileId?: string;
+  permissionProfileId?: string;
   responseFormat?: TelegramResponseFormat;
   prettyMode?: TelegramPrettyMode;
   responsePreviewMode?: ResponsePreviewMode;
@@ -62,6 +63,7 @@ export class SessionRegistry {
         reasoningEffort: meta?.reasoningEffort,
         fastMode: meta?.fastMode,
         launchProfileId,
+        permissionProfileId: meta?.permissionProfileId,
         deferThreadStart: options?.deferThreadStart && !meta?.threadId,
         resumeThreadId: meta?.threadId ?? undefined,
       });
@@ -105,6 +107,7 @@ export class SessionRegistry {
       reasoningEffort: info.reasoningEffort,
       fastMode: info.fastMode || undefined,
       launchProfileId: info.nextLaunchProfileId ?? info.launchProfileId,
+      permissionProfileId: info.selectedPermissionProfileId,
       responseFormat: existing?.responseFormat,
       prettyMode: existing?.prettyMode,
       responsePreviewMode: existing?.responsePreviewMode,
@@ -135,6 +138,7 @@ export class SessionRegistry {
       reasoningEffort: info?.reasoningEffort ?? existing?.reasoningEffort,
       fastMode: info?.fastMode || existing?.fastMode || undefined,
       launchProfileId: info ? info.nextLaunchProfileId ?? info.launchProfileId : existing?.launchProfileId,
+      permissionProfileId: info ? info.selectedPermissionProfileId : existing?.permissionProfileId,
       responseFormat: normalized === DEFAULT_TELEGRAM_RESPONSE_FORMAT ? undefined : normalized,
       prettyMode: existing?.prettyMode,
       responsePreviewMode: existing?.responsePreviewMode,
@@ -166,6 +170,7 @@ export class SessionRegistry {
       reasoningEffort: info?.reasoningEffort ?? existing?.reasoningEffort,
       fastMode: info?.fastMode || existing?.fastMode || undefined,
       launchProfileId: info ? info.nextLaunchProfileId ?? info.launchProfileId : existing?.launchProfileId,
+      permissionProfileId: info ? info.selectedPermissionProfileId : existing?.permissionProfileId,
       responseFormat: existing?.responseFormat,
       prettyMode: normalized === "off" ? undefined : normalized,
       responsePreviewMode: existing?.responsePreviewMode,
@@ -208,6 +213,7 @@ export class SessionRegistry {
       reasoningEffort: info?.reasoningEffort ?? existing?.reasoningEffort,
       fastMode: info?.fastMode || existing?.fastMode || undefined,
       launchProfileId: info ? info.nextLaunchProfileId ?? info.launchProfileId : existing?.launchProfileId,
+      permissionProfileId: info ? info.selectedPermissionProfileId : existing?.permissionProfileId,
       responseFormat: existing?.responseFormat,
       prettyMode: existing?.prettyMode,
       responsePreviewMode:

@@ -4,7 +4,7 @@
   "description": "Telegram bridge for the OpenAI Codex CLI SDK",
   "license": "MIT",
   "author": "Benedict Evert",
-  "packageManager": "pnpm@11.13.0",
+  "packageManager": "pnpm@11.15.1",
   "repository": {
     "type": "git",
     "url": "https://github.com/benedict2310/telecodex"
@@ -19,7 +19,7 @@
   ],
   "type": "module",
   "scripts": {
-    "postinstall": "node scripts/fix-node-pty-spawn-helper.mjs",
+    "postinstall": "node scripts/fix-node-pty-spawn-helper.mjs && node scripts/prepare-codex-linux-sandbox.mjs",
     "dev": "tsx src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
@@ -27,6 +27,7 @@
   },
   "dependencies": {
     "@grammyjs/auto-retry": "^2.0.2",
+    "@openai/codex": "0.145.0",
     "@openai/codex-sdk": "^0.144.4",
     "grammy": "^1.44.0",
     "node-pty": "^1.1.0"

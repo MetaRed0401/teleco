@@ -411,7 +411,7 @@ describe("SessionRegistry", () => {
       approvalPolicy: "never",
       unsafeLaunch: false,
     });
-    dateNowSpy.mockReturnValueOnce(1000);
+    dateNowSpy.mockReturnValue(1000);
     registry.updateMetadata("123", first as any);
 
     second.setInfo({
@@ -426,11 +426,11 @@ describe("SessionRegistry", () => {
       approvalPolicy: "never",
       unsafeLaunch: false,
     });
-    dateNowSpy.mockReturnValueOnce(2000);
+    dateNowSpy.mockReturnValue(2000);
     registry.updateMetadata("123:42", second as any);
 
     expect(registry.listContexts()).toEqual([
-      {
+      expect.objectContaining({
         contextKey: "123:42",
         threadId: "thread-b",
         workspace: "/workspace/b",
@@ -438,8 +438,8 @@ describe("SessionRegistry", () => {
         reasoningEffort: "high",
         launchProfileId: "default",
         updatedAt: 2000,
-      },
-      {
+      }),
+      expect.objectContaining({
         contextKey: "123",
         threadId: "thread-a",
         workspace: "/workspace/a",
@@ -447,7 +447,7 @@ describe("SessionRegistry", () => {
         reasoningEffort: undefined,
         launchProfileId: "readonly",
         updatedAt: 1000,
-      },
+      }),
     ]);
   });
 

@@ -28,6 +28,9 @@ try {
     "item/permissions/requestApproval",
     "mcpServer/elicitation/request",
     "thread/compact/start",
+    "thread/deleted",
+    "thread/settings/updated",
+    "account/rateLimits/updated",
     "item/started",
     "item/completed",
   ]) {

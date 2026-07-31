@@ -2,6 +2,14 @@
 set -euo pipefail
 
 resolve_codex() {
+  local project_root
+  project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+  if [[ -x "$project_root/node_modules/.bin/codex" ]]; then
+    printf '%s\n' "$project_root/node_modules/.bin/codex"
+    return
+  fi
+
   if command -v codex >/dev/null 2>&1; then
     command -v codex
     return

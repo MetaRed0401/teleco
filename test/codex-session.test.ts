@@ -1,19 +1,26 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
 import { vi } from "vitest";
 
 import { createDefaultLaunchProfile, createLaunchProfile } from "../src/codex-launch.js";
 import type { TeleCodexConfig } from "../src/config.js";
+import { claimTelegramDelivery, completeTelegramDelivery } from "../src/telegram-delivery-store.js";
 
 const mockCodexState = vi.hoisted(() => {
   const getThread = vi.fn();
   const listThreads = vi.fn().mockReturnValue([]);
   const listWorkspaces = vi.fn().mockReturnValue([]);
   const listModels = vi.fn().mockReturnValue([]);
+  const inspectWorkspace = vi.fn().mockReturnValue({ available: true });
 
   return {
     getThread,
     listThreads,
     listWorkspaces,
     listModels,
+    inspectWorkspace,
     reset: () => {
       getThread.mockReset();
       getThread.mockReturnValue(null);
@@ -23,6 +30,8 @@ const mockCodexState = vi.hoisted(() => {
       listWorkspaces.mockReturnValue([]);
       listModels.mockReset();
       listModels.mockReturnValue([]);
+      inspectWorkspace.mockReset();
+      inspectWorkspace.mockReturnValue({ available: true });
     },
   };
 });
@@ -135,6 +144,7 @@ vi.mock("../src/codex-state.js", () => ({
   listThreads: mockCodexState.listThreads,
   listWorkspaces: mockCodexState.listWorkspaces,
   listModels: mockCodexState.listModels,
+  inspectWorkspace: mockCodexState.inspectWorkspace,
 }));
 
 import { CodexSessionService } from "../src/codex-session.js";
@@ -219,7 +229,7 @@ describe("CodexSessionService", () => {
       }),
     );
 
-    const codexInstance = mockState.codexInstances[0];
+    const codexInstance = mockState.codexInstances.at(-1);
     expect(codexInstance.startThread).toHaveBeenCalledWith({
       model: "o3",
       sandboxMode: "workspace-write",
@@ -232,6 +242,9 @@ describe("CodexSessionService", () => {
       threadId: null,
       workspace: "/workspace/base",
       model: "o3",
+      fastMode: false,
+      fastOnce: false,
+      serviceTier: undefined,
       launchProfileId: "default",
       launchProfileLabel: "Default",
       launchProfileBehavior: "workspace-write / never",
@@ -246,11 +259,14 @@ describe("CodexSessionService", () => {
       workspace: "/workspace/resumed",
       model: "gpt-5.4",
       reasoningEffort: "high",
+      fastMode: false,
+      fastOnce: false,
+      serviceTier: undefined,
       launchProfileId: "readonly",
       resumeThreadId: "thread-resume",
     });
 
-    const codexInstance = mockState.codexInstances[0];
+    const codexInstance = mockState.codexInstances.at(-1);
     expect(codexInstance.startThread).toHaveBeenCalledTimes(0);
     expect(codexInstance.resumeThread).toHaveBeenCalledWith("thread-resume", {
       model: "gpt-5.4",
@@ -265,6 +281,9 @@ describe("CodexSessionService", () => {
       workspace: "/workspace/resumed",
       model: "gpt-5.4",
       reasoningEffort: "high",
+      fastMode: false,
+      fastOnce: false,
+      serviceTier: undefined,
       launchProfileId: "readonly",
       launchProfileLabel: "Read Only",
       launchProfileBehavior: "read-only / never",
@@ -304,6 +323,9 @@ describe("CodexSessionService", () => {
       threadId: null,
       workspace: "/workspace/base",
       model: "o3",
+      fastMode: false,
+      fastOnce: false,
+      serviceTier: undefined,
       launchProfileId: "readonly",
       launchProfileLabel: "Read Only",
       launchProfileBehavior: "read-only / never",
@@ -322,6 +344,9 @@ describe("CodexSessionService", () => {
       threadId: null,
       workspace: "/workspace/base",
       model: "o3",
+      fastMode: false,
+      fastOnce: false,
+      serviceTier: undefined,
       launchProfileId: "default",
       launchProfileLabel: "Default",
       launchProfileBehavior: "workspace-write / never",
@@ -995,6 +1020,9 @@ describe("CodexSessionService", () => {
       threadId: null,
       workspace: "/workspace/other",
       model: "o3",
+      fastMode: false,
+      fastOnce: false,
+      serviceTier: undefined,
       launchProfileId: "default",
       launchProfileLabel: "Default",
       launchProfileBehavior: "workspace-write / never",
@@ -1007,9 +1035,9 @@ describe("CodexSessionService", () => {
 
   it("resumes a thread by id", async () => {
     const service = await CodexSessionService.create(createConfig());
-    const codexInstance = mockState.codexInstances[0];
 
     const info = await service.resumeThread("thread-999");
+    const codexInstance = mockState.codexInstances.at(-1);
 
     expect(codexInstance.resumeThread).toHaveBeenCalledWith("thread-999", {
       model: "o3",
@@ -1022,6 +1050,9 @@ describe("CodexSessionService", () => {
       threadId: "thread-999",
       workspace: "/workspace/base",
       model: "o3",
+      fastMode: false,
+      fastOnce: false,
+      serviceTier: undefined,
       launchProfileId: "default",
       launchProfileLabel: "Default",
       launchProfileBehavior: "workspace-write / never",
@@ -1059,6 +1090,9 @@ describe("CodexSessionService", () => {
       threadId: "thread-abc",
       workspace: "/workspace/from-db",
       model: "gpt-5.4-mini",
+      fastMode: false,
+      fastOnce: false,
+      serviceTier: undefined,
       launchProfileId: "default",
       launchProfileLabel: "Default",
       launchProfileBehavior: "workspace-write / never",
@@ -1283,6 +1317,9 @@ describe("CodexSessionService", () => {
       threadId: null,
       workspace: "/workspace/base",
       model: "o3",
+      fastMode: false,
+      fastOnce: false,
+      serviceTier: undefined,
       launchProfileId: "default",
       launchProfileLabel: "Default",
       launchProfileBehavior: "workspace-write / never",
@@ -1290,6 +1327,11 @@ describe("CodexSessionService", () => {
       approvalPolicy: "never",
       unsafeLaunch: false,
       sessionTokens: {
+        input: 1,
+        cached: 0,
+        output: 1,
+      },
+      lastTurnTokens: {
         input: 1,
         cached: 0,
         output: 1,
@@ -1334,11 +1376,53 @@ describe("CodexSessionService", () => {
     ]);
 
     const service = await CodexSessionService.create(createConfig());
+    mockCodexState.listModels.mockClear();
 
     expect(service.listModels()).toEqual([
       { slug: "gpt-5.4", displayName: "GPT-5.4" },
       { slug: "o3", displayName: "o3" },
     ]);
     expect(mockCodexState.listModels).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns protocol-specific approval fallbacks", async () => {
+    const service = await createAppServerService();
+
+    await expect(
+      (service as any).handleAppServerRequest({
+        method: "item/commandExecution/requestApproval",
+        params: { threadId: "thread-app-server" },
+      }),
+    ).resolves.toEqual({ decision: "decline" });
+
+    await expect(
+      (service as any).handleAppServerRequest({
+        method: "item/permissions/requestApproval",
+        params: { threadId: "thread-app-server", permissions: { network: { enabled: true } } },
+      }),
+    ).resolves.toEqual({ permissions: {}, scope: "turn" });
+  });
+
+  it("marks a recovered response item as already delivered after live delivery", () => {
+    const workspace = mkdtempSync(path.join(os.tmpdir(), "telecodex-delivery-") );
+    const config = createConfig({ workspace });
+    const deliveryKey = "operation:operation-1:item:assistant-segment-1";
+    const delivery = {
+      deliveryKey,
+      contextKey: "123",
+      chatId: 123,
+      operationId: "operation-1",
+      itemId: "assistant-segment-1",
+      payload: "assistant response segment",
+    };
+
+    try {
+      expect(claimTelegramDelivery(config, { ...delivery, kind: "live-item" })).toBe("send");
+      completeTelegramDelivery(config, deliveryKey, 456);
+
+      expect(claimTelegramDelivery(config, { ...delivery, kind: "recovered-item" })).toBe("already-delivered");
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
   });
 });

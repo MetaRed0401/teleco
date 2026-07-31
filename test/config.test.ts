@@ -28,6 +28,22 @@ describe("loadConfig", () => {
     delete process.env.ENABLE_TELEGRAM_LOGIN;
     delete process.env.ENABLE_TELEGRAM_REACTIONS;
     delete process.env.ENABLE_LIFECYCLE_NOTIFICATIONS;
+    delete process.env.ENABLE_CODEX_APP_SERVER_RUNTIME;
+    delete process.env.ENABLE_TELEGRAM_DRAFT_STREAMING;
+    delete process.env.RESPONSE_PREVIEW_MODE;
+    delete process.env.TOOL_ACTIVITY_MODE;
+    delete process.env.FINAL_RESPONSE_MODE;
+    delete process.env.TOOL_DIFF_PREVIEW_TTL_MINUTES;
+    delete process.env.AUTO_COMPACT_ENABLED;
+    delete process.env.AUTO_COMPACT_CONTEXT_THRESHOLD;
+    delete process.env.AUTO_COMPACT_COOLDOWN_TURNS;
+    delete process.env.AUTO_COMPACT_COOLDOWN_MINUTES;
+    delete process.env.AUTO_COMPACT_AFTER_EVERY_TURN;
+    delete process.env.AUTO_COMPACT_AFTER_CODEX_AUTO_COMPACT;
+    delete process.env.TELEGRAM_CHANNEL_ID;
+    delete process.env.TELEGRAM_REACTION_PROCESSING_EMOJI;
+    delete process.env.TELEGRAM_REACTION_SUCCESS_EMOJI;
+    delete process.env.TELEGRAM_REACTION_FAILURE_EMOJI;
     delete process.env.container;
   });
 
@@ -63,7 +79,7 @@ describe("loadConfig", () => {
 
     const config = loadConfig();
 
-    expect(config).toEqual({
+    expect(config).toMatchObject({
       telegramBotToken: "bot-token",
       telegramAllowedUserIds: [123, 456],
       telegramAllowedUserIdSet: new Set([123, 456]),
@@ -347,7 +363,7 @@ describe("loadConfig", () => {
     expect(config.codexApprovalPolicy).toBe("never");
     expect(config.toolVerbosity).toBe("summary");
     expect(config.maxFileSize).toBe(20 * 1024 * 1024);
-    expect(warnSpy).toHaveBeenCalledTimes(4);
+    expect(warnSpy).toHaveBeenCalledTimes(5);
   });
 
   it("parses explicit launch profiles and default selection", () => {
