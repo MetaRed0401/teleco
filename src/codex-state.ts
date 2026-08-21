@@ -13,6 +13,14 @@ export interface CodexThreadRecord {
   reasoningEffort?: string;
   gitBranch?: string;
   isPinned?: boolean;
+  section?: {
+    id: string;
+    name?: string;
+    position?: number;
+  };
+  sectionEnteredAt?: Date;
+  source?: string;
+  cliVersion?: string;
   createdAt: Date;
   updatedAt: Date;
   recencyAt?: Date;
@@ -61,9 +69,19 @@ type ThreadRow = {
   reasoning_effort: unknown;
   git_branch: unknown;
   is_pinned: unknown;
+  thread_section_id: unknown;
+  section_name: unknown;
+  section_position: unknown;
+  section_entered_at_ms: unknown;
+  source: unknown;
+  thread_source: unknown;
+  cli_version: unknown;
   created_at: unknown;
+  created_at_ms: unknown;
   updated_at: unknown;
+  updated_at_ms: unknown;
   recency_at: unknown;
+  recency_at_ms: unknown;
   first_user_message: unknown;
 };
 
@@ -110,12 +128,13 @@ export function listThreads(limit = 20): CodexThreadRecord[] {
         const columns = getThreadColumns(db);
         const userThreadFilter = buildUserThreadFilter(columns);
         const threadSelect = buildThreadSelect(columns);
+        const recencyOrder = buildThreadRecencyOrder(columns);
         const query = db.prepare(`
           SELECT ${threadSelect}
           FROM threads
           WHERE (archived = 0 OR archived IS NULL)
             ${userThreadFilter}
-          ORDER BY recency_at DESC
+          ORDER BY ${recencyOrder} DESC
           LIMIT ?
         `);
 
@@ -126,6 +145,7 @@ export function listThreads(limit = 20): CodexThreadRecord[] {
         const columns = getThreadColumnsWithSqliteCli(databasePath);
         const userThreadFilter = buildUserThreadFilter(columns);
         const threadSelect = buildThreadSelect(columns);
+        const recencyOrder = buildThreadRecencyOrder(columns);
         const rows = queryJsonWithSqliteCli<ThreadRow>(
           databasePath,
           `
@@ -133,7 +153,7 @@ export function listThreads(limit = 20): CodexThreadRecord[] {
             FROM threads
             WHERE (archived = 0 OR archived IS NULL)
               ${userThreadFilter}
-            ORDER BY recency_at DESC
+            ORDER BY ${recencyOrder} DESC
             LIMIT ${safeLimit}
           `,
         );
@@ -290,7 +310,13 @@ function mapThreadRow(row: ThreadRow): CodexThreadRecord {
   const preview = typeof row.preview === "string" ? row.preview.trim() : "";
   const reasoningEffort = typeof row.reasoning_effort === "string" ? row.reasoning_effort.trim() : "";
   const gitBranch = typeof row.git_branch === "string" ? row.git_branch.trim() : "";
-  const recencyAt = fromOptionalUnixSeconds(row.recency_at);
+  const sectionId = typeof row.thread_section_id === "string" ? row.thread_section_id.trim() : "";
+  const sectionName = typeof row.section_name === "string" ? row.section_name.trim() : "";
+  const sectionPosition = typeof row.section_position === "number" ? row.section_position : undefined;
+  const source = parseThreadSource(row.thread_source) ?? parseThreadSource(row.source);
+  const cliVersion = typeof row.cli_version === "string" ? row.cli_version.trim() : "";
+  const recencyAt = fromOptionalUnixMilliseconds(row.recency_at_ms) ?? fromOptionalUnixSeconds(row.recency_at);
+  const sectionEnteredAt = fromOptionalUnixMilliseconds(row.section_entered_at_ms);
 
   return {
     id: typeof row.id === "string" ? row.id : String(row.id ?? ""),
@@ -302,8 +328,14 @@ function mapThreadRow(row: ThreadRow): CodexThreadRecord {
     ...(reasoningEffort ? { reasoningEffort } : {}),
     ...(gitBranch ? { gitBranch } : {}),
     ...(row.is_pinned === 1 || row.is_pinned === true ? { isPinned: true } : {}),
-    createdAt: fromUnixSeconds(row.created_at),
-    updatedAt: fromUnixSeconds(row.updated_at),
+    ...(sectionId
+      ? { section: { id: sectionId, ...(sectionName ? { name: sectionName } : {}), ...(sectionPosition !== undefined ? { position: sectionPosition } : {}) } }
+      : {}),
+    ...(sectionEnteredAt ? { sectionEnteredAt } : {}),
+    ...(source ? { source } : {}),
+    ...(cliVersion ? { cliVersion } : {}),
+    createdAt: fromOptionalUnixMilliseconds(row.created_at_ms) ?? fromUnixSeconds(row.created_at),
+    updatedAt: fromOptionalUnixMilliseconds(row.updated_at_ms) ?? fromUnixSeconds(row.updated_at),
     ...(recencyAt ? { recencyAt } : {}),
     firstUserMessage: typeof row.first_user_message === "string" ? row.first_user_message : "",
   };
@@ -315,6 +347,26 @@ function fromUnixSeconds(value: unknown): Date {
 
 function fromOptionalUnixSeconds(value: unknown): Date | undefined {
   return typeof value === "number" ? new Date(value * 1000) : undefined;
+}
+
+function fromOptionalUnixMilliseconds(value: unknown): Date | undefined {
+  return typeof value === "number" && value > 0 ? new Date(value) : undefined;
+}
+
+function parseThreadSource(value: unknown): string | undefined {
+  if (typeof value !== "string" || !value.trim()) {
+    return undefined;
+  }
+  const normalized = value.trim();
+  try {
+    const parsed = JSON.parse(normalized) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return Object.keys(parsed as Record<string, unknown>)[0] ?? normalized;
+    }
+  } catch {
+    // Plain source names are expected for newer state database columns.
+  }
+  return normalized;
 }
 
 function withDatabase<T>(fn: (db: DatabaseInstance) => T, fallback?: (databasePath: string) => T): T | null {
@@ -405,11 +457,31 @@ function buildThreadSelect(columns: Set<string>): string {
     optionalColumn("reasoning_effort", "NULL"),
     optionalColumn("git_branch", "NULL"),
     optionalColumn("is_pinned", "0"),
+    optionalColumn("thread_section_id", "NULL"),
+    columns.has("thread_section_id")
+      ? "(SELECT name FROM thread_sections WHERE id = threads.thread_section_id) AS section_name"
+      : "NULL AS section_name",
+    optionalColumn("section_position", "NULL"),
+    optionalColumn("section_entered_at_ms", "NULL"),
+    optionalColumn("source", "NULL"),
+    optionalColumn("thread_source", "NULL"),
+    optionalColumn("cli_version", "''"),
     "created_at",
+    optionalColumn("created_at_ms", "NULL"),
     "updated_at",
+    optionalColumn("updated_at_ms", "NULL"),
     optionalColumn("recency_at", "updated_at"),
+    optionalColumn("recency_at_ms", "NULL"),
     "first_user_message",
   ].join(", ");
+}
+
+function buildThreadRecencyOrder(columns: Set<string>): string {
+  return columns.has("recency_at_ms")
+    ? "COALESCE(NULLIF(recency_at_ms, 0), recency_at * 1000, updated_at * 1000)"
+    : columns.has("recency_at")
+      ? "COALESCE(recency_at, updated_at)"
+      : "updated_at";
 }
 
 function buildUserThreadFilter(columns: Set<string>): string {
@@ -419,7 +491,7 @@ function buildUserThreadFilter(columns: Set<string>): string {
   }
   if (columns.has("thread_source")) {
     conditions.push(
-      "(thread_source IS NULL OR TRIM(LOWER(CAST(thread_source AS TEXT))) != 'subagent')",
+      "(thread_source IS NULL OR LOWER(CAST(thread_source AS TEXT)) NOT LIKE '%subagent%')",
     );
   }
   return conditions.map((condition) => `AND ${condition}`).join("\n            ");

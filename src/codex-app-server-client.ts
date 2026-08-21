@@ -3,6 +3,7 @@ import { accessSync, constants, existsSync, realpathSync } from "node:fs";
 import path from "node:path";
 
 import { recordUnknownAppServerEvent, type UnknownAppServerEventKind } from "./app-server-observability.js";
+import { redactPotentialSecrets } from "./secret-redaction.js";
 
 export type AppServerMessage = Record<string, unknown>;
 export type AppServerNotification = { method: string; params?: unknown };
@@ -22,7 +23,6 @@ export type AppServerTransportMode = "persistent-websocket" | "direct-stdio";
 
 const NOTIFICATION_BUFFER_LIMIT = 200;
 const APP_SERVER_STDERR_PREVIEW_LIMIT = 6000;
-const APP_SERVER_STDERR_REDACTED_VALUE = "[redacted:token]";
 
 type PendingRequest = {
   method: string;
@@ -255,6 +255,10 @@ export class CodexAppServerClient {
 
   getClosedReason(): string | undefined {
     return this.closedReason;
+  }
+
+  getCodexVersion(): string {
+    return this.codexVersion;
   }
 
   getTransportMode(): AppServerTransportMode {
@@ -596,14 +600,4 @@ function formatUnknown(value: unknown): string {
 
 function trimTail(value: string, limit: number): string {
   return value.length > limit ? value.slice(-limit) : value;
-}
-
-function redactPotentialSecrets(value: string): string {
-  return value
-    .replace(/\b(sk-[A-Za-z0-9]{20,})\b/g, APP_SERVER_STDERR_REDACTED_VALUE)
-    .replace(/\b(eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b/g, APP_SERVER_STDERR_REDACTED_VALUE)
-    .replace(
-      /(\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|authorization|bearer)\b\s*(?::\s*|\=\s*|\s+))(["']?)([^"'\s]+)\2/gi,
-      `$1$2${APP_SERVER_STDERR_REDACTED_VALUE}$2`,
-    );
 }

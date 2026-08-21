@@ -24,7 +24,7 @@ This project is derived from [benedict2310/telecodex](https://github.com/benedic
 
 - Node.js 20 or newer.
 - pnpm 11 or newer.
-- Codex CLI/app-server 0.144.1 or newer; 0.144.4 is the recommended stable version.
+- Codex CLI/app-server 0.144.1 or newer; 0.148.0 is the recommended stable version.
   The minimum baseline supports the canonical app-server item protocol and includes the `0.142.5` WebSocket trace-log privacy fix.
 - A Telegram bot token from `@BotFather`.
 - Your numeric Telegram user ID.
@@ -36,7 +36,7 @@ For best results, install common developer tools such as `git`, `rg`, `fd`, `tre
 
 TeleCodex is a Telegram control plane for Codex running on the same machine as your repositories. Telegram receives prompts, progress, tool activity, approvals, and final replies. Codex still runs locally through the Codex app-server and CLI session files under your Codex home.
 
-This branch supports Codex CLI 0.144.1 as its minimum compatibility baseline and recommends Codex CLI 0.144.4. SDK and CLI versions are tracked separately because OpenAI may not publish them in lockstep.
+This branch supports Codex CLI 0.144.1 as its minimum compatibility baseline and recommends Codex CLI 0.148.0. SDK and CLI versions are tracked separately because OpenAI may not publish them in lockstep.
 
 Privacy note: TeleCodex avoids logging raw Telegram prompt text and hashes Telegram chat/context identifiers in runtime logs. Telegram messages still intentionally include workspace paths, thread IDs, and tool summaries because those are needed for remote operation.
 
@@ -221,6 +221,8 @@ When `.env.*` files exist, commands that can affect running services require eit
 | `/queue <prompt>` | Queue a prompt after the active turn. |
 | `/queue clear` | Clear queued prompts. |
 | `/queue pop <n>` | Remove queued prompt number `n`. |
+| `/queue edit <n> <prompt>` | Replace queued prompt number `n`. |
+| `/queue move <from> <to>` | Reorder queued prompts. |
 | `/think` | Show reasoning options as buttons. |
 | `/think <level>` | Set the reasoning level directly. |
 | `/model` | Show available model controls. |
@@ -324,7 +326,7 @@ Docker has two Ubuntu-based variants:
 - `Dockerfile` + `docker-compose.yml`: normal image with Node, pnpm, Codex CLI, and required runtime dependencies.
 - `Dockerfile.local` + `docker-compose.local.yml`: tool-rich image with the brew-parity CLI tools used by this environment.
 
-Both Dockerfiles pin Codex CLI to the recommended 0.144.4 stable version unless `CODEX_CLI_VERSION` is overridden at build time. Teleco retains a minimum compatibility baseline of 0.144.1.
+Both Dockerfiles pin Codex CLI to the recommended 0.148.0 stable version unless `CODEX_CLI_VERSION` is overridden at build time. Teleco retains a minimum compatibility baseline of 0.144.1.
 
 Typical Docker values:
 

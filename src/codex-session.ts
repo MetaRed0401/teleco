@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import {
   Codex,
   type ApprovalMode,
@@ -60,6 +62,15 @@ export type CodexMcpElicitationResponse = {
   _meta: unknown | null;
 };
 
+export interface CodexToolUserInputRequest {
+  method: "item/tool/requestUserInput";
+  params?: unknown;
+}
+
+export type CodexToolUserInputResponse = {
+  answers: Record<string, { answers: string[] }>;
+};
+
 export interface CodexSessionCallbacks {
   onTextDelta: (delta: string, metadata?: { agentMessageId: string; startsNewMessage: boolean }) => void;
   onToolStart: (toolName: string, toolCallId: string) => void;
@@ -69,7 +80,9 @@ export interface CodexSessionCallbacks {
   onTodoUpdate?: (items: Array<{ text: string; completed: boolean }>) => void;
   onApprovalRequest?: (request: CodexApprovalRequest) => Promise<CodexApprovalResponse>;
   onMcpElicitationRequest?: (request: CodexMcpElicitationRequest) => Promise<CodexMcpElicitationResponse>;
+  onToolUserInputRequest?: (request: CodexToolUserInputRequest) => Promise<CodexToolUserInputResponse>;
   onContextCompaction?: () => void;
+  onThreadReverted?: () => void;
   onTurnStarted?: (turnId: string) => void;
   onTurnComplete?: (usage: {
     inputTokens: number;
@@ -91,6 +104,8 @@ export interface CodexSessionInfo {
   launchProfileBehavior: string;
   sandboxMode: string;
   approvalPolicy: string;
+  configuredSandboxMode?: string;
+  configuredApprovalPolicy?: string;
   unsafeLaunch: boolean;
   nextLaunchProfileId?: string;
   nextLaunchProfileLabel?: string;
@@ -179,6 +194,10 @@ export interface CodexStatusDetails {
     peakDailyTokens?: number;
     longestRunningTurnSec?: number;
   };
+  threadUsage?: {
+    estimatedCredits: number;
+    estimatedUsd?: number;
+  };
   rateLimits: Array<{
     limitId?: string;
     limitName?: string;
@@ -206,6 +225,13 @@ export interface CodexStatusDetails {
   mcp?: {
     total: number;
     authenticationRequired: number;
+    unknownAuthentication: number;
+  };
+  plugins?: {
+    total: number;
+    installed: number;
+    disabled: number;
+    loadErrors: number;
   };
   error?: string;
 }
@@ -239,6 +265,29 @@ export interface CodexPermissionProfile {
 export interface CodexMcpServerStatus {
   name: string;
   authStatus: string;
+}
+
+export interface CodexThreadSection {
+  id: string;
+  name: string;
+}
+
+export interface CodexQueuedPrompt {
+  id: string;
+  clientUserMessageId: string;
+  summary: string;
+}
+
+export interface CodexQueueSnapshot {
+  supported: boolean;
+  items: CodexQueuedPrompt[];
+}
+
+export interface CodexThreadConnectionCheck {
+  threadId: string;
+  workspace: string;
+  status: string;
+  connectable: boolean;
 }
 
 type AppServerToolLifecycle = {
@@ -275,11 +324,14 @@ export class CodexSessionService {
   private readonly appServerToolLifecycles = new Map<string, AppServerToolLifecycle>();
   private readonly appServerAgentMessages = new Map<string, string>();
   private readonly threadMetadataOverrides = new Map<string, { name?: string; isPinned?: boolean }>();
+  private firstPromptConnectionCheckPending = false;
   private appServerInstructionSources: string[] = [];
   private appServerActivePermissionProfile: string | undefined;
   private appServerApprovalsReviewer: string | undefined;
   private appServerModelProvider: string | undefined;
   private appServerServiceTier: string | undefined;
+  private appServerEffectiveSandbox: string | undefined;
+  private appServerEffectiveApprovalPolicy: string | undefined;
 
   private constructor(private readonly config: TeleCodexConfig) {
     this.currentWorkspace = config.workspace;
@@ -316,6 +368,8 @@ export class CodexSessionService {
 
   getInfo(): CodexSessionInfo {
     const effectiveLaunchProfile = this.activeThreadLaunchProfile ?? this.currentLaunchProfile;
+    const sandboxMode = this.appServerEffectiveSandbox ?? effectiveLaunchProfile.sandboxMode;
+    const approvalPolicy = this.appServerEffectiveApprovalPolicy ?? effectiveLaunchProfile.approvalPolicy;
     const info: CodexSessionInfo = {
       threadId: this.thread?.id ?? this.currentThreadId,
       workspace: this.currentWorkspace,
@@ -326,10 +380,17 @@ export class CodexSessionService {
       launchProfileId: effectiveLaunchProfile.id,
       launchProfileLabel: effectiveLaunchProfile.label,
       launchProfileBehavior: formatLaunchProfileBehavior(effectiveLaunchProfile),
-      sandboxMode: effectiveLaunchProfile.sandboxMode,
-      approvalPolicy: effectiveLaunchProfile.approvalPolicy,
+      sandboxMode,
+      approvalPolicy,
       unsafeLaunch: effectiveLaunchProfile.unsafe,
     };
+
+    if (sandboxMode !== effectiveLaunchProfile.sandboxMode) {
+      info.configuredSandboxMode = effectiveLaunchProfile.sandboxMode;
+    }
+    if (approvalPolicy !== effectiveLaunchProfile.approvalPolicy) {
+      info.configuredApprovalPolicy = effectiveLaunchProfile.approvalPolicy;
+    }
 
     if (this.currentReasoningEffort) {
       info.reasoningEffort = this.currentReasoningEffort;
@@ -539,31 +600,56 @@ export class CodexSessionService {
     try {
       await this.ensureAppServerInitialized();
       const client = this.getAppServerClient();
-      const [accountResponse, usageResponse, rateLimitResponse, configResponse, threadResponse, mcpResponse] = await Promise.all([
+      const [accountResponse, usageResponse, threadUsageResponse, rateLimitResponse, configResponse, threadResponse, mcpResponse, pluginResponse] = await Promise.all([
         client.request("account/read", { refreshToken: false }, 5000).catch((error) => ({ error })),
         client.request("account/usage/read", undefined, 5000).catch((error) => ({ error })),
+        this.currentThreadId && isCodexMinorAtLeast(client.getCodexVersion(), 148)
+          ? client.request("account/usage/read", { threadId: this.currentThreadId }, 5000).catch((error) => ({ error }))
+          : Promise.resolve(undefined),
         client.request("account/rateLimits/read", undefined, 5000).catch((error) => ({ error })),
         client.request("config/read", {}, 5000).catch((error) => ({ error })),
         this.currentThreadId
           ? client.request("thread/read", { threadId: this.currentThreadId, includeTurns: false }, 5000).catch((error) => ({ error }))
           : Promise.resolve(undefined),
-        client.request("mcpServerStatus/list", {}, 5000).catch((error) => ({ error })),
+        this.listMcpServerStatuses(client, 5000).catch((error) => ({ error })),
+        client.request(
+          "plugin/list",
+          {
+            cwds: [this.currentWorkspace],
+            forceRefetch: false,
+            marketplaceKinds: ["local", "workspace-directory"],
+          },
+          5000,
+        ).catch((error) => ({ error })),
       ]);
 
       const details: CodexStatusDetails = {
         account: parseAccountStatus(accountResponse),
         accountUsage: parseAccountUsageStatus(usageResponse),
+        threadUsage: parseThreadUsageStatus(threadUsageResponse),
         rateLimits: parseRateLimitStatus(rateLimitResponse),
       };
       details.config = parseConfigStatus(configResponse);
-      const mcpData = readRecord(mcpResponse)?.data;
-      if (Array.isArray(mcpData)) {
+      if (Array.isArray(mcpResponse)) {
         details.mcp = {
-          total: mcpData.length,
-          authenticationRequired: mcpData.filter((value) => {
-            const authStatus = readString(readRecord(value)?.authStatus);
-            return authStatus === "notLoggedIn";
-          }).length,
+          total: mcpResponse.length,
+          authenticationRequired: mcpResponse.filter((status) => status.authStatus === "notLoggedIn").length,
+          unknownAuthentication: mcpResponse.filter((status) => status.authStatus === "unknown").length,
+        };
+      }
+      const pluginRecord = readRecord(pluginResponse);
+      if (Array.isArray(pluginRecord?.marketplaces)) {
+        const plugins = pluginRecord.marketplaces.flatMap((value) => {
+          const marketplace = readRecord(value);
+          return Array.isArray(marketplace?.plugins)
+            ? marketplace.plugins.map(readRecord).filter((plugin): plugin is Record<string, unknown> => Boolean(plugin))
+            : [];
+        });
+        details.plugins = {
+          total: plugins.length,
+          installed: plugins.filter((plugin) => plugin.installed === true).length,
+          disabled: plugins.filter((plugin) => plugin.enabled === false || Boolean(readString(plugin.disabledReason))).length,
+          loadErrors: Array.isArray(pluginRecord.marketplaceLoadErrors) ? pluginRecord.marketplaceLoadErrors.length : 0,
         };
       }
       if (details.config?.model && !this.currentModel) {
@@ -822,6 +908,7 @@ export class CodexSessionService {
       this.currentWorkspace = effectiveWorkspace;
       this.currentThreadId = threadId;
       this.appServerThreadLoaded = true;
+      this.firstPromptConnectionCheckPending = false;
       this.resetUsageState(effectiveModel);
       if (model) {
         this.currentModel = model;
@@ -835,6 +922,7 @@ export class CodexSessionService {
     this.activeThreadLaunchProfile = this.currentLaunchProfile;
     this.currentWorkspace = effectiveWorkspace;
     this.currentThreadId = this.thread.id ?? null;
+    this.firstPromptConnectionCheckPending = false;
     this.resetUsageState(effectiveModel);
     if (model) {
       this.currentModel = model;
@@ -855,28 +943,19 @@ export class CodexSessionService {
       await this.ensureAppServerInitialized();
       const response = await this.requestAppServerThreadResume({
         threadId,
-        cwd: workspace,
-        model: model ?? this.config.codexModel ?? null,
-        runtimeWorkspaceRoots: [workspace],
-        approvalPolicy: this.currentLaunchProfile.approvalPolicy,
-        sandbox: this.currentLaunchProfile.sandboxMode,
         excludeTurns: true,
-        config: this.buildAppServerConfig(),
       });
-      this.captureAppServerThreadResumeState(response);
       this.thread = null;
       this.activeThreadLaunchProfile = this.currentLaunchProfile;
-      this.currentWorkspace = workspace;
       this.currentThreadId = threadId;
+      this.captureAppServerThreadResumeState(response);
       this.appServerThreadLoaded = true;
+      this.firstPromptConnectionCheckPending = true;
       this.lastTurnTokens = undefined;
       this.contextTokensUsed = undefined;
       this.appServerModelContextWindow = undefined;
       this.appServerContextWindowModel = undefined;
-      this.contextWindowPendingModel = model ?? this.currentModel ?? this.config.codexModel;
-      if (model) {
-        this.currentModel = model;
-      }
+      this.contextWindowPendingModel = this.currentModel ?? model ?? this.config.codexModel;
       return this.getInfo();
     }
 
@@ -889,6 +968,7 @@ export class CodexSessionService {
     this.activeThreadLaunchProfile = this.currentLaunchProfile;
     this.currentWorkspace = workspace;
     this.currentThreadId = threadId;
+    this.firstPromptConnectionCheckPending = true;
     this.lastTurnTokens = undefined;
     this.contextTokensUsed = undefined;
     this.appServerModelContextWindow = undefined;
@@ -915,13 +995,7 @@ export class CodexSessionService {
       await this.ensureAppServerInitialized();
       const response = await this.requestAppServerThreadResume({
         threadId,
-        cwd: workspace,
-        model: model ?? this.currentModel ?? this.config.codexModel ?? null,
-        runtimeWorkspaceRoots: [workspace],
-        approvalPolicy: this.currentLaunchProfile.approvalPolicy,
-        sandbox: this.currentLaunchProfile.sandboxMode,
         excludeTurns: true,
-        config: this.buildAppServerConfig(),
       });
       this.captureAppServerThreadResumeState(response);
       this.thread = null;
@@ -929,6 +1003,7 @@ export class CodexSessionService {
       this.currentWorkspace = workspace;
       this.currentThreadId = threadId;
       this.appServerThreadLoaded = true;
+      this.firstPromptConnectionCheckPending = true;
       this.resetUsageState(model ?? this.currentModel ?? this.config.codexModel);
       if (model) {
         this.currentModel = model;
@@ -940,6 +1015,7 @@ export class CodexSessionService {
     this.activeThreadLaunchProfile = this.currentLaunchProfile;
     this.currentWorkspace = workspace;
     this.currentThreadId = threadId;
+    this.firstPromptConnectionCheckPending = true;
     this.resetUsageState(model ?? this.currentModel);
     if (model) {
       this.currentModel = model;
@@ -1076,6 +1152,48 @@ export class CodexSessionService {
       const override = this.threadMetadataOverrides.get(thread.id);
       return override ? { ...thread, ...override } : thread;
     });
+  }
+
+  async checkThreadConnection(threadId: string): Promise<CodexThreadConnectionCheck> {
+    this.ensureIdle("check a thread connection");
+    const record = getThread(threadId);
+    if (!record) {
+      throw new Error(`Unknown Codex thread: ${threadId}`);
+    }
+    assertWorkspaceAvailable(record.cwd);
+    if (!this.config.enableCodexAppServerRuntime) {
+      throw new Error("App-server runtime is required to check a thread connection.");
+    }
+
+    await this.ensureAppServerInitialized();
+    const response = await this.getAppServerClient().request(
+      "thread/read",
+      { threadId, includeTurns: false },
+      5000,
+    );
+    const thread = readRecord(readRecord(response)?.thread);
+    if (!thread || readString(thread.id) !== threadId) {
+      throw new Error("Codex thread is not readable through the app-server.");
+    }
+
+    const status = readString(readRecord(thread.status)?.type) ?? readString(thread.status) ?? "unknown";
+    return {
+      threadId,
+      workspace: record.cwd,
+      status,
+      connectable: status !== "active" && status !== "systemError",
+    };
+  }
+
+  async checkPendingFirstPromptConnection(): Promise<CodexThreadConnectionCheck | undefined> {
+    if (!this.firstPromptConnectionCheckPending || !this.currentThreadId) {
+      return undefined;
+    }
+    const result = await this.checkThreadConnection(this.currentThreadId);
+    if (result.connectable) {
+      this.firstPromptConnectionCheckPending = false;
+    }
+    return result;
   }
 
   listWorkspaces(): string[] {
@@ -1218,6 +1336,7 @@ export class CodexSessionService {
     this.abortController = null;
     this.thread = null;
     this.currentThreadId = null;
+    this.firstPromptConnectionCheckPending = false;
     this.activeThreadLaunchProfile = null;
     this.activeThreadPermissionProfileId = undefined;
     return info;
@@ -1260,19 +1379,213 @@ export class CodexSessionService {
       throw error;
     }
 
-    const response = await client.request("mcpServerStatus/list", {}, 10_000);
-    const data = readRecord(response)?.data;
-    const statuses = Array.isArray(data)
-      ? data.flatMap((value) => {
-          const status = readRecord(value);
-          const name = readString(status?.name);
-          if (!name) {
-            return [];
-          }
-          return [{ name, authStatus: readString(status?.authStatus) ?? "unknown" }];
-        })
-      : [];
+    const statuses = await this.listMcpServerStatuses(client, 10_000);
     return { supported: true, statuses };
+  }
+
+  async listThreadSections(): Promise<{ supported: boolean; sections: CodexThreadSection[] }> {
+    if (!this.config.enableCodexAppServerRuntime) {
+      return { supported: false, sections: [] };
+    }
+
+    await this.ensureAppServerInitialized();
+    const client = this.getAppServerClient();
+    const sections: CodexThreadSection[] = [];
+    const seenCursors = new Set<string>();
+    let cursor: string | undefined;
+
+    for (let page = 0; page < 20; page += 1) {
+      let response: unknown;
+      try {
+        response = await client.request(
+          "threadSection/list",
+          cursor ? { cursor, limit: 100 } : { limit: 100 },
+          10_000,
+        );
+      } catch (error) {
+        if (page === 0 && isUnsupportedAppServerRequest(error, "threadSection/list")) {
+          return { supported: false, sections: [] };
+        }
+        throw error;
+      }
+
+      const result = readRecord(response);
+      const data = Array.isArray(result?.data) ? result.data : [];
+      for (const value of data) {
+        const section = readRecord(value);
+        const id = readString(section?.id);
+        const name = readString(section?.name);
+        if (id && name) {
+          sections.push({ id, name });
+        }
+      }
+
+      const nextCursor = readString(result?.nextCursor);
+      if (!nextCursor) {
+        return { supported: true, sections };
+      }
+      if (seenCursors.has(nextCursor)) {
+        throw new Error("Codex thread sections returned a repeated pagination cursor.");
+      }
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
+    }
+
+    throw new Error("Codex thread sections exceeded the pagination limit.");
+  }
+
+  async moveCurrentThreadToSection(sectionId: string | null): Promise<void> {
+    this.ensureIdle("move a thread to a section");
+    if (!this.currentThreadId || !this.config.enableCodexAppServerRuntime) {
+      throw new Error("Thread section changes require an active app-server thread.");
+    }
+
+    await this.ensureAppServerThreadReady();
+    await this.getAppServerClient().request(
+      "thread/section/move",
+      { threadId: this.currentThreadId, sectionId },
+      5000,
+    );
+  }
+
+  async listQueuedPrompts(): Promise<CodexQueueSnapshot> {
+    if (!this.config.enableCodexAppServerRuntime) {
+      return { supported: false, items: [] };
+    }
+
+    await this.ensureAppServerInitialized();
+    const client = this.getAppServerClient();
+    if (!isCodexMinorAtLeast(client.getCodexVersion(), 148)) {
+      return { supported: false, items: [] };
+    }
+    if (!this.currentThreadId) {
+      return { supported: true, items: [] };
+    }
+
+    await this.ensureAppServerThreadReady();
+    return {
+      supported: true,
+      items: await this.listNativeQueuedPrompts(client, this.currentThreadId),
+    };
+  }
+
+  async addQueuedPrompt(input: CodexPromptInput): Promise<CodexQueuedPrompt> {
+    const { client, threadId } = await this.requireNativeQueue();
+    const response = await client.request(
+      "thread/queue/add",
+      {
+        threadId,
+        input: this.buildAppServerInput(input),
+        clientUserMessageId: randomUUID(),
+      },
+      5000,
+    );
+    const queued = parseQueuedPrompt(readRecord(response)?.queuedSubmission);
+    if (!queued) {
+      throw new Error("Codex did not return the queued submission.");
+    }
+    return queued;
+  }
+
+  async updateQueuedPrompt(queuedSubmissionId: string, input: CodexPromptInput): Promise<CodexQueuedPrompt> {
+    const { client, threadId } = await this.requireNativeQueue();
+    const response = await client.request(
+      "thread/queue/update",
+      { threadId, queuedSubmissionId, input: this.buildAppServerInput(input) },
+      5000,
+    );
+    const queued = parseQueuedPrompt(readRecord(response)?.queuedSubmission);
+    if (!queued) {
+      throw new Error("Codex did not return the updated queued submission.");
+    }
+    return queued;
+  }
+
+  async deleteQueuedPrompt(queuedSubmissionId: string): Promise<boolean> {
+    const { client, threadId } = await this.requireNativeQueue();
+    const response = await client.request(
+      "thread/queue/delete",
+      { threadId, queuedSubmissionId },
+      5000,
+    );
+    return readRecord(response)?.deleted === true;
+  }
+
+  async clearQueuedPrompts(): Promise<number> {
+    const snapshot = await this.listQueuedPrompts();
+    if (!snapshot.supported) {
+      throw new Error("Native Codex queue is unavailable.");
+    }
+    let deleted = 0;
+    for (const item of snapshot.items) {
+      if (await this.deleteQueuedPrompt(item.id)) {
+        deleted += 1;
+      }
+    }
+    return deleted;
+  }
+
+  async reorderQueuedPrompts(queuedSubmissionIds: string[]): Promise<void> {
+    const { client, threadId } = await this.requireNativeQueue();
+    await client.request("thread/queue/reorder", { threadId, queuedSubmissionIds }, 5000);
+  }
+
+  async startQueuedPrompt(queuedSubmissionId?: string): Promise<string | undefined> {
+    const { client, threadId } = await this.requireNativeQueue();
+    const response = await client.request(
+      "thread/queue/start",
+      { threadId, queuedSubmissionId: queuedSubmissionId ?? null },
+      5000,
+    );
+    return readString(readRecord(readRecord(response)?.turn)?.id);
+  }
+
+  private async requireNativeQueue(): Promise<{ client: CodexAppServerClient; threadId: string }> {
+    if (!this.config.enableCodexAppServerRuntime || !this.currentThreadId) {
+      throw new Error("Native Codex queue requires an active app-server thread.");
+    }
+    await this.ensureAppServerThreadReady();
+    const client = this.getAppServerClient();
+    if (!isCodexMinorAtLeast(client.getCodexVersion(), 148)) {
+      throw new Error("Native Codex queue requires Codex 0.148 or newer.");
+    }
+    return { client, threadId: this.currentThreadId };
+  }
+
+  private async listNativeQueuedPrompts(
+    client: CodexAppServerClient,
+    threadId: string,
+  ): Promise<CodexQueuedPrompt[]> {
+    const items: CodexQueuedPrompt[] = [];
+    const seenCursors = new Set<string>();
+    let cursor: string | undefined;
+
+    for (let page = 0; page < 20; page += 1) {
+      const response = await client.request(
+        "thread/queue/list",
+        { threadId, limit: 100, ...(cursor ? { cursor } : {}) },
+        5000,
+      );
+      const result = readRecord(response);
+      const pageItems = Array.isArray(result?.data) ? result.data : [];
+      for (const value of pageItems) {
+        const queued = parseQueuedPrompt(value);
+        if (queued) {
+          items.push(queued);
+        }
+      }
+      const nextCursor = readString(result?.nextCursor);
+      if (!nextCursor) {
+        return items;
+      }
+      if (seenCursors.has(nextCursor)) {
+        throw new Error("Codex queue returned a repeated pagination cursor.");
+      }
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
+    }
+
+    throw new Error("Codex queue exceeded the pagination limit.");
   }
 
   async setThreadName(name: string): Promise<string> {
@@ -1308,7 +1621,11 @@ export class CodexSessionService {
     }
 
     await this.ensureAppServerThreadReady();
-    await this.getAppServerClient().request(
+    const client = this.getAppServerClient();
+    if (isCodexMinorAtLeast(client.getCodexVersion(), 147)) {
+      throw new Error("Native thread pinning is unavailable in Codex 0.147 and newer.");
+    }
+    await client.request(
       "thread/metadata/update",
       { threadId: this.currentThreadId, isPinned },
       5000,
@@ -1317,6 +1634,44 @@ export class CodexSessionService {
       ...this.threadMetadataOverrides.get(this.currentThreadId),
       isPinned,
     });
+  }
+
+  private async listMcpServerStatuses(
+    client: CodexAppServerClient,
+    timeoutMs: number,
+  ): Promise<CodexMcpServerStatus[]> {
+    const statuses: CodexMcpServerStatus[] = [];
+    const seenCursors = new Set<string>();
+    let cursor: string | undefined;
+
+    for (let page = 0; page < 20; page += 1) {
+      const response = await client.request(
+        "mcpServerStatus/list",
+        cursor ? { cursor } : {},
+        timeoutMs,
+      );
+      const result = readRecord(response);
+      const data = Array.isArray(result?.data) ? result.data : [];
+      for (const value of data) {
+        const status = readRecord(value);
+        const name = readString(status?.name);
+        if (name) {
+          statuses.push({ name, authStatus: readString(status?.authStatus) ?? "unknown" });
+        }
+      }
+
+      const nextCursor = readString(result?.nextCursor);
+      if (!nextCursor) {
+        return statuses;
+      }
+      if (seenCursors.has(nextCursor)) {
+        throw new Error("Codex MCP status returned a repeated pagination cursor.");
+      }
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
+    }
+
+    throw new Error("Codex MCP status exceeded the pagination limit.");
   }
 
   private buildSdkInput(input: CodexPromptInput): Input {
@@ -1464,6 +1819,12 @@ export class CodexSessionService {
     this.appServerApprovalsReviewer = summarizeUnknownValue(record?.approvalsReviewer);
     this.appServerModelProvider = readString(record?.modelProvider);
     this.appServerServiceTier = readString(record?.serviceTier);
+    this.appServerEffectiveApprovalPolicy = summarizeApprovalPolicy(record?.approvalPolicy);
+    this.appServerEffectiveSandbox = summarizeSandboxPolicy(record?.sandbox);
+    const resumedWorkspace = readString(record?.cwd);
+    if (resumedWorkspace) {
+      this.currentWorkspace = resumedWorkspace;
+    }
     this.currentModel = readString(record?.model) ?? this.currentModel;
   }
 
@@ -1524,62 +1885,7 @@ export class CodexSessionService {
         callbacks.onTurnStarted?.(this.appServerCurrentTurnId);
       }
 
-      const activeThreadId = this.currentThreadId;
-      await new Promise<void>((resolve, reject) => {
-        const onAbort = (): void => {
-          reject(new Error("Codex turn was aborted."));
-        };
-        controller.signal.addEventListener("abort", onAbort, { once: true });
-        const done = client.onNotification((notification) => {
-          const params = readRecord(notification.params);
-          if (
-            notification.method === "thread/deleted" &&
-            readString(params?.threadId) === activeThreadId
-          ) {
-            controller.signal.removeEventListener("abort", onAbort);
-            done();
-            reject(new Error("The active Codex thread was deleted."));
-            return;
-          }
-          if (notification.method === "error") {
-            controller.signal.removeEventListener("abort", onAbort);
-            done();
-            reject(
-              new Error(
-                readString(readRecord(params?.error)?.message) ??
-                  readString(params?.message) ??
-                  "Codex app-server turn failed.",
-              ),
-            );
-            return;
-          }
-
-          if (notification.method !== "turn/completed") {
-            return;
-          }
-
-          if (readString(params?.threadId) !== this.currentThreadId) {
-            return;
-          }
-
-      const turn = readRecord(params?.turn);
-      const status = readString(turn?.status);
-      controller.signal.removeEventListener("abort", onAbort);
-      done();
-      if (status === "failed") {
-            const turnError = readRecord(turn?.error);
-            reject(
-              new Error(
-                readString(turnError?.message) ??
-                  readString(turnError?.additionalDetails) ??
-                  "Codex app-server turn failed.",
-              ),
-            );
-            return;
-          }
-          resolve();
-        });
-      });
+      await this.waitForAppServerTurnChain(client, callbacks, controller, this.currentThreadId);
     } catch (error) {
       if (isRecoverableAppServerError(error)) {
         this.resetAppServerClient();
@@ -1594,6 +1900,144 @@ export class CodexSessionService {
         this.abortController = null;
       }
     }
+  }
+
+  private async waitForAppServerTurnChain(
+    client: CodexAppServerClient,
+    callbacks: CodexSessionCallbacks,
+    controller: AbortController,
+    threadId: string,
+  ): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      let settleTimer: NodeJS.Timeout | undefined;
+      let lastFailure: Error | undefined;
+
+      const cleanup = (): void => {
+        if (settleTimer) {
+          clearTimeout(settleTimer);
+        }
+        controller.signal.removeEventListener("abort", onAbort);
+        unsubscribe();
+      };
+      const finish = (error?: Error): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        if (error) {
+          reject(error);
+        } else {
+          resolve();
+        }
+      };
+      const onAbort = (): void => finish(new Error("Codex turn was aborted."));
+
+      const inspectQueue = async (): Promise<void> => {
+        if (settled || this.appServerCurrentTurnId) {
+          return;
+        }
+        if (!isCodexMinorAtLeast(client.getCodexVersion(), 148)) {
+          finish(lastFailure);
+          return;
+        }
+
+        try {
+          const queued = await this.listNativeQueuedPrompts(client, threadId);
+          if (settled || this.appServerCurrentTurnId) {
+            return;
+          }
+          if (queued.length === 0) {
+            finish(lastFailure);
+            return;
+          }
+
+          const response = await client.request(
+            "thread/queue/start",
+            { threadId, queuedSubmissionId: null },
+            5000,
+          ).catch((error) => {
+            if (!/active|in progress|invalid request/i.test(String(error))) {
+              throw error;
+            }
+            return undefined;
+          });
+          const turnId = readString(readRecord(readRecord(response)?.turn)?.id);
+          if (turnId && turnId !== this.appServerCurrentTurnId) {
+            this.appServerCurrentTurnId = turnId;
+            callbacks.onTurnStarted?.(turnId);
+          }
+          scheduleQueueInspection(250);
+        } catch (error) {
+          finish(error instanceof Error ? error : new Error(String(error)));
+        }
+      };
+
+      const scheduleQueueInspection = (delayMs = 100): void => {
+        if (settleTimer) {
+          clearTimeout(settleTimer);
+        }
+        settleTimer = setTimeout(() => void inspectQueue(), delayMs);
+      };
+
+      const unsubscribe = client.onNotification((notification) => {
+        const params = readRecord(notification.params);
+        if (readString(params?.threadId) !== threadId) {
+          return;
+        }
+        if (notification.method === "thread/deleted") {
+          finish(new Error("The active Codex thread was deleted."));
+          return;
+        }
+        if (notification.method === "error") {
+          finish(
+            new Error(
+              readString(readRecord(params?.error)?.message) ??
+                readString(params?.message) ??
+                "Codex app-server turn failed.",
+            ),
+          );
+          return;
+        }
+        if (notification.method === "turn/started") {
+          lastFailure = undefined;
+          if (settleTimer) {
+            clearTimeout(settleTimer);
+            settleTimer = undefined;
+          }
+          return;
+        }
+        if (notification.method !== "turn/completed") {
+          if (
+            notification.method === "thread/status/changed" &&
+            readString(readRecord(params?.status)?.type) === "idle"
+          ) {
+            scheduleQueueInspection();
+          }
+          return;
+        }
+
+        const turn = readRecord(params?.turn);
+        const status = readString(turn?.status);
+        this.appServerCurrentTurnId = null;
+        if (status === "interrupted") {
+          finish();
+          return;
+        }
+        if (status === "failed") {
+          const turnError = readRecord(turn?.error);
+          lastFailure = new Error(
+            readString(turnError?.message) ??
+              readString(turnError?.additionalDetails) ??
+              "Codex app-server turn failed.",
+          );
+        }
+        scheduleQueueInspection();
+      });
+
+      controller.signal.addEventListener("abort", onAbort, { once: true });
+    });
   }
 
   private getAppServerClient(callbacks?: CodexSessionCallbacks): CodexAppServerClient {
@@ -1628,13 +2072,7 @@ export class CodexSessionService {
 
     const response = await this.requestAppServerThreadResume({
       threadId: this.currentThreadId,
-      cwd: this.currentWorkspace,
-      model: this.currentModel ?? this.config.codexModel ?? null,
-      runtimeWorkspaceRoots: [this.currentWorkspace],
-      approvalPolicy: this.currentLaunchProfile.approvalPolicy,
-      sandbox: this.currentLaunchProfile.sandboxMode,
       excludeTurns: true,
-      config: this.buildAppServerConfig(),
     });
     this.captureAppServerThreadResumeState(response);
     this.thread = null;
@@ -1753,7 +2191,11 @@ export class CodexSessionService {
     }
 
     if (request.method === "item/tool/requestUserInput") {
-      return { answers: {} };
+      const response = await callbacks?.onToolUserInputRequest?.({
+        method: request.method,
+        params: request.params,
+      });
+      return response ?? { answers: {} };
     }
 
     if (request.method === "item/tool/call") {
@@ -1778,7 +2220,12 @@ export class CodexSessionService {
       return;
     }
     const notificationTurnId = readString(params?.turnId) ?? readString(readRecord(params?.turn)?.id);
-    if (notificationTurnId && this.appServerCurrentTurnId && notificationTurnId !== this.appServerCurrentTurnId) {
+    if (
+      notification.method !== "turn/started" &&
+      notificationTurnId &&
+      this.appServerCurrentTurnId &&
+      notificationTurnId !== this.appServerCurrentTurnId
+    ) {
       return;
     }
     if (notificationTurnId && !this.appServerCurrentTurnId) {
@@ -1791,6 +2238,16 @@ export class CodexSessionService {
         if (threadId) {
           this.currentThreadId = threadId;
           this.appServerThreadLoaded = true;
+        }
+        break;
+      }
+      case "turn/started": {
+        const turnId = readString(readRecord(params?.turn)?.id);
+        if (turnId) {
+          this.appServerCurrentTurnId = turnId;
+          this.appServerToolLifecycles.clear();
+          this.appServerAgentMessages.clear();
+          callbacks.onTurnStarted?.(turnId);
         }
         break;
       }
@@ -1807,7 +2264,7 @@ export class CodexSessionService {
         const id = readString(item?.id) ?? randomItemId();
         const type = readString(item?.type);
         if (type === "commandExecution") {
-          this.emitAppServerToolStart(callbacks, readString(item?.command) ?? "shell", id);
+          this.emitAppServerToolStart(callbacks, getCommandExecutionToolName(item), id);
         } else if (type === "mcpToolCall") {
           this.emitAppServerToolStart(callbacks, `mcp:${readString(item?.server) ?? "unknown"}/${readString(item?.tool) ?? "tool"}`, id);
         } else if (type === "dynamicToolCall") {
@@ -1894,7 +2351,7 @@ export class CodexSessionService {
         if (type === "agentMessage") {
           this.emitAppServerAgentSnapshot(callbacks, id, readString(item?.text) ?? "");
         } else if (type === "commandExecution") {
-          this.emitAppServerToolStart(callbacks, readString(item?.command) ?? "shell", id);
+          this.emitAppServerToolStart(callbacks, getCommandExecutionToolName(item), id);
           const output = readString(item?.aggregatedOutput);
           if (output) {
             this.emitAppServerToolSnapshot(callbacks, id, output);
@@ -2028,7 +2485,10 @@ export class CodexSessionService {
         const turnItems = Array.isArray(turn?.items)
           ? turn.items.map(readRecord).filter((item): item is Record<string, unknown> => Boolean(item))
           : [];
-        const finalAgentItem = turnItems.filter((item) => readString(item.type) === "agentMessage").at(-1);
+        const agentItems = turnItems.filter((item) => readString(item.type) === "agentMessage");
+        const finalAgentItem =
+          agentItems.filter((item) => readString(item.phase) === "final_answer").at(-1)
+          ?? agentItems.at(-1);
         if (finalAgentItem) {
           this.emitAppServerAgentSnapshot(
             callbacks,
@@ -2055,13 +2515,32 @@ export class CodexSessionService {
         }
         break;
       }
+      case "thread/compacted":
+        callbacks.onContextCompaction?.();
+        break;
+      case "thread/reverted":
+        this.appServerCurrentTurnId = null;
+        this.appServerToolLifecycles.clear();
+        this.appServerAgentMessages.clear();
+        this.lastTurnTokens = undefined;
+        this.contextTokensUsed = undefined;
+        callbacks.onThreadReverted?.();
+        break;
+      case "thread/queue/changed":
+        break;
+      case "thread/archived":
+      case "thread/unarchived":
+      case "thread/closed":
       case "thread/status/changed":
       case "thread/settings/updated":
       case "thread/name/updated":
       case "turn/diff/updated":
       case "turn/plan/updated":
       case "account/rateLimits/updated":
+      case "account/login/completed":
+      case "account/updated":
       case "mcp/server/status/updated":
+      case "mcpServer/oauthLogin/completed":
       case "mcpServer/startupStatus/updated":
         break;
       case "model/rerouted": {
@@ -2286,7 +2765,7 @@ function toTurnRecoveryItem(
     return {
       id,
       kind: "tool",
-      toolName: readString(item.command) ?? "shell",
+      toolName: getCommandExecutionToolName(item),
       detail: trimRecoveryDetail(readString(item.aggregatedOutput) ?? ""),
       isError: readString(item.status) === "failed",
     };
@@ -2398,6 +2877,15 @@ function getCanonicalAppServerToolName(item: Record<string, unknown> | undefined
   return undefined;
 }
 
+function getCommandExecutionToolName(item: Record<string, unknown> | undefined): string {
+  const pluginId = readString(item?.pluginId);
+  if (pluginId) {
+    const scriptPath = readString(item?.scriptPath);
+    return `plugin:${pluginId}/${scriptPath ?? "command"}`;
+  }
+  return readString(item?.command) ?? "shell";
+}
+
 function summarizeCanonicalAppServerItem(item: Record<string, unknown>): string | undefined {
   const type = readString(item.type);
   if (type === "collabAgentToolCall") {
@@ -2504,6 +2992,19 @@ function parseAccountUsageStatus(value: unknown): CodexStatusDetails["accountUsa
   };
 }
 
+function parseThreadUsageStatus(value: unknown): CodexStatusDetails["threadUsage"] | undefined {
+  const threadUsage = readRecord(readRecord(value)?.threadUsage);
+  const estimatedCreditsMicros = readNumber(threadUsage?.estimatedUsageCreditsMicros);
+  if (estimatedCreditsMicros === undefined) {
+    return undefined;
+  }
+  const estimatedUsdMicros = readNumber(threadUsage?.estimatedUsageUsdMicros);
+  return {
+    estimatedCredits: estimatedCreditsMicros / 1_000_000,
+    ...(estimatedUsdMicros === undefined ? {} : { estimatedUsd: estimatedUsdMicros / 1_000_000 }),
+  };
+}
+
 function parseRateLimitSnapshot(value: unknown): CodexStatusDetails["rateLimits"][number] | undefined {
   const record = readRecord(value);
   if (!record) {
@@ -2595,6 +3096,46 @@ function summarizeUnknownValue(value: unknown): string | undefined {
   } catch {
     return String(value);
   }
+}
+
+function summarizeApprovalPolicy(value: unknown): string | undefined {
+  return readString(value) ?? summarizeUnknownValue(value);
+}
+
+function summarizeSandboxPolicy(value: unknown): string | undefined {
+  const type = readString(readRecord(value)?.type);
+  if (type === "dangerFullAccess") return "danger-full-access";
+  if (type === "readOnly") return "read-only";
+  if (type === "workspaceWrite") return "workspace-write";
+  if (type === "externalSandbox") return "external-sandbox";
+  return type;
+}
+
+function parseQueuedPrompt(value: unknown): CodexQueuedPrompt | undefined {
+  const record = readRecord(value);
+  const id = readString(record?.id);
+  const clientUserMessageId = readString(record?.clientUserMessageId);
+  if (!id || !clientUserMessageId) {
+    return undefined;
+  }
+  const input = Array.isArray(record?.input) ? record.input : [];
+  const summary = input
+    .map((entry) => {
+      const item = readRecord(entry);
+      const type = readString(item?.type);
+      if (type === "text") return readString(item?.text) ?? "";
+      if (type === "localImage" || type === "image") return "[image]";
+      return type ? `[${type}]` : "";
+    })
+    .filter(Boolean)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return {
+    id,
+    clientUserMessageId,
+    summary: summary.length > 120 ? `${summary.slice(0, 119)}…` : summary || "(empty prompt)",
+  };
 }
 
 function summarizeAppServerFileChange(item: Record<string, unknown> | undefined): string {
@@ -2819,6 +3360,11 @@ function parseReasoningEfforts(value: unknown, currentModel?: string): string[] 
 function isRuntimeWorkspaceRootsError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /runtimeWorkspaceRoots|experimentalApi|experimental api|unknown field|invalid params/i.test(message);
+}
+
+function isCodexMinorAtLeast(version: string, minimumMinor: number): boolean {
+  const match = /^(?:codex-cli\s+)?0\.(\d+)\./.exec(version);
+  return Boolean(match && Number(match[1]) >= minimumMinor);
 }
 
 function assertWorkspaceAvailable(workspace: string): void {

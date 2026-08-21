@@ -51,6 +51,9 @@ import {
   type CodexSessionInfo,
   type CodexSessionService,
   type CodexStatusDetails,
+  type CodexThreadConnectionCheck,
+  type CodexToolUserInputRequest,
+  type CodexToolUserInputResponse,
   type CodexTurnRecoveryItem,
 } from "./codex-session.js";
 import { checkAuthStatus, clearAuthCache, startLogin, startLogout } from "./codex-auth.js";
@@ -71,6 +74,7 @@ import type { FinalResponseMode, ResponsePreviewMode, TeleCodexConfig, ToolActiv
 import { contextKeyFromCtx, isTopicContextKey, parseContextKey, type TelegramContextKey } from "./context-key.js";
 import { friendlyErrorText } from "./error-messages.js";
 import { escapeHTML, formatStreamingTelegramHTML, formatTelegramHTML } from "./format.js";
+import { redactPotentialSecrets } from "./secret-redaction.js";
 import {
   collectRuntimeDoctor,
   collectRuntimeLocks,
@@ -171,6 +175,19 @@ function buildApprovalResponse(
     scope: decision === "acceptForSession" ? "session" : "turn",
   };
 }
+
+function getAvailableApprovalDecisions(request: CodexApprovalRequest): CodexApprovalDecision[] {
+  const params = readUnknownRecord(request.params);
+  if (!Array.isArray(params?.availableDecisions)) {
+    return ["accept", "acceptForSession", "decline", "cancel"];
+  }
+
+  const decisions = params.availableDecisions.filter(
+    (value): value is CodexApprovalDecision =>
+      value === "accept" || value === "acceptForSession" || value === "decline" || value === "cancel",
+  );
+  return decisions.length > 0 ? decisions : ["cancel"];
+}
 type PendingMcpElicitation = {
   resolve: (response: CodexMcpElicitationResponse) => void;
   timeout: NodeJS.Timeout;
@@ -197,6 +214,37 @@ type QueuedPrompt = {
   chatId: TelegramChatId;
 };
 
+type QueueViewItem = {
+  id: string;
+  summary: string;
+};
+
+type QueueView = {
+  backend: "native" | "local";
+  items: QueueViewItem[];
+};
+
+type ToolUserInputQuestion = {
+  id: string;
+  header: string;
+  question: string;
+  isOther: boolean;
+  options: Array<{ label: string; description: string }>;
+};
+
+type PendingToolUserInput = {
+  resolve: (response: CodexToolUserInputResponse) => void;
+  timeout: NodeJS.Timeout;
+  contextKey: TelegramContextKey | null;
+  chatId: TelegramChatId;
+  messageThreadId?: number;
+  questions: ToolUserInputQuestion[];
+  answers: Record<string, { answers: string[] }>;
+  index: number;
+  awaitingText: boolean;
+  isBlocking: boolean;
+};
+
 type SessionWorkspaceGroup = {
   workspace: string;
   sessions: CodexThreadRecord[];
@@ -209,6 +257,13 @@ type SessionSelectionPanel = {
   contextKey: TelegramContextKey;
   sessions: CodexThreadRecord[];
   activeThreadId?: string;
+};
+
+type SessionConnectionCheckView = {
+  record: CodexThreadRecord;
+  result?: CodexThreadConnectionCheck;
+  state: "ready" | "locked" | "busy" | "failed";
+  detail?: string;
 };
 
 type ToolState = {
@@ -316,6 +371,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   const pendingApprovalRequests = new Map<string, Promise<CodexApprovalResponse>>();
   const pendingMcpElicitations = new Map<string, PendingMcpElicitation>();
   const pendingMcpFormByContext = new Map<TelegramContextKey, string>();
+  const pendingToolUserInputs = new Map<string, PendingToolUserInput>();
+  const pendingToolUserInputByContext = new Map<TelegramContextKey, string>();
   const lastPromptInput = new Map<TelegramContextKey, CodexPromptInput>();
   const promptQueues = new Map<TelegramContextKey, QueuedPrompt[]>();
   const compactAbortControllers = new Map<TelegramContextKey, AbortController>();
@@ -510,7 +567,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     return queue;
   };
 
-  const enqueuePrompt = (
+  const enqueueLocalPrompt = (
     contextKey: TelegramContextKey,
     ctx: Context,
     chatId: TelegramChatId,
@@ -533,23 +590,89 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     return queuedPrompt;
   };
 
-  const renderQueueStatus = (contextKey: TelegramContextKey): { html: string; plain: string } => {
-    const queue = getPromptQueue(contextKey);
-    if (queue.length === 0) {
+  const getQueueView = async (
+    contextKey: TelegramContextKey,
+    session: CodexSessionService,
+  ): Promise<QueueView> => {
+    const local = promptQueues.get(contextKey) ?? [];
+    const native = await session.listQueuedPrompts().catch(() => ({ supported: false as const, items: [] }));
+    if (native.supported && (native.items.length > 0 || local.length === 0)) {
       return {
-        html: "Queue is empty.\n\nUse <code>/queue &lt;prompt&gt;</code> while Codex is working.",
-        plain: "Queue is empty.\n\nUse /queue <prompt> while Codex is working.",
+        backend: "native",
+        items: native.items.map((item) => ({ id: item.id, summary: redactPotentialSecrets(item.summary) })),
+      };
+    }
+    return {
+      backend: "local",
+      items: local.map((item) => ({ id: String(item.id), summary: item.summary })),
+    };
+  };
+
+  const enqueuePrompt = async (
+    contextKey: TelegramContextKey,
+    ctx: Context,
+    chatId: TelegramChatId,
+    session: CodexSessionService,
+    input: string,
+  ): Promise<{ id: string; summary: string; position: number; backend: "native" | "local" } | null> => {
+    if (session.isProcessing()) {
+      const native = await session.listQueuedPrompts().catch(() => ({ supported: false as const, items: [] }));
+      if (native.supported) {
+        if (native.items.length >= MAX_PROMPT_QUEUE_SIZE) {
+          return null;
+        }
+        const queued = await session.addQueuedPrompt(input);
+        return {
+          id: queued.id,
+          summary: redactPotentialSecrets(queued.summary),
+          position: native.items.length + 1,
+          backend: "native",
+        };
+      }
+    }
+
+    const queued = enqueueLocalPrompt(contextKey, ctx, chatId, input);
+    if (!queued) {
+      return null;
+    }
+    return {
+      id: String(queued.id),
+      summary: queued.summary,
+      position: getPromptQueue(contextKey).findIndex((item) => item.id === queued.id) + 1,
+      backend: "local",
+    };
+  };
+
+  const renderQueueStatus = (queue: QueueView): { html: string; plain: string } => {
+    if (queue.items.length === 0) {
+      return {
+        html: `Queue is empty.\n\nBackend: <code>${queue.backend}</code>\nUse <code>/queue &lt;prompt&gt;</code> while Codex is working.`,
+        plain: `Queue is empty.\n\nBackend: ${queue.backend}\nUse /queue <prompt> while Codex is working.`,
       };
     }
 
-    const htmlLines = [`<b>Queued prompts:</b> <code>${queue.length}/${MAX_PROMPT_QUEUE_SIZE}</code>`];
-    const plainLines = [`Queued prompts: ${queue.length}/${MAX_PROMPT_QUEUE_SIZE}`];
-    queue.forEach((item, index) => {
+    const htmlLines = [
+      `<b>Queued prompts:</b> <code>${queue.items.length}/${MAX_PROMPT_QUEUE_SIZE}</code>`,
+      `<b>Backend:</b> <code>${queue.backend}</code>`,
+    ];
+    const plainLines = [
+      `Queued prompts: ${queue.items.length}/${MAX_PROMPT_QUEUE_SIZE}`,
+      `Backend: ${queue.backend}`,
+    ];
+    queue.items.forEach((item, index) => {
       htmlLines.push(`${index + 1}. <code>#${item.id}</code> ${escapeHTML(item.summary)}`);
       plainLines.push(`${index + 1}. #${item.id} ${item.summary}`);
     });
-    htmlLines.push("", "Use <code>/queue clear</code> to empty the queue.");
-    plainLines.push("", "Use /queue clear to empty the queue.");
+    htmlLines.push(
+      "",
+      "Use <code>/queue edit &lt;position&gt; &lt;prompt&gt;</code>, <code>/queue move &lt;from&gt; &lt;to&gt;</code>, or <code>/queue pop &lt;position&gt;</code>.",
+      "Use <code>/queue clear</code> to empty the queue.",
+    );
+    plainLines.push(
+      "",
+      "Use /queue edit <position> <prompt>, /queue move <from> <to>, or /queue pop <position>.",
+      "Use /queue clear to empty the queue.",
+    );
     return { html: htmlLines.join("\n"), plain: plainLines.join("\n") };
   };
 
@@ -836,12 +959,23 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
           plain: `Approval request restored after reconnect\n\n${rendered.plain}`,
         }
       : rendered;
-    const keyboard = new InlineKeyboard()
-      .text("Allow once", `approval:${approvalId}:accept`)
-      .text("Allow session", `approval:${approvalId}:acceptForSession`)
-      .row()
-      .text("Deny", `approval:${approvalId}:decline`)
-      .text("Cancel", `approval:${approvalId}:cancel`);
+    const availableDecisions = getAvailableApprovalDecisions(request);
+    const keyboard = new InlineKeyboard();
+    if (availableDecisions.includes("accept")) {
+      keyboard.text("Allow once", `approval:${approvalId}:accept`);
+    }
+    if (availableDecisions.includes("acceptForSession")) {
+      keyboard.text("Allow session", `approval:${approvalId}:acceptForSession`);
+    }
+    if (availableDecisions.includes("accept") || availableDecisions.includes("acceptForSession")) {
+      keyboard.row();
+    }
+    if (availableDecisions.includes("decline")) {
+      keyboard.text("Deny", `approval:${approvalId}:decline`);
+    }
+    if (availableDecisions.includes("cancel")) {
+      keyboard.text("Cancel", `approval:${approvalId}:cancel`);
+    }
 
     const sent = await sendTextMessage(bot.api, chatId, text.html, {
       parseMode: "HTML",
@@ -1120,6 +1254,181 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     });
   };
 
+  const finishPendingToolUserInput = (
+    pendingId: string,
+    response: CodexToolUserInputResponse,
+  ): void => {
+    const pending = pendingToolUserInputs.get(pendingId);
+    if (!pending) return;
+    pendingToolUserInputs.delete(pendingId);
+    if (pending.contextKey) {
+      pendingToolUserInputByContext.delete(pending.contextKey);
+    }
+    clearTimeout(pending.timeout);
+    pending.resolve(response);
+  };
+
+  const sendPendingToolUserInputQuestion = async (
+    pendingId: string,
+    pending: PendingToolUserInput,
+  ): Promise<void> => {
+    const question = pending.questions[pending.index];
+    if (!question) {
+      finishPendingToolUserInput(pendingId, { answers: pending.answers });
+      return;
+    }
+
+    const lines = [
+      `<b>❓ ${escapeHTML(question.header)}</b>`,
+      escapeHTML(question.question),
+      `<i>${pending.index + 1}/${pending.questions.length} · ${pending.isBlocking ? "blocking" : "non-blocking"}</i>`,
+    ];
+    if (question.options.length === 0) {
+      pending.awaitingText = true;
+      if (pending.contextKey) {
+        pendingToolUserInputByContext.set(pending.contextKey, pendingId);
+      }
+      await bot.api.sendMessage(pending.chatId, lines.join("\n"), {
+        parse_mode: "HTML",
+        ...(pending.messageThreadId ? { message_thread_id: pending.messageThreadId } : {}),
+        reply_markup: {
+          force_reply: true,
+          selective: true,
+          input_field_placeholder: question.header.slice(0, 64),
+        },
+      });
+      return;
+    }
+
+    pending.awaitingText = false;
+    const keyboard = new InlineKeyboard();
+    question.options.forEach((option, index) => {
+      keyboard.text(option.label.slice(0, 40), `toolinput:${pendingId}:${index}`);
+      keyboard.row();
+    });
+    if (question.isOther) {
+      keyboard.text("Other", `toolinput:${pendingId}:other`).row();
+    }
+    keyboard.text("Cancel", `toolinput:${pendingId}:cancel`);
+    await sendTextMessage(bot.api, pending.chatId, lines.join("\n"), {
+      fallbackText: [
+        question.header,
+        question.question,
+        `${pending.index + 1}/${pending.questions.length} · ${pending.isBlocking ? "blocking" : "non-blocking"}`,
+      ].join("\n"),
+      messageThreadId: pending.messageThreadId,
+      replyMarkup: keyboard,
+    });
+  };
+
+  const requestTelegramToolUserInput = async (
+    ctx: Context,
+    chatId: TelegramChatId,
+    messageThreadId: number | undefined,
+    request: CodexToolUserInputRequest,
+  ): Promise<CodexToolUserInputResponse> => {
+    const params = request.params && typeof request.params === "object"
+      ? request.params as Record<string, unknown>
+      : undefined;
+    const rawQuestions = Array.isArray(params?.questions) ? params.questions.slice(0, 3) : [];
+    const questions: ToolUserInputQuestion[] = [];
+    for (const value of rawQuestions) {
+      if (!value || typeof value !== "object") continue;
+      const question = value as Record<string, unknown>;
+      const id = typeof question.id === "string" ? question.id : undefined;
+      const header = typeof question.header === "string" ? question.header : undefined;
+      const prompt = typeof question.question === "string" ? question.question : undefined;
+      if (!id || !header || !prompt || question.isSecret === true) continue;
+      const options = Array.isArray(question.options)
+        ? question.options.slice(0, 3).flatMap((option) => {
+            if (!option || typeof option !== "object") return [];
+            const record = option as Record<string, unknown>;
+            return typeof record.label === "string" && typeof record.description === "string"
+              ? [{ label: record.label, description: record.description }]
+              : [];
+          })
+        : [];
+      questions.push({
+        id,
+        header: header.slice(0, 64),
+        question: prompt.slice(0, 500),
+        isOther: question.isOther === true,
+        options,
+      });
+    }
+    if (questions.length === 0) {
+      await sendTextMessage(bot.api, chatId, "<b>⚠️ User input cancelled safely</b>\nThe request was empty, unsupported, or marked secret.", {
+        fallbackText: "User input cancelled safely: empty, unsupported, or secret request.",
+        messageThreadId,
+      });
+      return { answers: {} };
+    }
+
+    const contextKey = contextKeyFromCtx(ctx);
+    const previousId = contextKey ? pendingToolUserInputByContext.get(contextKey) : undefined;
+    if (previousId) {
+      finishPendingToolUserInput(previousId, { answers: {} });
+    }
+    const isBlocking = params?.isBlocking !== false;
+    const requestedTimeout = typeof params?.autoResolutionMs === "number" ? params.autoResolutionMs : undefined;
+    const timeoutMs = isBlocking
+      ? 10 * 60 * 1000
+      : Math.min(Math.max(requestedTimeout ?? 60_000, 1_000), 5 * 60 * 1000);
+    const pendingId = randomUUID();
+    return new Promise<CodexToolUserInputResponse>((resolve) => {
+      const timeout = setTimeout(() => {
+        finishPendingToolUserInput(pendingId, { answers: {} });
+      }, timeoutMs);
+      const pending: PendingToolUserInput = {
+        resolve,
+        timeout,
+        contextKey,
+        chatId,
+        messageThreadId,
+        questions,
+        answers: {},
+        index: 0,
+        awaitingText: false,
+        isBlocking,
+      };
+      pendingToolUserInputs.set(pendingId, pending);
+      if (contextKey) {
+        pendingToolUserInputByContext.set(contextKey, pendingId);
+      }
+      void sendPendingToolUserInputQuestion(pendingId, pending).catch(() => {
+        finishPendingToolUserInput(pendingId, { answers: {} });
+      });
+    });
+  };
+
+  const handlePendingToolUserInputText = async (ctx: Context, userText: string): Promise<boolean> => {
+    const contextKey = contextKeyFromCtx(ctx);
+    if (!contextKey) return false;
+    const pendingId = pendingToolUserInputByContext.get(contextKey);
+    const pending = pendingId ? pendingToolUserInputs.get(pendingId) : undefined;
+    const question = pending?.questions[pending.index];
+    if (!pendingId || !pending || !question || !pending.awaitingText) {
+      return false;
+    }
+    const value = userText.trim();
+    if (value.toLowerCase() === "/cancel") {
+      finishPendingToolUserInput(pendingId, { answers: {} });
+      await safeReply(ctx, "User input cancelled.", { fallbackText: "User input cancelled." });
+      return true;
+    }
+    if (!value || value.length > 500) {
+      await safeReply(ctx, "Reply must contain 1-500 characters.", {
+        fallbackText: "Reply must contain 1-500 characters.",
+      });
+      return true;
+    }
+    pending.answers[question.id] = { answers: [value] };
+    pending.index += 1;
+    pending.awaitingText = false;
+    await sendPendingToolUserInputQuestion(pendingId, pending);
+    return true;
+  };
+
   const handlePendingMcpFormText = async (ctx: Context, userText: string): Promise<boolean> => {
     const contextKey = contextKeyFromCtx(ctx);
     if (!contextKey) return false;
@@ -1202,6 +1511,131 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
   };
 
+  const inspectSessionConnection = async (
+    contextKey: TelegramContextKey,
+    session: CodexSessionService,
+    requestedThreadId?: string,
+  ): Promise<SessionConnectionCheckView | undefined> => {
+    const currentWorkspace = path.resolve(session.getCurrentWorkspace());
+    const currentThreadId = session.getInfo().threadId;
+    const record = requestedThreadId
+      ? getThread(requestedThreadId) ?? undefined
+      : session
+          .listAllSessions(50)
+          .find((candidate) => candidate.id !== currentThreadId && path.resolve(candidate.cwd) === currentWorkspace);
+    if (!record || path.resolve(record.cwd) !== currentWorkspace) {
+      return undefined;
+    }
+    if (isThreadOwnedElsewhere(config.workspace, contextKey, record.id)) {
+      return { record, state: "locked" };
+    }
+
+    try {
+      const result = await session.checkThreadConnection(record.id);
+      return {
+        record,
+        result,
+        state: result.connectable ? "ready" : result.status === "active" ? "busy" : "failed",
+      };
+    } catch (error) {
+      return { record, state: "failed", detail: friendlyErrorText(error) };
+    }
+  };
+
+  const renderSessionConnectionCheck = (
+    view: SessionConnectionCheckView,
+  ): { html: string; plain: string; keyboard: InlineKeyboard } => {
+    const icon = view.state === "ready" ? "✅" : view.state === "locked" ? "🔒" : view.state === "busy" ? "⏳" : "⚠️";
+    const label = view.state === "ready"
+      ? "Ready to connect"
+      : view.state === "locked"
+        ? "Owned by another Teleco context"
+        : view.state === "busy"
+          ? "CLI or another client may still be working"
+          : "Connection check failed";
+    const title = trimLine(
+      view.record.name || view.record.title || view.record.preview || view.record.firstUserMessage || shortId(view.record.id),
+      72,
+    );
+    const status = view.result?.status ?? (view.state === "locked" ? "locked" : "unavailable");
+    const html = [
+      "<b>Session connection check</b>",
+      "",
+      `<b>${icon} ${escapeHTML(label)}</b>`,
+      `<b>Thread:</b> <code>${escapeHTML(view.record.id)}</code>`,
+      `<b>Workspace:</b> <code>${escapeHTML(view.record.cwd)}</code>`,
+      `<b>Title:</b> ${escapeHTML(title)}`,
+      `<b>Status:</b> <code>${escapeHTML(status)}</code>`,
+      view.detail ? `<b>Detail:</b> ${escapeHTML(view.detail)}` : undefined,
+    ].filter((line): line is string => Boolean(line)).join("\n");
+    const plain = [
+      "Session connection check",
+      "",
+      `${icon} ${label}`,
+      `Thread: ${view.record.id}`,
+      `Workspace: ${view.record.cwd}`,
+      `Title: ${title}`,
+      `Status: ${status}`,
+      view.detail ? `Detail: ${view.detail}` : undefined,
+    ].filter((line): line is string => Boolean(line)).join("\n");
+    const keyboard = new InlineKeyboard();
+    if (view.state === "ready") {
+      keyboard.text("Attach", `sessioncheck_attach:${view.record.id}`).row();
+    } else if (view.state !== "locked") {
+      keyboard.text("Retry check", `sessioncheck_retry:${view.record.id}`).row();
+    }
+    keyboard.text("Sessions", "cmd_sessions").text("Cancel", "ui_cancel");
+    return { html, plain, keyboard };
+  };
+
+  const showSessionConnectionCheck = async (
+    ctx: Context,
+    requestedThreadId?: string,
+    editMessageId?: number,
+  ): Promise<void> => {
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      return;
+    }
+    const { contextKey, session } = contextSession;
+    if (isBusy(contextKey)) {
+      const message = "Cannot check sessions while a prompt is running.";
+      if (editMessageId && ctx.chat?.id) {
+        await safeEditMessage(bot, ctx.chat.id, editMessageId, escapeHTML(message), { fallbackText: message });
+      } else {
+        await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+      }
+      return;
+    }
+
+    const view = await inspectSessionConnection(contextKey, session, requestedThreadId);
+    if (!view) {
+      const message = requestedThreadId
+        ? "The requested thread was not found in the current workspace."
+        : "No other recent Codex thread was found in the current workspace.";
+      const keyboard = new InlineKeyboard().text("Sessions", "cmd_sessions").text("Cancel", "ui_cancel");
+      if (editMessageId && ctx.chat?.id) {
+        await safeEditMessage(bot, ctx.chat.id, editMessageId, escapeHTML(message), {
+          fallbackText: message,
+          replyMarkup: keyboard,
+        });
+      } else {
+        await safeReply(ctx, escapeHTML(message), { fallbackText: message, replyMarkup: keyboard });
+      }
+      return;
+    }
+
+    const rendered = renderSessionConnectionCheck(view);
+    if (editMessageId && ctx.chat?.id) {
+      await safeEditMessage(bot, ctx.chat.id, editMessageId, rendered.html, {
+        fallbackText: rendered.plain,
+        replyMarkup: rendered.keyboard,
+      });
+    } else {
+      await safeReply(ctx, rendered.html, { fallbackText: rendered.plain, replyMarkup: rendered.keyboard });
+    }
+  };
+
   const handleUserPrompt = async (
     ctx: Context,
     contextKey: TelegramContextKey,
@@ -1257,6 +1691,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     let isFlushing = false;
     let flushPending = false;
     let finalized = false;
+    let threadReverted = false;
     let textDeltaQueue: Promise<void> = Promise.resolve();
     let segmentCommitQueue: Promise<void> = Promise.resolve();
     let planMessageId: number | undefined;
@@ -1994,12 +2429,13 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
           return;
         }
 
+        const safePartialResult = redactPotentialSecrets(partialResult);
         if (metadata?.kind === "diff") {
-          state.diffPreview = appendWithCap(state.diffPreview ?? "", partialResult, 3500);
+          state.diffPreview = appendWithCap(state.diffPreview ?? "", safePartialResult, 3500);
           return;
         }
 
-        state.partialResult = appendWithCap(state.partialResult, partialResult, TOOL_OUTPUT_PREVIEW_LIMIT);
+        state.partialResult = appendWithCap(state.partialResult, safePartialResult, TOOL_OUTPUT_PREVIEW_LIMIT);
         scheduleToolUpdate(toolCallId);
       },
       onToolEnd: (toolCallId: string, isError: boolean) => {
@@ -2114,7 +2550,21 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       },
       onApprovalRequest: (request) => requestTelegramApproval(ctx, chatId, messageThreadId, request),
       onMcpElicitationRequest: (request) => requestTelegramMcpElicitation(ctx, chatId, messageThreadId, request),
-      onAgentEnd: () => undefined,
+      onToolUserInputRequest: (request) => requestTelegramToolUserInput(ctx, chatId, messageThreadId, request),
+      onThreadReverted: () => {
+        threadReverted = true;
+        accumulatedText = "";
+        currentAgentMessageId = undefined;
+        setActiveOperationDeliveryState(config, activeOperationId, "cancelled");
+        finishActiveOperation(config, activeOperationId, "aborted");
+        activeOperationFinished = true;
+      },
+      onAgentEnd: () => {
+        if (threadReverted) {
+          return;
+        }
+        void commitAssistantSegmentAtToolBoundary("turn_complete");
+      },
     };
 
     try {
@@ -2146,6 +2596,19 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         return;
       }
 
+      try {
+        const connectionCheck = await session.checkPendingFirstPromptConnection();
+        if (connectionCheck && !connectionCheck.connectable) {
+          const message = `First prompt blocked: thread status is ${connectionCheck.status}. Run /session_check and retry.`;
+          await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+          return;
+        }
+      } catch (error) {
+        const message = `First prompt blocked: session connection check failed. ${friendlyErrorText(error)}`;
+        await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+        return;
+      }
+
       const operation = startActiveOperation(config, {
         contextKey,
         chatId,
@@ -2157,6 +2620,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       });
       activeOperationId = operation.id;
       await session.prompt(userInput, callbacks);
+      if (threadReverted) {
+        await safeReply(ctx, "<b>Conversation history reverted.</b>\nThe stale in-flight response was discarded.", {
+          fallbackText: "Conversation history reverted.\nThe stale in-flight response was discarded.",
+        });
+        return;
+      }
       updateSessionMetadata(contextKey, session);
       updateActiveOperation(config, activeOperationId, {
         threadId: session.getInfo().threadId,
@@ -2173,7 +2642,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
             messageThreadId,
             operationId: activeOperationId,
             kind: "live-final",
-            payload: buildFinalResponseText(accumulatedText),
+            payload: buildFinalResponseText(redactPotentialSecrets(accumulatedText)),
           })
         : "send";
       try {
@@ -2382,7 +2851,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const busy = isBusy(contextKey);
     const processing = session.isProcessing();
     const busyState = getBusyState(contextKey);
-    const queueCount = promptQueues.get(contextKey)?.length ?? 0;
+    const queueCount = (await getQueueView(contextKey, session)).items.length;
     const compactState = busyState.compacting ? "running" : "ready";
     const runtimeStatus = session.getRuntimeStatus();
     const runtimeBackend = runtimeStatus.backend === "app-server" ? "app-server" : "SDK fallback";
@@ -3295,16 +3764,86 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const lowerArgs = rawArgs.toLowerCase();
 
     if (!rawArgs) {
-      const rendered = renderQueueStatus(contextKey);
+      const rendered = renderQueueStatus(await getQueueView(contextKey, session));
       await safeReply(ctx, rendered.html, { fallbackText: rendered.plain });
       return;
     }
 
     if (lowerArgs === "clear") {
-      const count = promptQueues.get(contextKey)?.length ?? 0;
-      promptQueues.delete(contextKey);
+      const queue = await getQueueView(contextKey, session);
+      const count = queue.items.length;
+      if (queue.backend === "native") {
+        await session.clearQueuedPrompts();
+      } else {
+        promptQueues.delete(contextKey);
+      }
       await safeReply(ctx, escapeHTML(`Cleared ${count} queued prompt${count === 1 ? "" : "s"}.`), {
         fallbackText: `Cleared ${count} queued prompt${count === 1 ? "" : "s"}.`,
+      });
+      return;
+    }
+
+    const editMatch = rawArgs.match(/^edit\s+(\d+)\s+([\s\S]+)$/i);
+    if (editMatch) {
+      const index = Number.parseInt(editMatch[1] ?? "", 10) - 1;
+      const input = editMatch[2]?.trim() ?? "";
+      const view = await getQueueView(contextKey, session);
+      const queued = index >= 0 ? view.items[index] : undefined;
+      if (!queued || !input) {
+        await safeReply(ctx, escapeHTML("Usage: /queue edit <position> <prompt>"), {
+          fallbackText: "Usage: /queue edit <position> <prompt>",
+        });
+        return;
+      }
+      if (view.backend === "native") {
+        await session.updateQueuedPrompt(queued.id, input);
+      } else {
+        const local = promptQueues.get(contextKey)?.[index];
+        if (!local) {
+          await safeReply(ctx, escapeHTML("No queued prompt at that position."), {
+            fallbackText: "No queued prompt at that position.",
+          });
+          return;
+        }
+        local.input = input;
+        local.summary = truncateForChannelHeader(input.replace(/\s+/g, " ").trim(), 120);
+      }
+      const summary = truncateForChannelHeader(input.replace(/\s+/g, " ").trim(), 120);
+      await safeReply(ctx, `<b>Updated queued prompt ${index + 1}</b>\n<code>${escapeHTML(summary)}</code>`, {
+        fallbackText: `Updated queued prompt ${index + 1}\n${summary}`,
+      });
+      return;
+    }
+
+    const moveMatch = lowerArgs.match(/^move\s+(\d+)\s+(\d+)$/);
+    if (moveMatch) {
+      const from = Number.parseInt(moveMatch[1] ?? "", 10) - 1;
+      const to = Number.parseInt(moveMatch[2] ?? "", 10) - 1;
+      const view = await getQueueView(contextKey, session);
+      if (from < 0 || to < 0 || from >= view.items.length || to >= view.items.length) {
+        await safeReply(ctx, escapeHTML("Usage: /queue move <from> <to> (positions must exist)"), {
+          fallbackText: "Usage: /queue move <from> <to> (positions must exist)",
+        });
+        return;
+      }
+      if (view.backend === "native") {
+        const reordered = view.items.map((item) => item.id);
+        const [moved] = reordered.splice(from, 1);
+        if (!moved) {
+          return;
+        }
+        reordered.splice(to, 0, moved);
+        await session.reorderQueuedPrompts(reordered);
+      } else {
+        const queue = promptQueues.get(contextKey) ?? [];
+        const [moved] = queue.splice(from, 1);
+        if (!moved) {
+          return;
+        }
+        queue.splice(to, 0, moved);
+      }
+      await safeReply(ctx, escapeHTML(`Moved queued prompt ${from + 1} to ${to + 1}.`), {
+        fallbackText: `Moved queued prompt ${from + 1} to ${to + 1}.`,
       });
       return;
     }
@@ -3312,16 +3851,20 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const popMatch = lowerArgs.match(/^pop\s+(\d+)$/);
     if (popMatch) {
       const index = Number.parseInt(popMatch[1] ?? "", 10) - 1;
-      const queue = promptQueues.get(contextKey) ?? [];
-      const [removed] = index >= 0 ? queue.splice(index, 1) : [];
-      if (queue.length === 0) {
-        promptQueues.delete(contextKey);
-      }
+      const view = await getQueueView(contextKey, session);
+      const removed = index >= 0 ? view.items[index] : undefined;
       if (!removed) {
         await safeReply(ctx, escapeHTML("No queued prompt at that position."), {
           fallbackText: "No queued prompt at that position.",
         });
         return;
+      }
+      if (view.backend === "native") {
+        await session.deleteQueuedPrompt(removed.id);
+      } else {
+        const queue = promptQueues.get(contextKey) ?? [];
+        queue.splice(index, 1);
+        if (queue.length === 0) promptQueues.delete(contextKey);
       }
       await safeReply(ctx, `<b>Removed queued prompt #${removed.id}</b>\n<code>${escapeHTML(removed.summary)}</code>`, {
         fallbackText: `Removed queued prompt #${removed.id}\n${removed.summary}`,
@@ -3335,7 +3878,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return;
     }
 
-    const queued = enqueuePrompt(contextKey, ctx, chatId, rawArgs);
+    const queued = await enqueuePrompt(contextKey, ctx, chatId, session, rawArgs);
     if (!queued) {
       await safeReply(ctx, escapeHTML(`Queue is full (${MAX_PROMPT_QUEUE_SIZE}/${MAX_PROMPT_QUEUE_SIZE}).`), {
         fallbackText: `Queue is full (${MAX_PROMPT_QUEUE_SIZE}/${MAX_PROMPT_QUEUE_SIZE}).`,
@@ -3343,9 +3886,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return;
     }
 
-    const position = getPromptQueue(contextKey).findIndex((item) => item.id === queued.id) + 1;
-    await safeReply(ctx, `<b>Queued prompt #${queued.id}</b> position <code>${position}</code>`, {
-      fallbackText: `Queued prompt #${queued.id} position ${position}`,
+    await safeReply(ctx, `<b>Queued prompt #${queued.id}</b> position <code>${queued.position}</code>\n<code>${queued.backend}</code>`, {
+      fallbackText: `Queued prompt #${queued.id} position ${queued.position}\n${queued.backend}`,
     });
   });
 
@@ -3400,7 +3942,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const { contextKey, session } = contextSession;
     if (isBusy(contextKey)) {
-      const queued = enqueuePrompt(contextKey, ctx, chatId, rawArgs);
+      const queued = await enqueuePrompt(contextKey, ctx, chatId, session, rawArgs);
       if (!queued) {
         await safeReply(ctx, escapeHTML(`Queue is full (${MAX_PROMPT_QUEUE_SIZE}/${MAX_PROMPT_QUEUE_SIZE}).`), {
           fallbackText: `Queue is full (${MAX_PROMPT_QUEUE_SIZE}/${MAX_PROMPT_QUEUE_SIZE}).`,
@@ -3408,7 +3950,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         return;
       }
 
-      await safeReply(ctx, `<b>Prompt queued as #${queued.id}</b>\n<code>${escapeHTML(queued.summary)}</code>`, {
+      await safeReply(ctx, `<b>Prompt queued as #${queued.id}</b>\n<code>${escapeHTML(queued.summary)}</code>\n<code>${queued.backend}</code>`, {
         fallbackText: `Prompt queued as #${queued.id}\n${queued.summary}`,
       });
       return;
@@ -3810,6 +4352,64 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     } catch (error) {
       await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
         fallbackText: `Failed: ${friendlyErrorText(error)}`,
+      });
+    } finally {
+      busyState.switching = false;
+    }
+  });
+
+  bot.command(["session_check", "sessioncheck", "sessionCheck"], async (ctx) => {
+    const threadId = commandArgsAny(ctx, ["session_check", "sessioncheck", "sessionCheck"]);
+    await showSessionConnectionCheck(ctx, threadId || undefined);
+  });
+
+  bot.callbackQuery(/^sessioncheck_(retry|attach):([0-9a-f-]{36})$/, async (ctx) => {
+    const action = ctx.match?.[1];
+    const threadId = ctx.match?.[2];
+    const messageId = ctx.callbackQuery.message?.message_id;
+    if (!action || !threadId || !messageId) {
+      await ctx.answerCallbackQuery();
+      return;
+    }
+    if (action === "retry") {
+      await ctx.answerCallbackQuery({ text: "Checking..." });
+      await showSessionConnectionCheck(ctx, threadId, messageId);
+      return;
+    }
+
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession || !ctx.chat?.id) {
+      await ctx.answerCallbackQuery();
+      return;
+    }
+    const { contextKey, session } = contextSession;
+    if (isBusy(contextKey)) {
+      await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
+      return;
+    }
+    const view = await inspectSessionConnection(contextKey, session, threadId);
+    if (!view || view.state !== "ready") {
+      await ctx.answerCallbackQuery({ text: "Session is not ready" });
+      await showSessionConnectionCheck(ctx, threadId, messageId);
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: "Attaching..." });
+    const busyState = getBusyState(contextKey);
+    busyState.switching = true;
+    try {
+      const info = await registry.switchSession(contextKey, session, threadId);
+      updateSessionMetadata(contextKey, session);
+      await safeEditMessage(
+        bot,
+        ctx.chat.id,
+        messageId,
+        `<b>Attached to checked thread.</b>\n\n${renderSessionInfoHTML(info, instanceName)}`,
+        { fallbackText: `Attached to checked thread.\n\n${renderSessionInfoPlain(info, instanceName)}` },
+      );
+    } catch (error) {
+      await safeEditMessage(bot, ctx.chat.id, messageId, `<b>Attach failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: `Attach failed: ${friendlyErrorText(error)}`,
       });
     } finally {
       busyState.switching = false;
@@ -4727,6 +5327,48 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     await ctx.answerCallbackQuery({ text: response.action === "accept" ? "MCP input submitted" : "MCP form cancelled" });
   });
 
+  bot.callbackQuery(/^toolinput:([^:]+):(\d+|other|cancel)$/, async (ctx) => {
+    const pendingId = ctx.match?.[1];
+    const selection = ctx.match?.[2];
+    const pending = pendingId ? pendingToolUserInputs.get(pendingId) : undefined;
+    const question = pending?.questions[pending.index];
+    if (!pendingId || !selection || !pending || !question) {
+      await ctx.answerCallbackQuery({ text: "User input request expired" });
+      return;
+    }
+    if (pending.contextKey && contextKeyFromCtx(ctx) !== pending.contextKey) {
+      await ctx.answerCallbackQuery({ text: "This request belongs to another Telegram context" });
+      return;
+    }
+    if (selection === "cancel") {
+      finishPendingToolUserInput(pendingId, { answers: {} });
+      await ctx.answerCallbackQuery({ text: "User input cancelled" });
+      return;
+    }
+    if (selection === "other") {
+      pending.awaitingText = true;
+      if (pending.contextKey) pendingToolUserInputByContext.set(pending.contextKey, pendingId);
+      await ctx.answerCallbackQuery({ text: "Reply with a custom value" });
+      await bot.api.sendMessage(pending.chatId, `<b>Reply with another value for ${escapeHTML(question.header)}</b>`, {
+        parse_mode: "HTML",
+        ...(pending.messageThreadId ? { message_thread_id: pending.messageThreadId } : {}),
+        reply_markup: { force_reply: true, selective: true },
+      });
+      return;
+    }
+
+    const index = Number.parseInt(selection, 10);
+    const option = question.options[index];
+    if (!option) {
+      await ctx.answerCallbackQuery({ text: "Invalid selection" });
+      return;
+    }
+    pending.answers[question.id] = { answers: [option.label] };
+    pending.index += 1;
+    await ctx.answerCallbackQuery({ text: option.label.slice(0, 80) });
+    await sendPendingToolUserInputQuestion(pendingId, pending);
+  });
+
   bot.callbackQuery(/^sessws_(\d+)$/, async (ctx) => {
     const chatId = ctx.chat?.id;
     const messageId = ctx.callbackQuery.message?.message_id;
@@ -5450,6 +6092,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return;
     }
 
+    if (await handlePendingToolUserInputText(ctx, userText)) {
+      return;
+    }
+
     if (await handlePendingMcpFormText(ctx, userText)) {
       return;
     }
@@ -5468,7 +6114,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const promptText = addReplyContext(ctx, userText);
     const busyState = getBusyState(contextKey);
     if (busyState.compacting) {
-      const queued = enqueuePrompt(contextKey, ctx, ctx.chat.id, promptText);
+      const queued = await enqueuePrompt(contextKey, ctx, ctx.chat.id, session, promptText);
       if (!queued) {
         await safeReply(ctx, escapeHTML(`Queue is full (${MAX_PROMPT_QUEUE_SIZE}/${MAX_PROMPT_QUEUE_SIZE}).`), {
           fallbackText: `Queue is full (${MAX_PROMPT_QUEUE_SIZE}/${MAX_PROMPT_QUEUE_SIZE}).`,
@@ -5476,9 +6122,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         return;
       }
 
-      const position = getPromptQueue(contextKey).findIndex((item) => item.id === queued.id) + 1;
-      await safeReply(ctx, `<b>Queued during compact #${queued.id}</b> position <code>${position}</code>`, {
-        fallbackText: `Queued during compact #${queued.id} position ${position}`,
+      await safeReply(ctx, `<b>Queued during compact #${queued.id}</b> position <code>${queued.position}</code>`, {
+        fallbackText: `Queued during compact #${queued.id} position ${queued.position}`,
       });
       return;
     }
@@ -5782,6 +6427,7 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "compact", description: "Compact controls" },
     { command: "session", description: "Current thread details" },
     { command: "sessions", description: "Browse & switch threads" },
+    { command: "session_check", description: "Check CLI thread connection" },
     { command: "attach", description: "Bind a Codex thread to this topic" },
     { command: "handback", description: "Hand thread to Codex CLI" },
     { command: "retry", description: "Resend the last prompt" },
@@ -6154,10 +6800,23 @@ function renderMobileStatus(options: {
   const mcp = details.mcp
     ? `${details.mcp.total} server${details.mcp.total === 1 ? "" : "s"}${
         details.mcp.authenticationRequired > 0 ? ` · ${details.mcp.authenticationRequired} auth required` : ""
+      }${
+        details.mcp.unknownAuthentication > 0 ? ` · ${details.mcp.unknownAuthentication} auth unknown` : ""
       }`
+    : undefined;
+  const plugins = details.plugins
+    ? `${details.plugins.total} found · ${details.plugins.installed} installed${
+        details.plugins.disabled > 0 ? ` · ${details.plugins.disabled} disabled` : ""
+      }${details.plugins.loadErrors > 0 ? ` · ${details.plugins.loadErrors} load errors` : ""}`
     : undefined;
   const limits = formatRateLimitsCompact(details.rateLimits);
   const usage = details.accountUsage ? formatAccountUsageCompact(details.accountUsage) : undefined;
+  const threadUsage = details.threadUsage
+    ? `${formatDecimal(details.threadUsage.estimatedCredits)} credits${
+        details.threadUsage.estimatedUsd === undefined ? "" : ` · $${formatDecimal(details.threadUsage.estimatedUsd)}`
+      } estimated`
+    : undefined;
+  const effectivePermission = `${info.sandboxMode} / ${info.approvalPolicy}`;
 
   const plainLines = [
     "Codex status",
@@ -6172,12 +6831,15 @@ function renderMobileStatus(options: {
     `Model: ${model}`,
     `Fast: ${fastMode}`,
     `Context: ${context}`,
+    threadUsage ? `Estimated usage: ${threadUsage}` : undefined,
     "",
     "Runtime",
     `State: ${options.runtime} · ${options.runtimeBackend}`,
     `App-server: ${appServer}`,
     mcp ? `MCP: ${mcp}` : undefined,
+    plugins ? `Plugins: ${plugins}` : undefined,
     `Launch: ${info.launchProfileLabel} · ${info.launchProfileBehavior}`,
+    `Effective permission: ${effectivePermission}`,
     `Compact: ${options.compactState} · Approval: ${approvals}`,
     details.thread?.approvalsReviewer ? `Reviewer: ${details.thread.approvalsReviewer}` : undefined,
     agents ? `Agents: ${agents}` : undefined,
@@ -6199,12 +6861,15 @@ function renderMobileStatus(options: {
     `<b>Model:</b> <code>${escapeHTML(model)}</code>`,
     `<b>Fast:</b> <code>${escapeHTML(fastMode)}</code>`,
     `<b>Context:</b> <code>${escapeHTML(context)}</code>`,
+    threadUsage ? `<b>Estimated usage:</b> <code>${escapeHTML(threadUsage)}</code>` : undefined,
     "",
     "<b>Runtime</b>",
     `<b>State:</b> <code>${escapeHTML(options.runtime)} · ${escapeHTML(options.runtimeBackend)}</code>`,
     `<b>App-server:</b> <code>${escapeHTML(appServer)}</code>`,
     mcp ? `<b>MCP:</b> <code>${escapeHTML(mcp)}</code>` : undefined,
+    plugins ? `<b>Plugins:</b> <code>${escapeHTML(plugins)}</code>` : undefined,
     `<b>Launch:</b> <code>${escapeHTML(`${info.launchProfileLabel} · ${info.launchProfileBehavior}`)}</code>`,
+    `<b>Effective permission:</b> <code>${escapeHTML(effectivePermission)}</code>`,
     `<b>Compact:</b> <code>${escapeHTML(options.compactState)}</code> · <b>Approval:</b> <code>${escapeHTML(approvals)}</code>`,
     details.thread?.approvalsReviewer
       ? `<b>Reviewer:</b> <code>${escapeHTML(details.thread.approvalsReviewer)}</code>`
@@ -6331,7 +6996,7 @@ function renderLaunchSummaryHTML(info: CodexSessionInfo): string {
 }
 
 function formatResponseSegment(text: string): string {
-  const body = text.replace(/^\s*\n+/, "").trimEnd();
+  const body = redactPotentialSecrets(text).replace(/^\s*\n+/, "").trimEnd();
   return body ? `${RESPONSE_HEADER}\n\n${body}` : "";
 }
 
@@ -6415,7 +7080,7 @@ function renderToolStartMessage(toolName: string): RenderedText {
 }
 
 function renderToolRunningMessage(toolName: string, partialResult: string): RenderedText {
-  const preview = summarizeToolOutput(partialResult);
+  const preview = summarizeToolOutput(redactPotentialSecrets(partialResult));
   const label = formatToolDisplayLabel(toolName);
   const detail = renderToolDetail(label);
   const htmlLines = [`<b>${escapeHTML(label.icon)} ${escapeHTML(label.title)}:</b>`, detail.html];
@@ -6434,7 +7099,7 @@ function renderToolRunningMessage(toolName: string, partialResult: string): Rend
 }
 
 function renderToolDiffPreview(diffPreview: string): RenderedText {
-  const preview = limitToolDiffPreview(diffPreview);
+  const preview = limitToolDiffPreview(redactPotentialSecrets(diffPreview));
   return {
     text: `<b>📝 Diff preview</b>\n<pre>${escapeHTML(preview)}</pre>`,
     fallbackText: `📝 Diff preview\n\n\`\`\`diff\n${preview}\n\`\`\``,
@@ -6444,7 +7109,7 @@ function renderToolDiffPreview(diffPreview: string): RenderedText {
 
 function renderToolEndMessage(toolName: string, partialResult: string, isError: boolean): RenderedText {
   const label = formatToolDisplayLabel(toolName);
-  const preview = summarizeToolOutput(partialResult) || (label.kind === "file_change" && !isError ? "details unavailable" : "");
+  const preview = summarizeToolOutput(redactPotentialSecrets(partialResult)) || (label.kind === "file_change" && !isError ? "details unavailable" : "");
   const status = formatToolCompletionStatus(label, isError);
   const detail = renderToolDetail(label);
   const htmlLines = [renderToolCompletionHeaderHTML(label, status)];
@@ -6500,6 +7165,9 @@ function formatToolCompletionStatus(
     if (label.kind === "mcp") {
       return { icon: "❌", title: "MCP tool failed" };
     }
+    if (label.kind === "plugin") {
+      return { icon: "❌", title: "Plugin command failed" };
+    }
     if (label.kind === "dynamic") {
       return { icon: "❌", title: "Dynamic tool failed" };
     }
@@ -6526,6 +7194,9 @@ function formatToolCompletionStatus(
   }
   if (label.kind === "mcp") {
     return { icon: "✅", title: "MCP tool done" };
+  }
+  if (label.kind === "plugin") {
+    return { icon: "✅", title: "Plugin command done" };
   }
   if (label.kind === "dynamic") {
     return { icon: "✅", title: "Dynamic tool done" };
@@ -6590,6 +7261,11 @@ export function formatToolDisplayLabel(toolName: string): { icon: string; title:
     return { icon: "🧩", title: "MCP tool", kind: "mcp", detail: `${server}/${tool}` };
   }
 
+  if (toolName.startsWith("plugin:")) {
+    const descriptor = toolName.slice("plugin:".length);
+    return { icon: "🔌", title: "Plugin command", kind: "plugin", detail: descriptor || "plugin" };
+  }
+
   if (toolName.startsWith("dynamic:")) {
     const descriptor = toolName.slice("dynamic:".length);
     const [namespace = "tool", tool = descriptor] = descriptor.split("/");
@@ -6624,16 +7300,17 @@ export function formatToolDisplayLabel(toolName: string): { icon: string; title:
 }
 
 function renderToolDetail(label: { kind: string; detail: string }): { html: string; plain: string } {
+  const detail = redactPotentialSecrets(label.detail);
   if (shouldRenderToolDetailBlock(label)) {
     return {
-      html: `<pre>${escapeHTML(label.detail)}</pre>`,
-      plain: `\`\`\`\n${label.detail}\n\`\`\``,
+      html: `<pre>${escapeHTML(detail)}</pre>`,
+      plain: `\`\`\`\n${detail}\n\`\`\``,
     };
   }
 
   return {
-    html: `<code>${escapeHTML(label.detail)}</code>`,
-    plain: `\`${label.detail}\``,
+    html: `<code>${escapeHTML(detail)}</code>`,
+    plain: `\`${detail}\``,
   };
 }
 
@@ -6722,6 +7399,10 @@ export function summarizeToolName(toolName: string): string {
 
   if (toolName.startsWith("subagent:")) {
     return "subagent";
+  }
+
+  if (toolName.startsWith("plugin:")) {
+    return "plugin";
   }
 
   if (toolName.startsWith("hook:")) {
@@ -6874,6 +7555,7 @@ export function fingerprintApprovalRequest(request: CodexApprovalRequest, instan
     itemId: params.itemId,
     approvalId: params.approvalId,
     command: params.command,
+    commandActions: params.commandActions,
     cwd: params.cwd,
     sandbox: params.sandbox,
     sandboxMode: params.sandboxMode,
@@ -6886,6 +7568,8 @@ export function fingerprintApprovalRequest(request: CodexApprovalRequest, instan
     additionalPermissions: params.additionalPermissions,
     networkApprovalContext: params.networkApprovalContext,
     availableDecisions: params.availableDecisions,
+    proposedExecpolicyAmendment: params.proposedExecpolicyAmendment,
+    proposedNetworkPolicyAmendments: params.proposedNetworkPolicyAmendments,
   };
   return createHash("sha256")
     .update(instanceName)
@@ -6981,9 +7665,13 @@ function approvalMethodLabel(method: string): string {
 function renderApprovalRequest(request: CodexApprovalRequest): { html: string; plain: string } {
   const params = readUnknownRecord(request.params);
   const command = readUnknownString(params?.command);
+  const commandActions = summarizeApprovalCommandActions(params?.commandActions);
   const cwd = readUnknownString(params?.cwd);
   const reason = readUnknownString(params?.reason);
   const grantRoot = readUnknownString(params?.grantRoot);
+  const networkContext = readUnknownRecord(params?.networkApprovalContext);
+  const networkHost = readUnknownString(networkContext?.host);
+  const networkProtocol = readUnknownString(networkContext?.protocol);
   const title =
     request.method === "item/commandExecution/requestApproval"
       ? "Codex approval requested: command"
@@ -6992,12 +7680,13 @@ function renderApprovalRequest(request: CodexApprovalRequest): { html: string; p
         : request.method === "item/permissions/requestApproval"
           ? "Codex approval requested: permission"
           : "Codex approval requested";
-  const detail = command ?? grantRoot ?? reason ?? request.method;
+  const detail = redactPotentialSecrets(command ?? commandActions ?? grantRoot ?? reason ?? request.method);
 
   const plain = [
     title,
     cwd ? `cwd: ${cwd}` : undefined,
-    reason ? `reason: ${reason}` : undefined,
+    reason ? `reason: ${redactPotentialSecrets(reason)}` : undefined,
+    networkHost ? `network: ${networkProtocol ? `${networkProtocol}://` : ""}${networkHost}` : undefined,
     detail ? `request: ${detail}` : undefined,
   ]
     .filter((line): line is string => Boolean(line))
@@ -7006,13 +7695,27 @@ function renderApprovalRequest(request: CodexApprovalRequest): { html: string; p
   const html = [
     `<b>${escapeHTML(title)}</b>`,
     cwd ? `<b>cwd:</b> <code>${escapeHTML(cwd)}</code>` : undefined,
-    reason ? `<b>reason:</b> <code>${escapeHTML(reason)}</code>` : undefined,
+    reason ? `<b>reason:</b> <code>${escapeHTML(redactPotentialSecrets(reason))}</code>` : undefined,
+    networkHost
+      ? `<b>network:</b> <code>${escapeHTML(`${networkProtocol ? `${networkProtocol}://` : ""}${networkHost}`)}</code>`
+      : undefined,
     detail ? `<b>request:</b>\n<pre>${escapeHTML(truncateForTelegramPre(detail, 1200))}</pre>` : undefined,
   ]
     .filter((line): line is string => Boolean(line))
     .join("\n");
 
   return { html, plain };
+}
+
+function summarizeApprovalCommandActions(value: unknown): string | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const commands = value
+    .map(readUnknownRecord)
+    .map((action) => readUnknownString(action?.command))
+    .filter((command): command is string => Boolean(command));
+  return commands.length > 0 ? commands.join("\n") : undefined;
 }
 
 function renderPendingApprovals(
@@ -7058,6 +7761,7 @@ function summarizeApprovalRequestForList(request: CodexApprovalRequest): {
 } {
   const params = readUnknownRecord(request.params);
   const command = readUnknownString(params?.command);
+  const commandActions = summarizeApprovalCommandActions(params?.commandActions);
   const cwd = readUnknownString(params?.cwd);
   const reason = readUnknownString(params?.reason);
   const grantRoot = readUnknownString(params?.grantRoot);
@@ -7073,7 +7777,7 @@ function summarizeApprovalRequestForList(request: CodexApprovalRequest): {
   return {
     type,
     cwd,
-    detail: command ?? grantRoot ?? reason ?? request.method,
+    detail: command ?? commandActions ?? grantRoot ?? reason ?? request.method,
   };
 }
 
@@ -7202,6 +7906,10 @@ function formatAccountUsageCompact(usage: NonNullable<CodexStatusDetails["accoun
     usage.longestRunningTurnSec !== undefined ? `longest turn ${formatDuration(usage.longestRunningTurnSec * 1000)}` : undefined,
   ].filter((part): part is string => Boolean(part));
   return parts.length > 0 ? parts.join(" · ") : "unavailable";
+}
+
+function formatDecimal(value: number): string {
+  return value.toFixed(2).replace(/\.00$/, "").replace(/(\.\d)0$/, "$1");
 }
 
 function formatRateLimitPlain(limit: CodexStatusDetails["rateLimits"][number]): string[] {
@@ -7906,6 +8614,7 @@ function renderSessionSelectionPanel(
       72,
     );
     const metadata = [
+      session.section?.name ? `section: ${session.section.name}` : undefined,
       session.model || undefined,
       session.reasoningEffort || undefined,
       formatRelativeTime(session.recencyAt ?? session.updatedAt),

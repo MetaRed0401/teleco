@@ -20,7 +20,7 @@ App-server approval server requests are connection-scoped. Teleco persists a bou
 
 The legacy SDK fallback is kept only as a compatibility path. New operation should use `ENABLE_CODEX_APP_SERVER_RUNTIME=true`.
 
-The minimum compatible Codex CLI/app-server version for this branch is 0.144.1, and the recommended stable version is 0.144.4. The minimum baseline uses canonical app-server items for tool activity and includes the `0.142.5` protection against full `Responses` WebSocket request payloads being written to trace logs. Codex CLI and SDK versions are reported separately and are not required to match exactly.
+The minimum compatible Codex CLI/app-server version for this branch is 0.144.1, and the recommended stable version is 0.148.0. The minimum baseline uses canonical app-server items for tool activity and includes the `0.142.5` protection against full `Responses` WebSocket request payloads being written to trace logs. Codex CLI and SDK versions are reported separately and are not required to match exactly.
 
 TeleCodex keeps app-server handling conservative across Codex releases. Canonical command, file change, MCP, dynamic tool, collaboration, sub-agent, web search, review, hook, and compact activity is normalized into one item-ID lifecycle. Aggregated completion output contributes only the suffix not already received through delta notifications. Unknown MCP/plugin/status notifications are ignored unless they are useful and safe to show on mobile.
 
@@ -89,7 +89,9 @@ Auto compact is policy-driven:
 
 Codex turns run in the background so Telegram can continue processing updates. `/stop` can interrupt an active turn without waiting for long polling to finish the previous prompt.
 
-Incoming prompts are queued while a turn or compact is running. The next queued prompt starts after the current operation completes.
+Incoming prompts are queued while a turn or compact is running. Codex 0.148 and newer use the native per-thread durable queue; older runtimes and compact-only periods retain the in-memory fallback. TeleCodex never writes the same prompt to both backends. Native queued prompts survive a bridge restart and can be inspected, edited, reordered, removed, or cleared with `/queue` commands.
+
+When Codex emits `thread/reverted`, TeleCodex clears in-memory response state and cancels the matching in-flight delivery operation. This prevents a final response from the pre-revert rollout from being replayed after a bridge restart. Conversation revert does not revert workspace files.
 
 Service updates are guarded by `.telecodex/service-update.lock`. In multi-instance mode, update, restart, and stop actions require an explicit instance or `--all` to avoid touching the wrong bot.
 

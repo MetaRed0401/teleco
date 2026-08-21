@@ -87,6 +87,7 @@ const mockState = vi.hoisted(() => {
 const mockAppServerState = vi.hoisted(() => {
   let notifications: Array<{ method: string; params?: unknown }> = [];
   let requestHandler: ((method: string, params?: unknown) => unknown | Promise<unknown>) | undefined;
+  let codexVersion = "0.146.0";
 
   const CodexAppServerClient = vi.fn().mockImplementation(function () {
     const listeners = new Set<(notification: { method: string; params?: unknown }) => void>();
@@ -95,6 +96,7 @@ const mockAppServerState = vi.hoisted(() => {
       isHealthy: vi.fn().mockReturnValue(true),
       getNotifications: vi.fn().mockReturnValue([]),
       getClosedReason: vi.fn().mockReturnValue(undefined),
+      getCodexVersion: vi.fn(() => codexVersion),
       close: vi.fn(),
       onNotification: vi.fn((listener: (notification: { method: string; params?: unknown }) => void) => {
         listeners.add(listener);
@@ -131,9 +133,13 @@ const mockAppServerState = vi.hoisted(() => {
     setRequestHandler: (handler: (method: string, params?: unknown) => unknown | Promise<unknown>) => {
       requestHandler = handler;
     },
+    setCodexVersion: (version: string) => {
+      codexVersion = version;
+    },
     reset: () => {
       notifications = [];
       requestHandler = undefined;
+      codexVersion = "0.146.0";
       CodexAppServerClient.mockClear();
     },
   };
@@ -199,6 +205,7 @@ describe("CodexSessionService", () => {
     onToolEnd: vi.fn(),
     onAgentEnd: vi.fn(),
     onTodoUpdate: vi.fn(),
+    onTurnStarted: vi.fn(),
     onTurnComplete: vi.fn(),
   });
 
@@ -871,6 +878,315 @@ describe("CodexSessionService", () => {
       "thread/metadata/update",
       { threadId: "thread-app-server", isPinned: true },
     );
+  });
+
+  it("reads estimated thread usage from Codex 0.148 status", async () => {
+    mockAppServerState.setCodexVersion("0.148.0");
+    const service = await createAppServerService();
+    mockAppServerState.setRequestHandler(async (method: string, params: Record<string, unknown> | undefined) => {
+      if (method === "account/usage/read" && params?.threadId === "thread-app-server") {
+        return {
+          threadUsage: {
+            estimatedUsageCreditsMicros: 1_250_000,
+            estimatedUsageUsdMicros: 375_000,
+          },
+        };
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    });
+
+    await expect(service.getStatusDetails()).resolves.toMatchObject({
+      threadUsage: {
+        estimatedCredits: 1.25,
+        estimatedUsd: 0.375,
+      },
+    });
+  });
+
+  it("rejects removed native pin metadata on 0.147", async () => {
+    mockAppServerState.setCodexVersion("0.147.0");
+    const service = await createAppServerService();
+
+    await expect(service.setThreadPinned(true)).rejects.toThrow(
+      "Native thread pinning is unavailable in Codex 0.147 and newer.",
+    );
+  });
+
+  it("paginates 0.147 MCP status responses and preserves unknown auth", async () => {
+    const service = await createAppServerService();
+    mockAppServerState.setRequestHandler(async (method: string, params?: unknown) => {
+      const input = params as Record<string, unknown>;
+      if (method === "config/mcpServer/reload") {
+        return {};
+      }
+      if (method === "mcpServerStatus/list" && !input.cursor) {
+        return { data: [{ name: "first", authStatus: "unknown" }], nextCursor: "mcp-page-2" };
+      }
+      if (method === "mcpServerStatus/list" && input.cursor === "mcp-page-2") {
+        return { data: [{ name: "second", authStatus: "oAuth" }], nextCursor: null };
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    });
+
+    await expect(service.refreshMcpServers()).resolves.toEqual({
+      supported: true,
+      statuses: [
+        { name: "first", authStatus: "unknown" },
+        { name: "second", authStatus: "oAuth" },
+      ],
+    });
+  });
+
+  it("lists paginated 0.147 thread sections and moves the active thread", async () => {
+    const service = await createAppServerService();
+    const requests = vi.fn(async (method: string, params?: unknown) => {
+      const input = params as Record<string, unknown>;
+      if (method === "threadSection/list" && !input.cursor) {
+        return { data: [{ id: "section-1", name: "One" }], nextCursor: "section-page-2" };
+      }
+      if (method === "threadSection/list" && input.cursor === "section-page-2") {
+        return { data: [{ id: "section-2", name: "Two" }], nextCursor: null };
+      }
+      if (method === "thread/section/move") {
+        return null;
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    mockAppServerState.setRequestHandler(requests);
+
+    await expect(service.listThreadSections()).resolves.toEqual({
+      supported: true,
+      sections: [
+        { id: "section-1", name: "One" },
+        { id: "section-2", name: "Two" },
+      ],
+    });
+    await expect(service.moveCurrentThreadToSection("section-2")).resolves.toBeUndefined();
+    expect(requests).toHaveBeenCalledWith(
+      "thread/section/move",
+      { threadId: "thread-app-server", sectionId: "section-2" },
+    );
+  });
+
+  it("prefers the 0.147 final-answer phase at turn completion", async () => {
+    const service = await createAppServerService();
+    const callbacks = createCallbacks();
+    mockAppServerState.setNotifications([
+      {
+        method: "turn/completed",
+        params: {
+          threadId: "thread-app-server",
+          turn: {
+            id: "turn-app-server",
+            status: "completed",
+            items: [
+              { id: "commentary", type: "agentMessage", phase: "commentary", text: "still working" },
+              { id: "final", type: "agentMessage", phase: "final_answer", text: "finished" },
+            ],
+          },
+        },
+      },
+    ]);
+
+    await service.prompt("phase test", callbacks);
+
+    expect(callbacks.onTextDelta).toHaveBeenCalledWith(
+      "finished",
+      { agentMessageId: "final", startsNewMessage: true },
+    );
+    expect(callbacks.onTextDelta).not.toHaveBeenCalledWith(
+      "still working",
+      expect.anything(),
+    );
+  });
+
+  it("supports the 0.148 native queue contract with bounded pagination", async () => {
+    mockAppServerState.setCodexVersion("0.148.0");
+    const service = await createAppServerService();
+    const requests = vi.fn(async (method: string, params?: unknown) => {
+      const input = params as Record<string, unknown>;
+      if (method === "thread/queue/list" && !input.cursor) {
+        return {
+          data: [{
+            id: "queue-1",
+            clientUserMessageId: "client-1",
+            input: [{ type: "text", text: "first queued prompt" }],
+          }],
+          nextCursor: "queue-page-2",
+        };
+      }
+      if (method === "thread/queue/list" && input.cursor === "queue-page-2") {
+        return {
+          data: [{
+            id: "queue-2",
+            clientUserMessageId: "client-2",
+            input: [{ type: "localImage", path: "/redacted" }],
+          }],
+          nextCursor: null,
+        };
+      }
+      if (method === "thread/queue/add") {
+        return {
+          queuedSubmission: {
+            id: "queue-added",
+            clientUserMessageId: input.clientUserMessageId,
+            input: input.input,
+          },
+        };
+      }
+      if (method === "thread/queue/update") {
+        return {
+          queuedSubmission: {
+            id: input.queuedSubmissionId,
+            clientUserMessageId: "client-1",
+            input: input.input,
+          },
+        };
+      }
+      if (method === "thread/queue/delete") return { deleted: true };
+      if (method === "thread/queue/reorder") return {};
+      if (method === "thread/queue/start") return { turn: { id: "queued-turn" } };
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    mockAppServerState.setRequestHandler(requests);
+
+    await expect(service.listQueuedPrompts()).resolves.toEqual({
+      supported: true,
+      items: [
+        { id: "queue-1", clientUserMessageId: "client-1", summary: "first queued prompt" },
+        { id: "queue-2", clientUserMessageId: "client-2", summary: "[image]" },
+      ],
+    });
+    await expect(service.addQueuedPrompt("new prompt")).resolves.toMatchObject({
+      id: "queue-added",
+      summary: "new prompt",
+    });
+    await expect(service.updateQueuedPrompt("queue-1", "updated prompt")).resolves.toMatchObject({
+      id: "queue-1",
+      summary: "updated prompt",
+    });
+    await expect(service.deleteQueuedPrompt("queue-1")).resolves.toBe(true);
+    await expect(service.reorderQueuedPrompts(["queue-2", "queue-1"])).resolves.toBeUndefined();
+    await expect(service.startQueuedPrompt("queue-2")).resolves.toBe("queued-turn");
+  });
+
+  it("keeps listening through automatically dispatched 0.148 queued turns", async () => {
+    mockAppServerState.setCodexVersion("0.148.0");
+    const service = await createAppServerService();
+    const callbacks = createCallbacks();
+    mockAppServerState.setRequestHandler(async (method: string) => {
+      if (method === "thread/queue/list") return { data: [], nextCursor: null };
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    mockAppServerState.setNotifications([
+      {
+        method: "item/completed",
+        params: { threadId: "thread-app-server", turnId: "turn-app-server", item: { id: "first", type: "agentMessage", text: "first" } },
+      },
+      completedAppServerTurn,
+      {
+        method: "turn/started",
+        params: { threadId: "thread-app-server", turn: { id: "turn-queued", status: "inProgress" } },
+      },
+      {
+        method: "item/completed",
+        params: { threadId: "thread-app-server", turnId: "turn-queued", item: { id: "second", type: "agentMessage", text: "second" } },
+      },
+      {
+        method: "turn/completed",
+        params: { threadId: "thread-app-server", turn: { id: "turn-queued", status: "completed" } },
+      },
+    ]);
+
+    await service.prompt("start", callbacks);
+
+    expect(callbacks.onAgentEnd).toHaveBeenCalledTimes(2);
+    expect(callbacks.onTurnStarted).toHaveBeenCalledWith("turn-queued");
+    expect(callbacks.onTextDelta).toHaveBeenCalledWith(
+      "second",
+      expect.objectContaining({ agentMessageId: "second" }),
+    );
+  });
+
+  it("forwards 0.148 blocking user input requests to the client callback", async () => {
+    const service = await createAppServerService();
+    const onToolUserInputRequest = vi.fn().mockResolvedValue({
+      answers: { choice: { answers: ["Continue"] } },
+    });
+
+    await expect(
+      (service as any).handleAppServerRequest(
+        {
+          method: "item/tool/requestUserInput",
+          params: {
+            threadId: "thread-app-server",
+            turnId: "turn-app-server",
+            itemId: "input-1",
+            isBlocking: true,
+            questions: [{ id: "choice", header: "Next", question: "Continue?" }],
+          },
+        },
+        { ...createCallbacks(), onToolUserInputRequest },
+      ),
+    ).resolves.toEqual({ answers: { choice: { answers: ["Continue"] } } });
+    expect(onToolUserInputRequest).toHaveBeenCalledWith(expect.objectContaining({
+      method: "item/tool/requestUserInput",
+    }));
+  });
+
+  it("preserves persisted 0.148 resume settings and reports effective permissions", async () => {
+    const service = await createAppServerService();
+    const requests = vi.fn(async (method: string) => {
+      if (method === "thread/resume") {
+        return {
+          thread: { id: "thread-persisted" },
+          cwd: "/workspace/persisted",
+          model: "gpt-5.5",
+          modelProvider: "openai",
+          approvalPolicy: "on-request",
+          approvalsReviewer: "guardian_subagent",
+          sandbox: { type: "readOnly", networkAccess: false },
+        };
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    mockAppServerState.setRequestHandler(requests);
+
+    const info = await service.resumeThread("thread-persisted");
+
+    expect(requests).toHaveBeenCalledWith("thread/resume", {
+      threadId: "thread-persisted",
+      excludeTurns: true,
+    });
+    expect(info).toMatchObject({
+      workspace: "/workspace/persisted",
+      model: "gpt-5.5",
+      sandboxMode: "read-only",
+      approvalPolicy: "on-request",
+      configuredSandboxMode: "workspace-write",
+      configuredApprovalPolicy: "never",
+    });
+  });
+
+  it("invalidates canonical item state after a 0.148 thread revert", async () => {
+    const service = await createAppServerService();
+    const callbacks = { ...createCallbacks(), onThreadReverted: vi.fn() };
+    const emit = (method: string, params: unknown) =>
+      (service as any).handleAppServerNotification({ method, params }, callbacks);
+
+    emit("item/completed", {
+      threadId: "thread-app-server",
+      item: { id: "agent-same", type: "agentMessage", text: "before" },
+    });
+    emit("thread/reverted", { threadId: "thread-app-server" });
+    emit("item/completed", {
+      threadId: "thread-app-server",
+      item: { id: "agent-same", type: "agentMessage", text: "after" },
+    });
+
+    expect(callbacks.onThreadReverted).toHaveBeenCalledTimes(1);
+    expect(callbacks.onTextDelta).toHaveBeenCalledWith("before", expect.anything());
+    expect(callbacks.onTextDelta).toHaveBeenCalledWith("after", expect.anything());
   });
 
   it("reports unsupported MCP refresh without resetting the app-server", async () => {

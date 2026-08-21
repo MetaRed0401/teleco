@@ -45,8 +45,8 @@ jobs:
       - name: Focused compatibility tests
         run: |
           pnpm exec vitest run test/codex-app-server-client.test.ts test/app-server-observability.test.ts test/approval-state.test.ts
-          pnpm exec vitest run test/codex-session.test.ts -t '0.146|pagination|canonical app-server|canonical completion|unknown canonical|releases canonical'
+          pnpm exec vitest run test/codex-session.test.ts -t '0.146|0.147|0.148|pagination|canonical app-server|canonical completion|unknown canonical|releases canonical'
       - name: Real app-server smoke
         env:
-          CODEX_EXPECT_0146: ${{ matrix.label == 'candidate' }}
+          CODEX_COMPAT_VERSION: ${{ matrix.version }}
         run: node scripts/codex-app-server-smoke.mjs

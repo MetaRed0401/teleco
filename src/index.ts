@@ -24,6 +24,7 @@ import {
   failTelegramDelivery,
   scheduleTelegramDeliveryCleanup,
 } from "./telegram-delivery-store.js";
+import { redactPotentialSecrets } from "./secret-redaction.js";
 
 let registry: SessionRegistry | undefined;
 let bot: ReturnType<typeof createBot> | undefined;
@@ -344,6 +345,13 @@ async function replayRecoveredItems(
     if (deliveredItemIds.has(item.id)) {
       continue;
     }
+    const safeItem: CodexTurnRecoveryItem = item.kind === "response"
+      ? { ...item, text: redactPotentialSecrets(item.text) }
+      : {
+          ...item,
+          toolName: redactPotentialSecrets(item.toolName),
+          detail: redactPotentialSecrets(item.detail),
+        };
     const deliveryKey = `operation:${operation.id}:item:${item.id}`;
     const claim = claimTelegramDelivery(config, {
       deliveryKey,
@@ -353,7 +361,9 @@ async function replayRecoveredItems(
       operationId: operation.id,
       itemId: item.id,
       kind: "recovered-item",
-      payload: item.kind === "response" ? item.text : `${item.toolName}\n${item.detail}\n${item.isError ? "error" : "ok"}`,
+      payload: safeItem.kind === "response"
+        ? safeItem.text
+        : `${safeItem.toolName}\n${safeItem.detail}\n${safeItem.isError ? "error" : "ok"}`,
     });
     if (claim !== "send") {
       deliveredItemIds.add(item.id);
@@ -361,7 +371,7 @@ async function replayRecoveredItems(
       continue;
     }
     try {
-      const messageId = await retryRecoveryTelegramCall(() => sendRecoveredTurnItem(bot!, registry!, operation, item));
+      const messageId = await retryRecoveryTelegramCall(() => sendRecoveredTurnItem(bot!, registry!, operation, safeItem));
       completeTelegramDelivery(config, deliveryKey, messageId);
     } catch (error) {
       failTelegramDelivery(config, deliveryKey, error);
@@ -380,6 +390,7 @@ async function deliverRecoveredResponseWithRetry(
     return false;
   }
 
+  const safeAgentText = redactPotentialSecrets(agentText);
   const previousAttempts = operation.deliveryAttempts ?? 0;
   const deliveryKey = `operation:${operation.id}:final`;
   for (let attempt = previousAttempts; attempt < RECOVERY_DELIVERY_MAX_ATTEMPTS; attempt += 1) {
@@ -391,13 +402,13 @@ async function deliverRecoveredResponseWithRetry(
       messageThreadId: operation.messageThreadId,
       operationId: operation.id,
       kind: "recovered-final",
-      payload: agentText,
+      payload: safeAgentText,
     });
     if (claim !== "send") {
       return true;
     }
     try {
-      const messageId = await deliverRecoveredResponse(operation, agentText);
+      const messageId = await deliverRecoveredResponse(operation, safeAgentText);
       completeTelegramDelivery(config, deliveryKey, messageId);
       return true;
     } catch (error) {
@@ -437,7 +448,9 @@ async function deliverRecoveredResponse(operation: ActiveOperationRecord, agentT
     return undefined;
   }
 
-  const chunks = splitRecoveryText(agentText || "Codex completed the turn, but no final agent message was stored.");
+  const chunks = splitRecoveryText(
+    redactPotentialSecrets(agentText || "Codex completed the turn, but no final agent message was stored."),
+  );
   const first = `<b>Recovered response after service restart</b>\n\n${escapeHTML(chunks[0] ?? "")}`;
   let responseMessageId = operation.responseMessageId;
   if (responseMessageId) {
@@ -470,7 +483,10 @@ async function sendInterruptedOperationFallback(operation: ActiveOperationRecord
   if (!bot) {
     return;
   }
-  const message = [renderInterruptedOperationMessage(operation), detail ? `\n<b>Recovery detail:</b> <code>${escapeHTML(detail)}</code>` : undefined]
+  const message = [
+    renderInterruptedOperationMessage(operation),
+    detail ? `\n<b>Recovery detail:</b> <code>${escapeHTML(redactPotentialSecrets(detail))}</code>` : undefined,
+  ]
     .filter((line): line is string => Boolean(line))
     .join("\n");
   try {

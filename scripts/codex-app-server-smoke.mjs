@@ -9,8 +9,15 @@ const root = mkdtempSync(path.join(tmpdir(), "telecodex-app-server-smoke-"));
 const codexHome = path.join(root, "codex-home");
 const workspace = path.join(root, "workspace");
 const schemaDir = path.join(root, "schema");
-const codexBinary = process.env.CODEX_BIN?.trim() || "codex";
-const expect0146 = process.env.CODEX_EXPECT_0146 === "true";
+const configuredCodexBinary = process.env.CODEX_BIN?.trim() || "codex";
+const codexBinary = configuredCodexBinary.includes(path.sep)
+  ? path.resolve(configuredCodexBinary)
+  : configuredCodexBinary;
+const compatVersion = process.env.CODEX_COMPAT_VERSION?.trim();
+const compatMinor = readCodexMinor(compatVersion);
+const expect0146 = compatMinor !== undefined && compatMinor >= 146;
+const expect0147 = compatMinor !== undefined && compatMinor >= 147;
+const expect0148 = compatMinor !== undefined && compatMinor >= 148;
 mkdirSync(codexHome, { recursive: true });
 mkdirSync(workspace, { recursive: true });
 let stage = "schema generation";
@@ -50,6 +57,49 @@ try {
       if (!schemaText.includes(protocolName)) throw new Error("0.146 schema contract");
     }
   }
+  if (expect0147) {
+    for (const protocolName of [
+      "thread/section/move",
+      "threadSection/create",
+      "threadSection/list",
+      "threadSection/update",
+      "threadSection/delete",
+      "thread/search",
+      "plugin/search",
+      "ThreadSectionCreateParams",
+      "ThreadSectionListParams",
+      "ThreadSectionUpdateParams",
+      "ThreadSectionMoveParams",
+      "ThreadSectionDeleteParams",
+      "ThreadSearchSortKey",
+      "PluginSearchResult",
+      "PluginDisabledReason",
+      "CommandExecutionRequestApprovalParams",
+    ]) {
+      if (!schemaText.includes(protocolName)) throw new Error("0.147 schema contract");
+    }
+  }
+  if (expect0148) {
+    for (const protocolName of [
+      "thread/queue/add",
+      "thread/queue/list",
+      "thread/queue/update",
+      "thread/queue/delete",
+      "thread/queue/reorder",
+      "thread/queue/start",
+      "thread/queue/changed",
+      "thread/revert",
+      "thread/reverted",
+      "ThreadUsage",
+      "isBlocking",
+      "hook/started",
+      "hook/completed",
+      "ThreadSectionAppearance",
+      "ImageGenerationFailure",
+    ]) {
+      if (!schemaText.includes(protocolName)) throw new Error("0.148 schema contract");
+    }
+  }
 
   stage = "initialize";
   client = createClient(codexHome, workspace);
@@ -82,12 +132,45 @@ try {
     } catch (error) {
       if (error?.rpcCode !== -32600) throw error;
     }
-    stage = "0.146 thread metadata";
-    await client.request("thread/name/set", { threadId, name: "telecodex-ci" });
-    await client.request("thread/metadata/update", { threadId, isPinned: false });
-    stage = "0.146 MCP refresh";
+    if (!expect0147) {
+      stage = "0.146 thread metadata";
+      await client.request("thread/name/set", { threadId, name: "telecodex-ci" });
+      await client.request("thread/metadata/update", { threadId, isPinned: false });
+    }
+    stage = "native MCP refresh";
     await client.request("config/mcpServer/reload", {});
     await client.request("mcpServerStatus/list", {});
+  }
+  if (expect0147) {
+    stage = "0.147 thread search";
+    await client.request("thread/search", {
+      searchTerm: "telecodex-ci",
+      limit: 10,
+      sortKey: "recency_at",
+      sortDirection: "desc",
+    });
+    stage = "0.147 thread section create";
+    const createdSection = await client.request("threadSection/create", { name: "telecodex-ci" });
+    const sectionId = createdSection?.section?.id;
+    if (typeof sectionId !== "string" || !sectionId) throw new Error("thread section id");
+    stage = "0.147 thread section list";
+    await client.request("threadSection/list", { limit: 10 });
+    stage = "0.147 thread section update";
+    await client.request("threadSection/update", { sectionId, name: "telecodex-ci-updated" });
+    stage = "0.147 thread section delete";
+    await client.request("threadSection/delete", { sectionId });
+  }
+  if (expect0148) {
+    stage = "0.148 empty thread queue list";
+    const queue = await client.request("thread/queue/list", { threadId, limit: 100 });
+    if (!Array.isArray(queue?.data)) throw new Error("thread queue list response");
+    stage = "0.148 thread usage";
+    try {
+      await client.request("account/usage/read", { threadId });
+    } catch (error) {
+      // A newly created empty thread may not have a persisted usage record yet.
+      if (error?.rpcCode !== -32600) throw error;
+    }
   }
 
   stage = "app-server restart";
@@ -100,14 +183,15 @@ try {
   client.notify("initialized", {});
   stage = "thread resume after restart";
   try {
-    await client.request("thread/resume", { threadId, cwd: workspace, sandbox: "read-only", excludeTurns: true });
+    await client.request("thread/resume", { threadId, excludeTurns: true });
   } catch (error) {
     if (typeof error?.rpcCode !== "number" || error.rpcCode === -32601) throw error;
   }
   console.log("Codex app-server compatibility smoke passed.");
 } catch (error) {
   const rpcCode = typeof error?.rpcCode === "number" ? ` (RPC ${error.rpcCode})` : "";
-  console.error(`Codex app-server compatibility smoke failed during ${stage}${rpcCode}.`);
+  const rpcMessage = typeof error?.rpcMessage === "string" ? `: ${error.rpcMessage}` : "";
+  console.error(`Codex app-server compatibility smoke failed during ${stage}${rpcCode}${rpcMessage}.`);
   process.exitCode = 1;
 } finally {
   await client?.close();
@@ -140,6 +224,7 @@ function createClient(home, cwd) {
             if (message.error) {
               const failure = new Error("app-server request failed");
               failure.rpcCode = typeof message.error.code === "number" ? message.error.code : undefined;
+              failure.rpcMessage = typeof message.error.message === "string" ? message.error.message : undefined;
               request.reject(failure);
             } else {
               request.resolve(message.result);
@@ -194,4 +279,9 @@ function readSchemaTree(directory) {
       return entry.isDirectory() ? readSchemaTree(entryPath) : entry.name.endsWith(".json") ? readFileSync(entryPath, "utf8") : "";
     })
     .join("\n");
+}
+
+function readCodexMinor(version) {
+  const match = /^(?:codex-cli\s+)?0\.(\d+)\./.exec(version ?? "");
+  return match ? Number(match[1]) : undefined;
 }
