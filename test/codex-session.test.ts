@@ -200,6 +200,7 @@ describe("CodexSessionService", () => {
 
   const createCallbacks = () => ({
     onTextDelta: vi.fn(),
+    onAgentMessageComplete: vi.fn(),
     onToolStart: vi.fn(),
     onToolUpdate: vi.fn(),
     onToolEnd: vi.fn(),
@@ -1187,6 +1188,131 @@ describe("CodexSessionService", () => {
     expect(callbacks.onThreadReverted).toHaveBeenCalledTimes(1);
     expect(callbacks.onTextDelta).toHaveBeenCalledWith("before", expect.anything());
     expect(callbacks.onTextDelta).toHaveBeenCalledWith("after", expect.anything());
+  });
+
+  it("keeps 0.149 async agent messages visible and non-terminal", async () => {
+    const service = await createAppServerService();
+    const callbacks = createCallbacks();
+    const emit = (method: string, params: unknown) =>
+      (service as any).handleAppServerNotification({ method, params }, callbacks);
+
+    emit("turn/started", {
+      threadId: "thread-app-server",
+      turn: { id: "turn-149", status: "inProgress" },
+    });
+    emit("item/started", {
+      threadId: "thread-app-server",
+      turnId: "turn-149",
+      item: { id: "async-1", type: "agentMessage", delivery: "async", text: "" },
+    });
+    emit("item/agentMessage/delta", {
+      threadId: "thread-app-server",
+      turnId: "turn-149",
+      itemId: "async-1",
+      delta: "same text",
+    });
+    emit("item/completed", {
+      threadId: "thread-app-server",
+      turnId: "turn-149",
+      item: { id: "async-1", type: "agentMessage", delivery: "async", text: "same text" },
+    });
+    emit("item/completed", {
+      threadId: "thread-app-server",
+      turnId: "turn-149",
+      item: { id: "async-1", type: "agentMessage", delivery: "async", text: "same text" },
+    });
+    emit("item/completed", {
+      threadId: "thread-app-server",
+      turnId: "turn-149",
+      item: { id: "final-1", type: "agentMessage", phase: "final_answer", text: "same text" },
+    });
+    emit("turn/completed", {
+      threadId: "thread-app-server",
+      turn: {
+        id: "turn-149",
+        status: "completed",
+        items: [
+          { id: "async-1", type: "agentMessage", delivery: "async", text: "same text" },
+          { id: "final-1", type: "agentMessage", phase: "final_answer", text: "same text" },
+        ],
+      },
+    });
+
+    expect(callbacks.onTextDelta).toHaveBeenCalledWith(
+      "same text",
+      expect.objectContaining({ agentMessageId: "async-1", delivery: "async" }),
+    );
+    expect(callbacks.onTextDelta).toHaveBeenCalledWith(
+      "same text",
+      expect.objectContaining({ agentMessageId: "final-1" }),
+    );
+    expect(callbacks.onAgentMessageComplete).toHaveBeenCalledTimes(1);
+    expect(callbacks.onAgentEnd).toHaveBeenCalledTimes(1);
+  });
+
+  it("tracks 0.149 project assignments across resume and notifications", async () => {
+    const service = await createAppServerService();
+    mockAppServerState.setRequestHandler(async (method: string) => {
+      if (method === "thread/resume") {
+        return { thread: { id: "thread-project", projectId: "project-a" } };
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    });
+
+    await expect(service.resumeThread("thread-project")).resolves.toMatchObject({ projectId: "project-a" });
+    (service as any).handleAppServerNotification(
+      {
+        method: "thread/project/updated",
+        params: { threadId: "thread-project", projectId: "project-b" },
+      },
+      createCallbacks(),
+    );
+    expect(service.getInfo().projectId).toBe("project-b");
+  });
+
+  it("forks 0.149 threads with permissions and project metadata", async () => {
+    const service = await createAppServerService();
+    (service as any).currentPermissionProfileId = "managed-profile";
+    const requests = vi.fn(async (method: string) => {
+      if (method === "thread/fork") {
+        return { thread: { id: "thread-forked", projectId: "project-forked" } };
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    mockAppServerState.setRequestHandler(requests);
+
+    await expect(service.forkThread("turn-before")).resolves.toMatchObject({
+      threadId: "thread-forked",
+      projectId: "project-forked",
+    });
+    expect(requests).toHaveBeenCalledWith("thread/fork", {
+      threadId: "thread-app-server",
+      excludeTurns: true,
+      beforeTurnId: "turn-before",
+      permissions: "managed-profile",
+    });
+  });
+
+  it("renders 0.149 strict review as deduplicated activity without approval state", async () => {
+    const service = await createAppServerService();
+    const onApprovalRequest = vi.fn();
+    const callbacks = { ...createCallbacks(), onApprovalRequest };
+    const notification = {
+      method: "autoApprovalReview/strictReviewRequired",
+      params: {
+        threadId: "thread-app-server",
+        turnId: "turn-strict",
+        startedAtMs: 1_700_000_000_000,
+      },
+    };
+
+    (service as any).handleAppServerNotification(notification, callbacks);
+    (service as any).handleAppServerNotification(notification, callbacks);
+
+    expect(callbacks.onToolStart).toHaveBeenCalledTimes(1);
+    expect(callbacks.onToolStart).toHaveBeenCalledWith("review:strict", "strict-review-turn-strict");
+    expect(callbacks.onToolEnd).toHaveBeenCalledTimes(1);
+    expect(onApprovalRequest).not.toHaveBeenCalled();
   });
 
   it("reports unsupported MCP refresh without resetting the app-server", async () => {

@@ -5,6 +5,7 @@ import path from "node:path";
 
 export interface CodexThreadRecord {
   id: string;
+  projectId?: string;
   name?: string;
   title: string;
   preview?: string;
@@ -61,6 +62,7 @@ type DatabaseCtor = new (
 type DatabaseInstance = InstanceType<DatabaseCtor>;
 type ThreadRow = {
   id: unknown;
+  project_id: unknown;
   name: unknown;
   title: unknown;
   preview: unknown;
@@ -306,6 +308,7 @@ export function listModels(): CodexModelRecord[] {
 }
 
 function mapThreadRow(row: ThreadRow): CodexThreadRecord {
+  const projectId = typeof row.project_id === "string" ? row.project_id.trim() : "";
   const name = typeof row.name === "string" ? row.name.trim() : "";
   const preview = typeof row.preview === "string" ? row.preview.trim() : "";
   const reasoningEffort = typeof row.reasoning_effort === "string" ? row.reasoning_effort.trim() : "";
@@ -320,6 +323,7 @@ function mapThreadRow(row: ThreadRow): CodexThreadRecord {
 
   return {
     id: typeof row.id === "string" ? row.id : String(row.id ?? ""),
+    ...(projectId ? { projectId } : {}),
     ...(name ? { name } : {}),
     title: typeof row.title === "string" ? row.title : "",
     ...(preview ? { preview } : {}),
@@ -449,6 +453,7 @@ function buildThreadSelect(columns: Set<string>): string {
 
   return [
     "id",
+    optionalColumn("project_id", "NULL"),
     optionalColumn("name", "NULL"),
     "title",
     optionalColumn("preview", "''"),

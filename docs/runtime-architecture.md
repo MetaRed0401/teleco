@@ -20,9 +20,11 @@ App-server approval server requests are connection-scoped. Teleco persists a bou
 
 The legacy SDK fallback is kept only as a compatibility path. New operation should use `ENABLE_CODEX_APP_SERVER_RUNTIME=true`.
 
-The minimum compatible Codex CLI/app-server version for this branch is 0.144.1, and the recommended stable version is 0.148.0. The minimum baseline uses canonical app-server items for tool activity and includes the `0.142.5` protection against full `Responses` WebSocket request payloads being written to trace logs. Codex CLI and SDK versions are reported separately and are not required to match exactly.
+The minimum compatible Codex CLI/app-server version for this branch is 0.144.1, and the recommended stable version is 0.149.0. The minimum baseline uses canonical app-server items for tool activity and includes the `0.142.5` protection against full `Responses` WebSocket request payloads being written to trace logs. Codex CLI and SDK versions are reported separately and are not required to match exactly.
 
 TeleCodex keeps app-server handling conservative across Codex releases. Canonical command, file change, MCP, dynamic tool, collaboration, sub-agent, web search, review, hook, and compact activity is normalized into one item-ID lifecycle. Aggregated completion output contributes only the suffix not already received through delta notifications. Unknown MCP/plugin/status notifications are ignored unless they are useful and safe to show on mobile.
+
+Codex 0.149 project assignments remain metadata and never replace workspace or thread ownership checks. Async agent messages are committed as non-terminal live items, while strict-review notifications are informational activity rather than actionable Telegram approvals.
 
 MCP URL elicitations are scoped to the originating Telegram context. Only credential-free HTTPS URLs receive an authentication button, and the user must explicitly confirm completion or cancel. Structured form elicitations fail closed until Teleco provides a schema-aware form UI. Authentication prompts are never mirrored to notification channels.
 

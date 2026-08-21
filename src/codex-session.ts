@@ -72,7 +72,8 @@ export type CodexToolUserInputResponse = {
 };
 
 export interface CodexSessionCallbacks {
-  onTextDelta: (delta: string, metadata?: { agentMessageId: string; startsNewMessage: boolean }) => void;
+  onTextDelta: (delta: string, metadata?: CodexAgentMessageMetadata) => void;
+  onAgentMessageComplete?: (metadata: CodexAgentMessageMetadata) => void;
   onToolStart: (toolName: string, toolCallId: string) => void;
   onToolUpdate: (toolCallId: string, partialResult: string, metadata?: { kind?: "output" | "diff" }) => void;
   onToolEnd: (toolCallId: string, isError: boolean) => void;
@@ -91,8 +92,15 @@ export interface CodexSessionCallbacks {
   }) => void;
 }
 
+export interface CodexAgentMessageMetadata {
+  agentMessageId: string;
+  startsNewMessage: boolean;
+  delivery?: "async";
+}
+
 export interface CodexSessionInfo {
   threadId: string | null;
+  projectId?: string;
   workspace: string;
   model?: string;
   reasoningEffort?: string;
@@ -171,6 +179,7 @@ export type CodexTurnRecoveryItem =
       id: string;
       kind: "response";
       text: string;
+      delivery?: "async";
     }
   | {
       id: string;
@@ -323,6 +332,9 @@ export class CodexSessionService {
   private appServerCallbacks: CodexSessionCallbacks | undefined;
   private readonly appServerToolLifecycles = new Map<string, AppServerToolLifecycle>();
   private readonly appServerAgentMessages = new Map<string, string>();
+  private readonly appServerAsyncAgentMessages = new Set<string>();
+  private readonly appServerCompletedAgentMessages = new Set<string>();
+  private currentProjectId: string | undefined;
   private readonly threadMetadataOverrides = new Map<string, { name?: string; isPinned?: boolean }>();
   private firstPromptConnectionCheckPending = false;
   private appServerInstructionSources: string[] = [];
@@ -372,6 +384,7 @@ export class CodexSessionService {
     const approvalPolicy = this.appServerEffectiveApprovalPolicy ?? effectiveLaunchProfile.approvalPolicy;
     const info: CodexSessionInfo = {
       threadId: this.thread?.id ?? this.currentThreadId,
+      projectId: this.currentProjectId,
       workspace: this.currentWorkspace,
       model: this.currentModel ?? this.config.codexModel,
       fastMode: this.currentFastMode,
@@ -518,7 +531,10 @@ export class CodexSessionService {
       .map((item, index) => toTurnRecoveryItem(item, index, readString(turn?.id)))
       .filter((item): item is CodexTurnRecoveryItem => Boolean(item));
     const agentMessages = recoveryItems
-      .filter((item): item is Extract<CodexTurnRecoveryItem, { kind: "response" }> => item.kind === "response")
+      .filter(
+        (item): item is Extract<CodexTurnRecoveryItem, { kind: "response" }> =>
+          item.kind === "response" && item.delivery !== "async",
+      )
       .map((item) => item.text);
     const agentText = agentMessages.at(-1) ?? "";
     const threadStatus = readString(readRecord(thread.status)?.type) ?? "unknown";
@@ -980,6 +996,36 @@ export class CodexSessionService {
     return this.getInfo();
   }
 
+  async forkThread(beforeTurnId?: string): Promise<CodexSessionInfo> {
+    this.ensureIdle("fork a thread");
+    if (!this.currentThreadId) {
+      throw new Error("No active Codex thread to fork.");
+    }
+    if (!this.config.enableCodexAppServerRuntime) {
+      throw new Error("App-server runtime is required to fork a thread.");
+    }
+
+    await this.ensureAppServerInitialized();
+    const response = await this.requestAppServerThreadFork({
+      threadId: this.currentThreadId,
+      excludeTurns: true,
+      ...(beforeTurnId ? { beforeTurnId } : {}),
+    });
+    const threadId = readString(readRecord(readRecord(response)?.thread)?.id);
+    if (!threadId) {
+      throw new Error("Codex app-server did not return a forked thread id.");
+    }
+
+    this.captureAppServerThreadResumeState(response);
+    this.thread = null;
+    this.activeThreadLaunchProfile = this.currentLaunchProfile;
+    this.currentThreadId = threadId;
+    this.appServerThreadLoaded = true;
+    this.firstPromptConnectionCheckPending = false;
+    this.resetUsageState(this.currentModel ?? this.config.codexModel);
+    return this.getInfo();
+  }
+
   async switchSession(threadId: string): Promise<CodexSessionInfo> {
     this.ensureIdle("switch session");
 
@@ -1336,6 +1382,7 @@ export class CodexSessionService {
     this.abortController = null;
     this.thread = null;
     this.currentThreadId = null;
+    this.currentProjectId = undefined;
     this.firstPromptConnectionCheckPending = false;
     this.activeThreadLaunchProfile = null;
     this.activeThreadPermissionProfileId = undefined;
@@ -1347,6 +1394,7 @@ export class CodexSessionService {
     this.abortController = null;
     this.thread = null;
     this.currentThreadId = null;
+    this.currentProjectId = undefined;
     this.activeThreadLaunchProfile = null;
     this.activeThreadPermissionProfileId = undefined;
     this.resetAppServerClient();
@@ -1775,6 +1823,8 @@ export class CodexSessionService {
     this.appServerCallbacks = undefined;
     this.appServerToolLifecycles.clear();
     this.appServerAgentMessages.clear();
+    this.appServerAsyncAgentMessages.clear();
+    this.appServerCompletedAgentMessages.clear();
   }
 
   private resetUsageState(model = this.currentModel ?? this.config.codexModel): void {
@@ -1814,6 +1864,8 @@ export class CodexSessionService {
 
   private captureAppServerThreadResumeState(response: unknown): void {
     const record = readRecord(response);
+    const thread = readRecord(record?.thread);
+    this.currentProjectId = readString(thread?.projectId);
     this.appServerInstructionSources = readStringArray(record?.instructionSources);
     this.appServerActivePermissionProfile = summarizeUnknownValue(record?.activePermissionProfile);
     this.appServerApprovalsReviewer = summarizeUnknownValue(record?.approvalsReviewer);
@@ -1844,6 +1896,8 @@ export class CodexSessionService {
     let client = this.getAppServerClient(callbacks);
     this.appServerToolLifecycles.clear();
     this.appServerAgentMessages.clear();
+    this.appServerAsyncAgentMessages.clear();
+    this.appServerCompletedAgentMessages.clear();
     let unsubscribe = client.onNotification((notification) => {
       this.handleAppServerNotification(notification, callbacks);
     });
@@ -1896,6 +1950,8 @@ export class CodexSessionService {
       this.appServerCurrentTurnId = null;
       this.appServerToolLifecycles.clear();
       this.appServerAgentMessages.clear();
+      this.appServerAsyncAgentMessages.clear();
+      this.appServerCompletedAgentMessages.clear();
       if (this.abortController === controller) {
         this.abortController = null;
       }
@@ -2116,6 +2172,24 @@ export class CodexSessionService {
     }
   }
 
+  private async requestAppServerThreadFork(params: Record<string, unknown>): Promise<unknown> {
+    const requestParams = this.applyAppServerPermissionProfile(params, "thread");
+    try {
+      const response = await this.getAppServerClient().request("thread/fork", requestParams);
+      this.activeThreadPermissionProfileId = this.currentPermissionProfileId;
+      return response;
+    } catch (error) {
+      if (!isRuntimeWorkspaceRootsError(error) || !("runtimeWorkspaceRoots" in requestParams)) {
+        throw error;
+      }
+      const retryParams = { ...requestParams };
+      delete retryParams.runtimeWorkspaceRoots;
+      const response = await this.getAppServerClient().request("thread/fork", retryParams);
+      this.activeThreadPermissionProfileId = this.currentPermissionProfileId;
+      return response;
+    }
+  }
+
   private async requestAppServerTurnStart(client: CodexAppServerClient, params: Record<string, unknown>): Promise<unknown> {
     const requestParams = this.applyAppServerPermissionProfile(params, "turn");
     try {
@@ -2234,9 +2308,11 @@ export class CodexSessionService {
 
     switch (notification.method) {
       case "thread/started": {
-        const threadId = readString(readRecord(params?.thread)?.id);
+        const thread = readRecord(params?.thread);
+        const threadId = readString(thread?.id);
         if (threadId) {
           this.currentThreadId = threadId;
+          this.currentProjectId = readString(thread?.projectId);
           this.appServerThreadLoaded = true;
         }
         break;
@@ -2247,6 +2323,8 @@ export class CodexSessionService {
           this.appServerCurrentTurnId = turnId;
           this.appServerToolLifecycles.clear();
           this.appServerAgentMessages.clear();
+          this.appServerAsyncAgentMessages.clear();
+          this.appServerCompletedAgentMessages.clear();
           callbacks.onTurnStarted?.(turnId);
         }
         break;
@@ -2255,7 +2333,7 @@ export class CodexSessionService {
         const delta = readString(params?.delta);
         const itemId = readString(params?.itemId) ?? "agent-message";
         if (delta) {
-          this.emitAppServerAgentDelta(callbacks, itemId, delta);
+          this.emitAppServerAgentDelta(callbacks, itemId, delta, this.getAppServerAgentDelivery(itemId));
         }
         break;
       }
@@ -2263,7 +2341,11 @@ export class CodexSessionService {
         const item = readRecord(params?.item);
         const id = readString(item?.id) ?? randomItemId();
         const type = readString(item?.type);
-        if (type === "commandExecution") {
+        if (type === "agentMessage") {
+          if (readAgentMessageDelivery(item) === "async") {
+            this.appServerAsyncAgentMessages.add(this.getAppServerItemLifecycleKey(id));
+          }
+        } else if (type === "commandExecution") {
           this.emitAppServerToolStart(callbacks, getCommandExecutionToolName(item), id);
         } else if (type === "mcpToolCall") {
           this.emitAppServerToolStart(callbacks, `mcp:${readString(item?.server) ?? "unknown"}/${readString(item?.tool) ?? "tool"}`, id);
@@ -2349,7 +2431,16 @@ export class CodexSessionService {
         const id = readString(item?.id) ?? randomItemId();
         const type = readString(item?.type);
         if (type === "agentMessage") {
-          this.emitAppServerAgentSnapshot(callbacks, id, readString(item?.text) ?? "");
+          const delivery = readAgentMessageDelivery(item) ?? this.getAppServerAgentDelivery(id);
+          if (delivery === "async") {
+            this.appServerAsyncAgentMessages.add(this.getAppServerItemLifecycleKey(id));
+          }
+          this.emitAppServerAgentSnapshot(callbacks, id, readString(item?.text) ?? "", delivery);
+          const lifecycleKey = this.getAppServerItemLifecycleKey(id);
+          if (delivery === "async" && !this.appServerCompletedAgentMessages.has(lifecycleKey)) {
+            this.appServerCompletedAgentMessages.add(lifecycleKey);
+            callbacks.onAgentMessageComplete?.({ agentMessageId: id, startsNewMessage: false, delivery });
+          }
         } else if (type === "commandExecution") {
           this.emitAppServerToolStart(callbacks, getCommandExecutionToolName(item), id);
           const output = readString(item?.aggregatedOutput);
@@ -2445,6 +2536,14 @@ export class CodexSessionService {
         }
         break;
       }
+      case "autoApprovalReview/strictReviewRequired": {
+        const turnId = readString(params?.turnId) ?? "turn";
+        const toolId = `strict-review-${turnId}`;
+        this.emitAppServerToolStart(callbacks, "review:strict", toolId);
+        this.emitAppServerToolSnapshot(callbacks, toolId, "Codex strict security review required.");
+        this.emitAppServerToolEnd(callbacks, toolId, false);
+        break;
+      }
       case "thread/tokenUsage/updated": {
         const usage = readRecord(params?.tokenUsage);
         const last = readRecord(usage?.last);
@@ -2485,7 +2584,9 @@ export class CodexSessionService {
         const turnItems = Array.isArray(turn?.items)
           ? turn.items.map(readRecord).filter((item): item is Record<string, unknown> => Boolean(item))
           : [];
-        const agentItems = turnItems.filter((item) => readString(item.type) === "agentMessage");
+        const agentItems = turnItems.filter(
+          (item) => readString(item.type) === "agentMessage" && readAgentMessageDelivery(item) !== "async",
+        );
         const finalAgentItem =
           agentItems.filter((item) => readString(item.phase) === "final_answer").at(-1)
           ?? agentItems.at(-1);
@@ -2508,10 +2609,13 @@ export class CodexSessionService {
       case "thread/deleted": {
         if (!notificationThreadId || notificationThreadId === this.currentThreadId) {
           this.currentThreadId = null;
+          this.currentProjectId = undefined;
           this.appServerThreadLoaded = false;
           this.appServerCurrentTurnId = null;
           this.appServerToolLifecycles.clear();
           this.appServerAgentMessages.clear();
+          this.appServerAsyncAgentMessages.clear();
+          this.appServerCompletedAgentMessages.clear();
         }
         break;
       }
@@ -2522,6 +2626,8 @@ export class CodexSessionService {
         this.appServerCurrentTurnId = null;
         this.appServerToolLifecycles.clear();
         this.appServerAgentMessages.clear();
+        this.appServerAsyncAgentMessages.clear();
+        this.appServerCompletedAgentMessages.clear();
         this.lastTurnTokens = undefined;
         this.contextTokensUsed = undefined;
         callbacks.onThreadReverted?.();
@@ -2534,6 +2640,7 @@ export class CodexSessionService {
       case "thread/status/changed":
       case "thread/settings/updated":
       case "thread/name/updated":
+      case "project/changed":
       case "turn/diff/updated":
       case "turn/plan/updated":
       case "account/rateLimits/updated":
@@ -2543,6 +2650,12 @@ export class CodexSessionService {
       case "mcpServer/oauthLogin/completed":
       case "mcpServer/startupStatus/updated":
         break;
+      case "thread/project/updated": {
+        if (!notificationThreadId || notificationThreadId === this.currentThreadId) {
+          this.currentProjectId = readString(params?.projectId);
+        }
+        break;
+      }
       case "model/rerouted": {
         const toModel = readString(params?.toModel);
         if (toModel && toModel !== this.currentModel) {
@@ -2651,6 +2764,7 @@ export class CodexSessionService {
     callbacks: CodexSessionCallbacks,
     agentMessageId: string,
     delta: string,
+    delivery?: "async",
   ): void {
     if (!delta) {
       return;
@@ -2661,6 +2775,7 @@ export class CodexSessionService {
     callbacks.onTextDelta(delta, {
       agentMessageId,
       startsNewMessage: previous === undefined,
+      ...(delivery ? { delivery } : {}),
     });
   }
 
@@ -2668,6 +2783,7 @@ export class CodexSessionService {
     callbacks: CodexSessionCallbacks,
     agentMessageId: string,
     snapshot: string,
+    delivery?: "async",
   ): void {
     if (!snapshot) {
       return;
@@ -2680,8 +2796,15 @@ export class CodexSessionService {
       callbacks.onTextDelta(delta, {
         agentMessageId,
         startsNewMessage: previous === undefined,
+        ...(delivery ? { delivery } : {}),
       });
     }
+  }
+
+  private getAppServerAgentDelivery(agentMessageId: string): "async" | undefined {
+    return this.appServerAsyncAgentMessages.has(this.getAppServerItemLifecycleKey(agentMessageId))
+      ? "async"
+      : undefined;
   }
 
   private getAppServerItemLifecycleKey(itemId: string): string {
@@ -2758,7 +2881,8 @@ function toTurnRecoveryItem(
 
   if (type === "agentMessage") {
     const text = readString(item.text)?.trim();
-    return text ? { id, kind: "response", text } : undefined;
+    const delivery = readAgentMessageDelivery(item);
+    return text ? { id, kind: "response", text, ...(delivery ? { delivery } : {}) } : undefined;
   }
 
   if (type === "commandExecution") {
@@ -2817,6 +2941,10 @@ function toTurnRecoveryItem(
     detail: trimRecoveryDetail(summarizeCanonicalAppServerItem(item) ?? ""),
     isError: isCanonicalAppServerItemError(item),
   };
+}
+
+function readAgentMessageDelivery(item: Record<string, unknown> | undefined): "async" | undefined {
+  return readString(item?.delivery) === "async" ? "async" : undefined;
 }
 
 function trimRecoveryDetail(value: string): string {

@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 type ThreadFixture = {
   id: string;
+  project_id?: string | null;
   title: string;
   cwd: string;
   model: string | null;
@@ -20,6 +21,7 @@ type LoadOptions = {
   stats?: Record<string, number>;
   threads?: ThreadFixture[];
   threadSourceColumn?: boolean;
+  projectIdColumn?: boolean;
   modelsJson?: string;
   betterSqliteAvailable?: boolean;
   openThrows?: boolean;
@@ -123,6 +125,9 @@ function runAllQuery(
       "archived",
       "source",
     ];
+    if (options.projectIdColumn !== false) {
+      columns.push("project_id");
+    }
     if (options.threadSourceColumn !== false) {
       columns.push("thread_source");
     }
@@ -223,6 +228,7 @@ describe("codex-state", () => {
       threads: [
         {
           id: "thread-1",
+          project_id: "project-1",
           title: "Newest",
           cwd: "/workspace/b",
           model: "gpt-5.4",
@@ -255,6 +261,7 @@ describe("codex-state", () => {
     expect(state.listThreads(10)).toEqual([
       {
         id: "thread-1",
+        projectId: "project-1",
         title: "Newest",
         cwd: "/workspace/b",
         model: "gpt-5.4",

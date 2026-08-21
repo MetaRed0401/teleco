@@ -2366,6 +2366,25 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
             scheduleFlush();
           });
       },
+      onAgentMessageComplete: (metadata) => {
+        if (metadata.delivery !== "async") {
+          return;
+        }
+        const commitTask = textDeltaQueue
+          .catch((error) => {
+            console.error("Failed to process async agent message delta", error);
+          })
+          .then(async () => {
+            if (currentAgentMessageId === metadata.agentMessageId && accumulatedText.trim()) {
+              await commitCurrentAssistantSegment();
+            }
+          })
+          .catch((error) => {
+            console.error("Failed to commit async agent message", error);
+          });
+        textDeltaQueue = commitTask;
+        segmentCommitQueue = commitTask;
+      },
       onToolStart: (toolName: string, toolCallId: string) => {
         if (toolVerbosity === "summary") {
           toolCounts.set(toolName, (toolCounts.get(toolName) ?? 0) + 1);
@@ -8615,6 +8634,7 @@ function renderSessionSelectionPanel(
     );
     const metadata = [
       session.section?.name ? `section: ${session.section.name}` : undefined,
+      session.projectId ? `project: ${shortId(session.projectId)}` : undefined,
       session.model || undefined,
       session.reasoningEffort || undefined,
       formatRelativeTime(session.recencyAt ?? session.updatedAt),

@@ -1,6 +1,6 @@
 # macOS LaunchAgent service
 
-TeleCodex can run as a macOS user LaunchAgent. This is the macOS equivalent of the Linux user systemd service: it runs under your user account, can reuse your Codex CLI auth state, and can access the same workspace files and developer tools available on the host. Codex CLI/app-server 0.144.1 is the minimum compatible baseline; 0.148.0 is the recommended stable version.
+TeleCodex can run as a macOS user LaunchAgent. This is the macOS equivalent of the Linux user systemd service: it runs under your user account, can reuse your Codex CLI auth state, and can access the same workspace files and developer tools available on the host. Codex CLI/app-server 0.144.1 is the minimum compatible baseline; 0.149.0 is the recommended stable version.
 
 The launchd helper installs one persistent Codex app-server LaunchAgent on `ws://127.0.0.1:45123`. All Teleco bot LaunchAgents share this loopback-only runtime, so restarting or updating a bridge does not terminate an active Codex turn. Direct `pnpm dev` runs retain bridge-owned stdio unless the helper-provided runtime flag is present.
 

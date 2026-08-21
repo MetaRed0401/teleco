@@ -1,7 +1,7 @@
 {
   "minimum": "0.144.1",
-  "previous": "0.147.0",
-  "recommended": "0.148.0",
-  "candidate": "0.148.0",
+  "previous": "0.148.0",
+  "recommended": "0.149.0",
+  "candidate": "0.149.0",
   "alpha": "next"
 }

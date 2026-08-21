@@ -18,6 +18,7 @@ const compatMinor = readCodexMinor(compatVersion);
 const expect0146 = compatMinor !== undefined && compatMinor >= 146;
 const expect0147 = compatMinor !== undefined && compatMinor >= 147;
 const expect0148 = compatMinor !== undefined && compatMinor >= 148;
+const expect0149 = compatMinor !== undefined && compatMinor >= 149;
 mkdirSync(codexHome, { recursive: true });
 mkdirSync(workspace, { recursive: true });
 let stage = "schema generation";
@@ -100,6 +101,20 @@ try {
       if (!schemaText.includes(protocolName)) throw new Error("0.148 schema contract");
     }
   }
+  if (expect0149) {
+    for (const protocolName of [
+      "project/changed",
+      "thread/project/updated",
+      "autoApprovalReview/strictReviewRequired",
+      "McpResourceReadParams",
+      "originCallId",
+      "connectorId",
+      "appContext",
+      "delivery",
+    ]) {
+      if (!schemaText.includes(protocolName)) throw new Error("0.149 schema contract");
+    }
+  }
 
   stage = "initialize";
   client = createClient(codexHome, workspace);
@@ -119,7 +134,10 @@ try {
   if (typeof threadId !== "string" || !threadId) throw new Error("thread id");
 
   stage = "thread read";
-  await client.request("thread/read", { threadId, includeTurns: false });
+  const threadRead = await client.request("thread/read", { threadId, includeTurns: false });
+  if (expect0149 && !("projectId" in (threadRead?.thread ?? {}))) {
+    throw new Error("0.149 thread project contract");
+  }
   if (expect0146) {
     stage = "0.146 thread history";
     try {
