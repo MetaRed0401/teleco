@@ -38,6 +38,7 @@ try {
     "item/permissions/requestApproval",
     "mcpServer/elicitation/request",
     "thread/compact/start",
+    "thread/unsubscribe",
     "thread/deleted",
     "thread/settings/updated",
     "account/rateLimits/updated",
@@ -190,6 +191,10 @@ try {
       if (error?.rpcCode !== -32600) throw error;
     }
   }
+
+  stage = "thread unsubscribe";
+  const unsubscribeResult = await client.request("thread/unsubscribe", { threadId });
+  if (unsubscribeResult?.status !== "unsubscribed") throw new Error("thread unsubscribe response");
 
   stage = "app-server restart";
   await client.close();

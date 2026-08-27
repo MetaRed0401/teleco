@@ -24,6 +24,7 @@ describe("bot-ui", () => {
       expect(plain).toContain("/steer");
       expect(plain).toContain("/stop");
       expect(plain).toContain("/permission");
+      expect(plain).toContain("/handback — Confirm and release the active thread back to Codex");
       expect(plain).toContain("/files");
       expect(plain).toContain("/grep");
       expect(plain).toContain("/update");

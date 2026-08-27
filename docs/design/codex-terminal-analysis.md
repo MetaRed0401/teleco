@@ -19,7 +19,7 @@ Those outputs exist in the TeleCodex process and Telegram, not in a separate Cod
 
 ## What is still shared
 
-The important shared object is the Codex thread id. TeleCodex stores and resumes Codex threads through app-server, and `/handback` prints:
+The important shared object is the Codex thread id. TeleCodex stores and resumes Codex threads through app-server. `/handback` first unsubscribes the TeleCodex app-server connection, then prints:
 
 ```bash
 cd '/path/to/project' && codex resume '<thread-id>'

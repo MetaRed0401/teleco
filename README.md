@@ -76,6 +76,23 @@ TELEGRAM_ALLOWED_USER_IDS=<telegram-user-id>
 
 If you already use Codex CLI on this machine, leave `CODEX_API_KEY` empty so TeleCodex can use the existing Codex auth state. If you do not use Codex CLI auth, set `CODEX_API_KEY` explicitly.
 
+### Linuxbrew beta
+
+The packaged CLI installs application code under Homebrew `libexec` and keeps instance secrets outside the Cellar:
+
+```bash
+brew tap MetaRed0401/teleco
+brew install teleco
+teleco instance add first
+teleco instance migrate /path/to/existing/teleco
+teleco service install first
+teleco service start first
+```
+
+Bot tokens are entered through a hidden prompt. For automation, use `--token-stdin`; token command-line arguments are intentionally unsupported. Instance files are stored under `~/.config/teleco/instances/` with restrictive permissions. Migration previews `.env` and `.env.<instance>` files before creating private backups and importing them.
+
+Use `brew upgrade teleco` to update packaged code, then `teleco service restart --all`. Run `teleco doctor` for installation diagnostics. See [docs/homebrew-linux.md](docs/homebrew-linux.md) for local Formula testing, migration, and service details.
+
 ## Environment Configuration
 
 Important options are documented in `.env.example`.
@@ -233,7 +250,7 @@ When `.env.*` files exist, commands that can affect running services require eit
 | `/logout` | Clear Telegram-driven login state when enabled. |
 | `/voice` | Show voice transcription backend status. |
 | `/attach <thread-id>` | Attach the current Telegram context to a Codex thread. |
-| `/handback` | Hand the active thread back to Codex CLI and print a resume command. |
+| `/handback` | Confirm, release the active app-server thread, and print a Codex resume command. |
 | `/files [path]` | List files under a workspace path. |
 | `/tree [path]` | Show a workspace tree. |
 | `/find <query>` | Find files by name. |

@@ -87,6 +87,7 @@ import {
   updateServiceOperationMarkerPid,
 } from "./service-operation-marker.js";
 import { SessionRegistry } from "./session-registry.js";
+import { getTelecoVersion } from "./version.js";
 import {
   formatTelegramResponseFormatLabel,
   formatTelegramPrettyModeLabel,
@@ -114,6 +115,7 @@ import {
 } from "./workspace-browser.js";
 
 const TELEGRAM_MESSAGE_LIMIT = 4000;
+const CONFIRMATION_TTL_MS = 5 * 60 * 1000;
 const EDIT_DEBOUNCE_MS = 800;
 const TOOL_UPDATE_DEBOUNCE_MS = 1200;
 const TYPING_INTERVAL_MS = 4500;
@@ -288,6 +290,14 @@ type StreamingSettingButton = KeyboardItem & {
   value: ResponsePreviewMode | ToolActivityMode | FinalResponseMode;
 };
 
+type ConfirmationAction = "logout" | "restart" | "force_restart" | "update" | "handback";
+
+type PendingConfirmation = {
+  action: ConfirmationAction;
+  token: string;
+  expiresAt: number;
+};
+
 type TextOptions = {
   parseMode?: TelegramParseMode;
   fallbackText?: string;
@@ -367,6 +377,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   const pendingFormattingButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingPrettyButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingStreamingButtons = new Map<TelegramContextKey, StreamingSettingButton[]>();
+  const pendingConfirmations = new Map<TelegramContextKey, PendingConfirmation>();
   const pendingApprovals = new Map<string, PendingApproval>();
   const pendingApprovalRequests = new Map<string, Promise<CodexApprovalResponse>>();
   const pendingMcpElicitations = new Map<string, PendingMcpElicitation>();
@@ -395,6 +406,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     pendingFormattingButtons.delete(key);
     pendingPrettyButtons.delete(key);
     pendingStreamingButtons.delete(key);
+    pendingConfirmations.delete(key);
     lastPromptInput.delete(key);
     promptQueues.delete(key);
     autoCompactStates.delete(key);
@@ -496,7 +508,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     });
   };
 
-  const buildConfirmKeyboard = (action: "logout" | "restart" | "force_restart" | "update"): InlineKeyboard => {
+  const buildConfirmKeyboard = (action: ConfirmationAction, token: string): InlineKeyboard => {
     const label =
       action === "logout"
         ? "Confirm logout"
@@ -504,19 +516,38 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
           ? "Restart when idle"
           : action === "force_restart"
             ? "Force restart now"
-            : "Confirm update";
-    return new InlineKeyboard().text(label, `confirm_${action}`).row().text("Cancel", "ui_cancel");
+            : action === "handback"
+              ? "Hand back thread"
+              : "Confirm update";
+    return new InlineKeyboard()
+      .text(label, `confirm_${action}:${token}`)
+      .row()
+      .text("Cancel", `confirm_cancel:${token}`);
   };
 
   const sendConfirmPanel = async (
     ctx: Context,
-    action: "logout" | "restart" | "force_restart" | "update",
+    action: ConfirmationAction,
     lines: { html: string[]; plain: string[] },
   ): Promise<void> => {
-    await safeReply(ctx, lines.html.join("\n"), {
-      fallbackText: lines.plain.join("\n"),
-      replyMarkup: buildConfirmKeyboard(action),
-    });
+    const contextKey = contextKeyFromCtx(ctx);
+    if (!contextKey) {
+      return;
+    }
+    const token = randomUUID().replace(/-/g, "").slice(0, 12);
+    pendingConfirmations.set(contextKey, { action, token, expiresAt: Date.now() + CONFIRMATION_TTL_MS });
+    try {
+      await safeReply(ctx, lines.html.join("\n"), {
+        fallbackText: lines.plain.join("\n"),
+        replyMarkup: buildConfirmKeyboard(action, token),
+      });
+    } catch (error) {
+      const pending = pendingConfirmations.get(contextKey);
+      if (pending?.token === token) {
+        pendingConfirmations.delete(contextKey);
+      }
+      throw error;
+    }
   };
 
   const trySteerActiveTurn = async (
@@ -884,7 +915,37 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
           },
         );
       }
-      const cliResult = await runCliPtyCompact(session.getInfo(), { signal: compactAbortController.signal });
+      let cliResult: Awaited<ReturnType<typeof runCliPtyCompact>>;
+      try {
+        cliResult = await runCliPtyCompact(session.getInfo(), { signal: compactAbortController.signal });
+      } catch (error) {
+        if (!nativeResult.eventObserved || isAbortLikeError(error)) {
+          throw error;
+        }
+        await registry.resumeThread(contextKey, session, info.threadId);
+        registry.updateMetadata(contextKey, session);
+        markAutoCompactCompleted(contextKey);
+        finishActiveOperation(config, activeOperationId, "completed");
+        activeOperationFinished = true;
+        await safeReply(
+          ctx,
+          [
+            `<b>${options.automatic ? "Auto compact completed." : "Compact completed."}</b>`,
+            `<b>Thread:</b> <code>${escapeHTML(info.threadId)}</code>`,
+            "<b>Native event:</b> <code>observed</code>",
+            "<b>CLI synchronization:</b> <code>not confirmed</code>",
+          ].join("\n"),
+          {
+            fallbackText: [
+              options.automatic ? "Auto compact completed." : "Compact completed.",
+              `Thread: ${info.threadId}`,
+              "Native event: observed",
+              "CLI synchronization: not confirmed",
+            ].join("\n"),
+          },
+        );
+        return true;
+      }
       await registry.resumeThread(contextKey, session, cliResult.threadId);
       registry.updateMetadata(contextKey, session);
       markAutoCompactCompleted(contextKey);
@@ -3063,6 +3124,98 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     scheduleServiceRestart(force);
   };
 
+  const runHandbackCommand = async (ctx: Context): Promise<void> => {
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      return;
+    }
+
+    const { contextKey, session } = contextSession;
+    if (isBusy(contextKey)) {
+      await safeReply(ctx, escapeHTML("Cannot hand back while a prompt is running. Use /abort first."), {
+        fallbackText: "Cannot hand back while a prompt is running. Use /abort first.",
+      });
+      return;
+    }
+    if (!session.hasActiveThread()) {
+      await safeReply(ctx, escapeHTML("No active thread to hand back."), {
+        fallbackText: "No active thread to hand back.",
+      });
+      return;
+    }
+
+    try {
+      const info = await session.handback();
+      updateSessionMetadata(contextKey, session);
+
+      if (!info.threadId) {
+        await safeReply(
+          ctx,
+          escapeHTML(
+            "This thread has not started yet, so there is no resumable thread ID. Send a message to create one, or use /new to start fresh.",
+          ),
+          {
+            fallbackText:
+              "This thread has not started yet, so there is no resumable thread ID. Send a message to create one, or use /new to start fresh.",
+          },
+        );
+        return;
+      }
+
+      const shellEscape = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
+      const resumeCommand = `cd ${shellEscape(info.workspace)} && codex resume ${shellEscape(info.threadId)}`;
+
+      let copiedToClipboard = false;
+      if (process.platform === "darwin") {
+        try {
+          const { spawnSync } = await import("node:child_process");
+          const result = spawnSync("pbcopy", [], {
+            input: resumeCommand,
+            timeout: 2000,
+            stdio: ["pipe", "ignore", "ignore"],
+          });
+          copiedToClipboard = result.status === 0;
+        } catch {
+          // Ignore clipboard failures.
+        }
+      }
+
+      const plainText = [
+        "🔄 Thread handed back to Codex.",
+        "TeleCodex released its app-server subscription.",
+        "",
+        "Resume from Codex app, or run this in your terminal:",
+        resumeCommand,
+        copiedToClipboard ? "" : undefined,
+        copiedToClipboard ? "📋 Command copied to clipboard!" : undefined,
+        "",
+        "Send any message here to start a new TeleCodex thread.",
+      ]
+        .filter((line): line is string => line !== undefined)
+        .join("\n");
+
+      const html = [
+        "<b>🔄 Thread handed back to Codex.</b>",
+        "TeleCodex released its app-server subscription.",
+        "",
+        "Resume from Codex app, or run this in your terminal:",
+        `<pre>${escapeHTML(resumeCommand)}</pre>`,
+        copiedToClipboard ? "" : undefined,
+        copiedToClipboard ? "📋 <i>Command copied to clipboard!</i>" : undefined,
+        "",
+        "Send any message here to start a new TeleCodex thread.",
+      ]
+        .filter((line): line is string => line !== undefined)
+        .join("\n");
+
+      await safeReply(ctx, html, { fallbackText: plainText });
+    } catch (error) {
+      await safeReply(ctx, `<b>Handback failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: `Handback failed: ${friendlyErrorText(error)}`,
+      });
+    }
+  };
+
   bot.command("status", async (ctx) => {
     await sendStatusReply(ctx);
   });
@@ -4256,75 +4409,21 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       });
       return;
     }
-
-    try {
-      const info = session.handback();
-      updateSessionMetadata(contextKey, session);
-
-      if (!info.threadId) {
-        await safeReply(
-          ctx,
-          escapeHTML(
-            "This thread has not started yet, so there is no resumable thread ID. Send a message to create one, or use /new to start fresh.",
-          ),
-          {
-            fallbackText:
-              "This thread has not started yet, so there is no resumable thread ID. Send a message to create one, or use /new to start fresh.",
-          },
-        );
-        return;
-      }
-
-      const shellEscape = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
-      const resumeCommand = `cd ${shellEscape(info.workspace)} && codex resume ${shellEscape(info.threadId)}`;
-
-      let copiedToClipboard = false;
-      if (process.platform === "darwin") {
-        try {
-          const { spawnSync } = await import("node:child_process");
-          const result = spawnSync("pbcopy", [], {
-            input: resumeCommand,
-            timeout: 2000,
-            stdio: ["pipe", "ignore", "ignore"],
-          });
-          copiedToClipboard = result.status === 0;
-        } catch {
-          // Ignore clipboard failures.
-        }
-      }
-
-      const plainText = [
-        "🔄 Thread handed back to Codex CLI.",
-        "",
-        "Run this in your terminal:",
-        resumeCommand,
-        copiedToClipboard ? "" : undefined,
-        copiedToClipboard ? "📋 Command copied to clipboard!" : undefined,
-        "",
-        "Send any message here to start a new TeleCodex thread.",
-      ]
-        .filter((line): line is string => line !== undefined)
-        .join("\n");
-
-      const html = [
-        "<b>🔄 Thread handed back to Codex CLI.</b>",
-        "",
-        "Run this in your terminal:",
-        `<pre>${escapeHTML(resumeCommand)}</pre>`,
-        copiedToClipboard ? "" : undefined,
-        copiedToClipboard ? "📋 <i>Command copied to clipboard!</i>" : undefined,
-        "",
-        "Send any message here to start a new TeleCodex thread.",
-      ]
-        .filter((line): line is string => line !== undefined)
-        .join("\n");
-
-      await safeReply(ctx, html, { fallbackText: plainText });
-    } catch (error) {
-      await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
-        fallbackText: `Failed: ${friendlyErrorText(error)}`,
-      });
-    }
+    const info = session.getInfo();
+    await sendConfirmPanel(ctx, "handback", {
+      html: [
+        "<b>Hand this thread back to Codex?</b>",
+        `<b>Thread:</b> <code>${escapeHTML(info.threadId ?? "(not started yet)")}</code>`,
+        `<b>Workspace:</b> <code>${escapeHTML(info.workspace)}</code>`,
+        "TeleCodex will release its app-server subscription and detach this Telegram context.",
+      ],
+      plain: [
+        "Hand this thread back to Codex?",
+        `Thread: ${info.threadId ?? "(not started yet)"}`,
+        `Workspace: ${info.workspace}`,
+        "TeleCodex will release its app-server subscription and detach this Telegram context.",
+      ],
+    });
   });
 
   bot.command("attach", async (ctx) => {
@@ -4993,13 +5092,61 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     });
   });
 
-  bot.callbackQuery(/^confirm_(logout|restart|force_restart|update)$/, async (ctx) => {
-    const action = ctx.match?.[1];
-    if (!action) {
+  bot.callbackQuery(/^confirm_cancel:([0-9a-f]{12})$/, async (ctx) => {
+    const contextKey = contextKeyFromCtx(ctx);
+    const token = ctx.match?.[1];
+    const pending = contextKey ? pendingConfirmations.get(contextKey) : undefined;
+    if (!contextKey || !token || pending?.token !== token || pending.expiresAt <= Date.now()) {
+      if (contextKey && pending?.token === token) {
+        pendingConfirmations.delete(contextKey);
+      }
+      await ctx.answerCallbackQuery({ text: "Confirmation expired" });
+      return;
+    }
+    pendingConfirmations.delete(contextKey);
+    await ctx.answerCallbackQuery({ text: "Cancelled" });
+    const chatId = ctx.chat?.id;
+    const messageId = ctx.callbackQuery.message?.message_id;
+    if (chatId && messageId) {
+      await safeEditMessage(bot, chatId, messageId, "<b>Cancelled.</b>", {
+        fallbackText: "Cancelled.",
+        messageThreadId: ctx.callbackQuery.message?.message_thread_id,
+      });
+    }
+  });
+
+  bot.callbackQuery(/^confirm_(logout|restart|force_restart|update|handback):([0-9a-f]{12})$/, async (ctx) => {
+    const action = ctx.match?.[1] as ConfirmationAction | undefined;
+    const token = ctx.match?.[2];
+    const contextKey = contextKeyFromCtx(ctx);
+    const pending = contextKey ? pendingConfirmations.get(contextKey) : undefined;
+    if (
+      !action
+      || !token
+      || !contextKey
+      || pending?.action !== action
+      || pending.token !== token
+      || pending.expiresAt <= Date.now()
+    ) {
+      if (contextKey && pending?.token === token) {
+        pendingConfirmations.delete(contextKey);
+      }
+      await ctx.answerCallbackQuery({ text: "Confirmation expired" });
       return;
     }
 
+    pendingConfirmations.delete(contextKey);
+
     await ctx.answerCallbackQuery({ text: `Confirmed ${action}` });
+    const chatId = ctx.chat?.id;
+    const messageId = ctx.callbackQuery.message?.message_id;
+    if (chatId && messageId) {
+      const label = action === "handback" ? "Handback" : action.replace("_", " ");
+      await safeEditMessage(bot, chatId, messageId, `<b>${escapeHTML(label)} confirmed.</b>`, {
+        fallbackText: `${label} confirmed.`,
+        messageThreadId: ctx.callbackQuery.message?.message_thread_id,
+      });
+    }
     if (action === "logout") {
       await runTelegramLogout(ctx);
       return;
@@ -5008,7 +5155,15 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       await runServiceUpdateCommand(ctx);
       return;
     }
+    if (action === "handback") {
+      await runHandbackCommand(ctx);
+      return;
+    }
     await runServiceRestartCommand(ctx, action === "force_restart");
+  });
+
+  bot.callbackQuery(/^confirm_(logout|restart|force_restart|update)$/, async (ctx) => {
+    await ctx.answerCallbackQuery({ text: "Confirmation expired. Run the command again." });
   });
 
   bot.callbackQuery(/^cmd_(files|sessions|search_help)$/, async (ctx) => {
@@ -6448,7 +6603,7 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "sessions", description: "Browse & switch threads" },
     { command: "session_check", description: "Check CLI thread connection" },
     { command: "attach", description: "Bind a Codex thread to this topic" },
-    { command: "handback", description: "Hand thread to Codex CLI" },
+    { command: "handback", description: "Release thread back to Codex" },
     { command: "retry", description: "Resend the last prompt" },
     { command: "queue", description: "Queue prompts for this context" },
     { command: "steer", description: "Steer the active Codex turn" },
@@ -6839,6 +6994,7 @@ function renderMobileStatus(options: {
 
   const plainLines = [
     "Codex status",
+    `Teleco: ${getTelecoVersion()}`,
     `Auth: ${options.authStatus} (${options.authMethod})`,
     `Account: ${account}`,
     usage ? `Usage: ${usage}` : undefined,
@@ -8189,9 +8345,14 @@ function getServiceInstanceName(): string {
 }
 
 function startServiceCommand(command: "restart" | "update", force = false): { instance: string; pid?: number } {
-  const scriptPath = path.join(process.cwd(), "scripts", "telecodex-service.sh");
   const instance = getServiceInstanceName();
-  const child = spawn(scriptPath, [command, instance, ...(force ? ["--force"] : [])], {
+  const cliEntry = process.env.TELECO_CLI_ENTRY?.trim();
+  const scriptPath = path.join(process.cwd(), "scripts", "telecodex-service.sh");
+  const executable = cliEntry ? process.execPath : scriptPath;
+  const args = cliEntry
+    ? [cliEntry, "service", command, instance, ...(force ? ["--force"] : [])]
+    : [command, instance, ...(force ? ["--force"] : [])];
+  const child = spawn(executable, args, {
     cwd: process.cwd(),
     env: process.env,
     detached: true,

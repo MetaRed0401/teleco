@@ -2019,7 +2019,7 @@ describe("CodexSessionService", () => {
 
     await service.prompt("hello", callbacks);
 
-    expect(service.handback()).toEqual({
+    await expect(service.handback()).resolves.toEqual({
       threadId: "thread-live",
       workspace: "/workspace/base",
     });
@@ -2048,6 +2048,48 @@ describe("CodexSessionService", () => {
         output: 1,
       },
     });
+  });
+
+  it("unsubscribes the app-server thread before handback", async () => {
+    const service = await createAppServerService();
+    const client = mockAppServerState.CodexAppServerClient.mock.results[0]?.value;
+    mockAppServerState.setRequestHandler(async (method: string, params?: unknown) => {
+      if (method === "thread/unsubscribe") {
+        expect(params).toEqual({ threadId: "thread-app-server" });
+        return { status: "unsubscribed" };
+      }
+      throw new Error(`Unexpected app-server request: ${method}`);
+    });
+
+    await expect(service.handback()).resolves.toEqual({
+      threadId: "thread-app-server",
+      workspace: "/workspace/base",
+    });
+
+    expect(client.request).toHaveBeenCalledWith(
+      "thread/unsubscribe",
+      { threadId: "thread-app-server" },
+      5000,
+    );
+    expect(client.close).toHaveBeenCalledTimes(1);
+    expect(service.hasActiveThread()).toBe(false);
+  });
+
+  it("keeps the app-server thread attached when handback unsubscribe fails", async () => {
+    const service = await createAppServerService();
+    const client = mockAppServerState.CodexAppServerClient.mock.results[0]?.value;
+    mockAppServerState.setRequestHandler(async (method: string) => {
+      if (method === "thread/unsubscribe") {
+        throw new Error("unsubscribe failed");
+      }
+      throw new Error(`Unexpected app-server request: ${method}`);
+    });
+
+    await expect(service.handback()).rejects.toThrow("unsubscribe failed");
+
+    expect(client.close).not.toHaveBeenCalled();
+    expect(service.hasActiveThread()).toBe(true);
+    expect(service.getInfo().threadId).toBe("thread-app-server");
   });
 
   it("listAllSessions delegates to codex-state", async () => {

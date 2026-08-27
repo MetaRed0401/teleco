@@ -34,6 +34,7 @@ project.type
 
 # Test coverage
 coverage/
+release/
 
 .env.*
 !.env.example

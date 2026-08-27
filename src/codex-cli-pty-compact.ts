@@ -6,6 +6,8 @@ import type { CodexSessionInfo } from "./codex-session.js";
 
 const CLI_COMPACT_TIMEOUT_MS = 20 * 60 * 1000;
 const CLI_READY_FALLBACK_MS = 2500;
+const CLI_READY_RETRY_MS = 1000;
+const CLI_RESUME_MAX_WAIT_MS = 30_000;
 const OUTPUT_PREVIEW_LIMIT = 4000;
 
 export interface CliPtyCompactResult {
@@ -27,8 +29,11 @@ export async function runCliPtyCompact(
 
   const startedAt = Date.now();
   let output = "";
+  let phaseOutput = "";
   let compactSent = false;
+  let trustPromptHandled = false;
   let settled = false;
+  let readyWaitStartedAt = startedAt;
   let readyTimer: NodeJS.Timeout | undefined;
   let timeoutTimer: NodeJS.Timeout | undefined;
   const resolvedCodexCli = resolveCodexCliPath();
@@ -80,7 +85,29 @@ export async function runCliPtyCompact(
         return;
       }
       compactSent = true;
+      phaseOutput = "";
       child.write("/compact\r");
+    };
+
+    const scheduleCompact = (delayMs: number): void => {
+      readyTimer && clearTimeout(readyTimer);
+      readyTimer = setTimeout(() => {
+        readyTimer = undefined;
+        const plain = stripTerminalControlSequences(phaseOutput);
+        if (!trustPromptHandled && isWorkspaceTrustPrompt(plain)) {
+          trustPromptHandled = true;
+          phaseOutput = "";
+          readyWaitStartedAt = Date.now();
+          child.write("\r");
+          scheduleCompact(CLI_READY_FALLBACK_MS);
+          return;
+        }
+        if (isResumePending(plain) && Date.now() - readyWaitStartedAt < CLI_RESUME_MAX_WAIT_MS) {
+          scheduleCompact(CLI_READY_RETRY_MS);
+          return;
+        }
+        sendCompact();
+      }, delayMs);
     };
 
     const onAbort = (): void => {
@@ -91,14 +118,29 @@ export async function runCliPtyCompact(
     timeoutTimer = setTimeout(() => {
       fail(new Error(`Timed out waiting for CLI compact completion. ${formatOutputPreview(output)}`.trim()));
     }, CLI_COMPACT_TIMEOUT_MS);
-    readyTimer = setTimeout(sendCompact, CLI_READY_FALLBACK_MS);
+    scheduleCompact(CLI_READY_FALLBACK_MS);
 
     child.onData((data) => {
       output = appendOutput(output, data);
-      const plain = stripAnsi(output);
+      phaseOutput = appendOutput(phaseOutput, data);
+      const plain = stripTerminalControlSequences(phaseOutput);
 
-      if (!compactSent && isCliReady(plain)) {
-        sendCompact();
+      if (!compactSent && !trustPromptHandled && isWorkspaceTrustPrompt(plain)) {
+        trustPromptHandled = true;
+        phaseOutput = "";
+        readyWaitStartedAt = Date.now();
+        child.write("\r");
+        scheduleCompact(CLI_READY_FALLBACK_MS);
+        return;
+      }
+
+      if (!compactSent && isCliReady(plain) && !isResumePending(plain)) {
+        scheduleCompact(500);
+        return;
+      }
+
+      if (compactSent && isCompactFailure(plain)) {
+        fail(new Error(`Codex CLI compact failed. ${formatOutputPreview(output)}`.trim()));
         return;
       }
 
@@ -127,11 +169,53 @@ export async function runCliPtyCompact(
 }
 
 function isCliReady(output: string): boolean {
-  return /OpenAI Codex|Session:|Context window|\/status|^\s*>/im.test(output);
+  return lastCliReadyIndex(output) >= 0;
 }
 
 function isCompactComplete(output: string): boolean {
-  return /compacted|compaction complete|compact complete|context compacted|conversation compacted/i.test(output);
+  if (/compacted|compaction complete|compact complete|context compacted|conversation compacted/i.test(output)) {
+    return true;
+  }
+  const commandIndex = output.toLowerCase().lastIndexOf("/compact");
+  return commandIndex >= 0 && lastCliReadyIndex(output) > commandIndex;
+}
+
+function isCompactFailure(output: string): boolean {
+  return /compact(?:ion)? failed|failed to compact|unable to compact/i.test(output);
+}
+
+function isWorkspaceTrustPrompt(output: string): boolean {
+  return normalizeTerminalText(output).includes("doyoutrustthecontentsofthisdirectory");
+}
+
+function isResumePending(output: string): boolean {
+  const normalized = normalizeTerminalText(output);
+  const resumeIndex = normalized.lastIndexOf("resumingsession");
+  if (resumeIndex < 0) {
+    return false;
+  }
+  const readyIndex = Math.max(
+    normalized.lastIndexOf("askcodextodoanything"),
+    normalized.lastIndexOf("forshortcuts"),
+  );
+  return readyIndex <= resumeIndex;
+}
+
+function lastCliReadyIndex(output: string): number {
+  const indexes = [
+    output.toLowerCase().lastIndexOf("ask codex to do anything"),
+    output.toLowerCase().lastIndexOf("for shortcuts"),
+    output.toLowerCase().lastIndexOf("/status"),
+  ];
+  const promptMatches = [...output.matchAll(/^\s*[>›]/gim)];
+  if (promptMatches.length > 0) {
+    indexes.push(promptMatches.at(-1)?.index ?? -1);
+  }
+  return Math.max(...indexes);
+}
+
+function normalizeTerminalText(output: string): string {
+  return output.toLowerCase().replace(/\s+/g, "");
 }
 
 function appendOutput(current: string, next: string): string {
@@ -140,11 +224,20 @@ function appendOutput(current: string, next: string): string {
 }
 
 function formatOutputPreview(output: string): string {
-  return stripAnsi(output).replace(/\r/g, "").trim().slice(-OUTPUT_PREVIEW_LIMIT);
+  return stripTerminalControlSequences(output)
+    .replace(/\r/g, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim()
+    .slice(-OUTPUT_PREVIEW_LIMIT);
 }
 
-function stripAnsi(value: string): string {
-  return value.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "");
+function stripTerminalControlSequences(value: string): string {
+  return value
+    .replace(/\u001b\][\s\S]*?(?:\u0007|\u001b\\)/g, "")
+    .replace(/\u001bP[\s\S]*?\u001b\\/g, "")
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "");
 }
 
 function resolveCodexCliPath(): { command: string; path: string; checked: string[] } {

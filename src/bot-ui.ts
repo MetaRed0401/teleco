@@ -25,7 +25,7 @@ export function renderHelpMessage(): DualText {
         ["/session", "Current thread details"],
         ["/sessions", "Browse & switch threads"],
         ["/attach <id>", "Attach this context to a Codex thread"],
-        ["/handback", "Hand the active thread back to Codex CLI"],
+        ["/handback", "Confirm and release the active thread back to Codex"],
         ["/stop", "Cancel current operation"],
         ["/approvals", "List pending approvals"],
         ["/retry", "Resend the last prompt"],

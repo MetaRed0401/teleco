@@ -1,5 +1,7 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import path from "node:path";
+
+import { loadEnvironmentFile } from "./env-file.js";
 
 import {
   createBuiltinLaunchProfiles,
@@ -55,7 +57,7 @@ export interface TeleCodexConfig {
 }
 
 export function loadConfig(): TeleCodexConfig {
-  loadEnvFile(path.resolve(process.cwd(), ".env"));
+  loadEnvironmentFile(process.env.TELECODEX_ENV_FILE?.trim() || path.resolve(process.cwd(), ".env"));
 
   const telegramBotToken = requireEnv("TELEGRAM_BOT_TOKEN");
   const telegramAllowedUserIds = parseAllowedUserIds(requireEnv("TELEGRAM_ALLOWED_USER_IDS"));
@@ -204,42 +206,6 @@ function resolveWorkspace(): string {
 
 function isRunningInDocker(): boolean {
   return existsSync("/.dockerenv") || process.env.container === "docker";
-}
-
-function loadEnvFile(envPath: string): void {
-  if (!existsSync(envPath)) {
-    return;
-  }
-
-  const contents = readFileSync(envPath, "utf8");
-  for (const rawLine of contents.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith("#")) {
-      continue;
-    }
-
-    const normalized = line.startsWith("export ") ? line.slice(7).trim() : line;
-    const separatorIndex = normalized.indexOf("=");
-    if (separatorIndex === -1) {
-      continue;
-    }
-
-    const key = normalized.slice(0, separatorIndex).trim();
-    let value = normalized.slice(separatorIndex + 1).trim();
-
-    if (!key || process.env[key] !== undefined) {
-      continue;
-    }
-
-    if (
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      value = value.slice(1, -1);
-    }
-
-    process.env[key] = value.replace(/\\n/g, "\n");
-  }
 }
 
 function requireEnv(name: string): string {

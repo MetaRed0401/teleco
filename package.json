@@ -1,13 +1,13 @@
 {
-  "name": "telecodex",
+  "name": "teleco",
   "version": "0.1.0",
-  "description": "Telegram bridge for the OpenAI Codex CLI SDK",
+  "description": "Telegram control plane for the OpenAI Codex CLI and app-server",
   "license": "MIT",
   "author": "Benedict Evert",
   "packageManager": "pnpm@11.15.1",
   "repository": {
     "type": "git",
-    "url": "https://github.com/benedict2310/telecodex"
+    "url": "https://github.com/MetaRed0401/teleco"
   },
   "keywords": [
     "telegram",
@@ -18,12 +18,29 @@
     "bridge"
   ],
   "type": "module",
+  "bin": {
+    "teleco": "dist/cli.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist/",
+    "scripts/",
+    "systemd/",
+    "docs/homebrew-linux.md",
+    ".env.example",
+    "codex-versions.json",
+    "LICENSE",
+    "README.md"
+  ],
   "scripts": {
     "postinstall": "node scripts/fix-node-pty-spawn-helper.mjs && node scripts/prepare-codex-linux-sandbox.mjs",
     "dev": "tsx src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
-    "test": "vitest run"
+    "test": "vitest run",
+    "package:homebrew": "node scripts/build-homebrew-release.mjs"
   },
   "dependencies": {
     "@grammyjs/auto-retry": "^2.0.2",

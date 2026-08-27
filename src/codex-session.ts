@@ -1376,8 +1376,17 @@ export class CodexSessionService {
     return this.resumeThread(threadId);
   }
 
-  handback(): { threadId: string | null; workspace: string } {
+  async handback(): Promise<{ threadId: string | null; workspace: string }> {
     const info = { threadId: this.currentThreadId, workspace: this.currentWorkspace };
+    if (
+      this.config.enableCodexAppServerRuntime
+      && info.threadId
+      && this.appServerInitialized
+      && this.appServerThreadLoaded
+      && this.appServerClient?.isHealthy()
+    ) {
+      await this.appServerClient.request("thread/unsubscribe", { threadId: info.threadId }, 5000);
+    }
     this.abortController?.abort();
     this.abortController = null;
     this.thread = null;
@@ -1386,6 +1395,7 @@ export class CodexSessionService {
     this.firstPromptConnectionCheckPending = false;
     this.activeThreadLaunchProfile = null;
     this.activeThreadPermissionProfileId = undefined;
+    this.resetAppServerClient();
     return info;
   }
 

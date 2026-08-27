@@ -1,0 +1,32 @@
+class Teleco < Formula
+  desc "Telegram control plane for the OpenAI Codex CLI and app-server"
+  homepage "https://github.com/MetaRed0401/teleco"
+  url "@URL@"
+  sha256 "@SHA256@"
+  license "MIT"
+
+  depends_on "pnpm" => :build
+  depends_on "node@24"
+
+  def install
+    ENV.prepend_path "PATH", formula_opt_bin("node@24")
+    system "pnpm", "install", "--prod", "--frozen-lockfile"
+    libexec.install Dir["*"]
+    libexec.install ".env.example"
+
+    (bin/"teleco").write <<~SH
+      #!/bin/bash
+      export TELECO_EXECUTABLE="#{HOMEBREW_PREFIX}/bin/teleco"
+      export TELECO_INSTALL_MODE="homebrew"
+      exec "#{formula_opt_bin("node@24")}/node" "#{opt_libexec}/dist/cli.js" "$@"
+    SH
+    (bin/"teleco").chmod 0755
+  end
+
+  test do
+    ENV["TELECO_CONFIG_HOME"] = testpath/"config"
+    assert_match "teleco #{version}", shell_output("#{bin}/teleco --version")
+    assert_match "teleco", shell_output("#{bin}/teleco config path")
+    system bin/"teleco", "doctor", "--offline"
+  end
+end
