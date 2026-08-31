@@ -1,9 +1,14 @@
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockExecFile = vi.hoisted(() => vi.fn());
+const mockSpawn = vi.hoisted(() => vi.fn());
 
 vi.mock("node:child_process", () => ({
   execFile: mockExecFile,
+  spawn: mockSpawn,
 }));
 
 import { checkAuthStatus, clearAuthCache, startLogin, startLogout } from "../src/codex-auth.js";
@@ -37,13 +42,53 @@ function mockExecNotFound(): void {
   });
 }
 
+interface MockLoginChild extends EventEmitter {
+  stdin: PassThrough;
+  stdout: PassThrough;
+  stderr: PassThrough;
+  kill: ReturnType<typeof vi.fn>;
+}
+
+function createLoginChild(): MockLoginChild {
+  const child = new EventEmitter() as MockLoginChild;
+  child.stdin = new PassThrough();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.kill = vi.fn(() => {
+    process.nextTick(() => child.emit("exit", null, "SIGTERM"));
+    return true;
+  });
+  return child;
+}
+
+function mockLoginOutput(chunks: string[], exitCode: number | null = 0): MockLoginChild {
+  const child = createLoginChild();
+  mockSpawn.mockReturnValue(child);
+  process.nextTick(() => {
+    for (const chunk of chunks) child.stdout.write(chunk);
+    if (exitCode !== null) child.emit("exit", exitCode, null);
+  });
+  return child;
+}
+
+function mockLoginError(code = "ENOENT"): MockLoginChild {
+  const child = createLoginChild();
+  mockSpawn.mockReturnValue(child);
+  process.nextTick(() => {
+    child.emit("error", Object.assign(new Error(`spawn codex ${code}`), { code }));
+  });
+  return child;
+}
+
 describe("codex-auth", () => {
   beforeEach(() => {
     mockExecFile.mockReset();
+    mockSpawn.mockReset();
     clearAuthCache();
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
   });
 
@@ -64,6 +109,14 @@ describe("codex-auth", () => {
       expect(status.authenticated).toBe(true);
       expect(status.method).toBe("cli");
       expect(status.detail).toContain("user@example.com");
+      expect(mockExecFile).toHaveBeenCalledWith(
+        expect.stringContaining("node_modules/.bin/codex"),
+        ["login", "status"],
+        expect.objectContaining({
+          env: expect.objectContaining({ PATH: expect.stringContaining("/home/linuxbrew/.linuxbrew/bin") }),
+        }),
+        expect.any(Function),
+      );
     });
 
     it("reports unauthenticated when CLI auth fails", async () => {
@@ -131,16 +184,24 @@ describe("codex-auth", () => {
   });
 
   describe("startLogin", () => {
-    it("returns success when CLI login succeeds", async () => {
-      mockExecSuccess("Visit https://auth.openai.com/device?code=ABCD-1234");
+    it("returns the device prompt without waiting for the login process to exit", async () => {
+      const child = mockLoginOutput([
+        "Sign in with a device ",
+        "code at https://auth.openai.com/device\nABCD-1234",
+      ], null);
 
       const result = await startLogin();
       expect(result.success).toBe(true);
       expect(result.message).toContain("https://auth.openai.com");
+      expect(child.kill).not.toHaveBeenCalled();
+
+      mockExecSuccess("Successfully logged out");
+      await startLogout();
+      expect(child.kill).toHaveBeenCalledTimes(1);
     });
 
     it("returns failure when CLI login fails", async () => {
-      mockExecFailure("Login not supported in this environment");
+      mockLoginOutput(["Login not supported in this environment"], 1);
 
       const result = await startLogin();
       expect(result.success).toBe(false);
@@ -148,11 +209,38 @@ describe("codex-auth", () => {
     });
 
     it("returns failure when CLI is not available", async () => {
-      mockExecNotFound();
+      mockLoginError();
 
       const result = await startLogin();
       expect(result.success).toBe(false);
       expect(result.message).toContain("ENOENT");
+    });
+
+    it("reuses an in-progress device prompt", async () => {
+      const child = mockLoginOutput([
+        "Open https://auth.openai.com/device and enter code ABCD-1234",
+      ], null);
+
+      const first = await startLogin();
+      const second = await startLogin();
+
+      expect(second).toEqual(first);
+      expect(mockSpawn).toHaveBeenCalledTimes(1);
+
+      mockExecSuccess("Successfully logged out");
+      await startLogout();
+      expect(child.kill).toHaveBeenCalledTimes(1);
+    });
+
+    it("stops login when no device prompt is produced", async () => {
+      vi.useFakeTimers();
+      const child = mockLoginOutput([], null);
+
+      const pending = startLogin();
+      await vi.advanceTimersByTimeAsync(15_000);
+
+      await expect(pending).resolves.toMatchObject({ success: false });
+      expect(child.kill).toHaveBeenCalledTimes(1);
     });
 
     it("clears the auth cache", async () => {
@@ -160,13 +248,14 @@ describe("codex-auth", () => {
       await checkAuthStatus(); // populate cache
       expect(mockExecFile).toHaveBeenCalledTimes(1);
 
-      mockExecSuccess("Login initiated");
+      mockLoginOutput(["Open https://auth.openai.com/device and enter code ABCD-1234"]);
       await startLogin();
 
       // After login, cache is cleared so next check should hit CLI
       mockExecSuccess("Logged in as new-user");
       await checkAuthStatus();
-      expect(mockExecFile).toHaveBeenCalledTimes(3);
+      expect(mockExecFile).toHaveBeenCalledTimes(2);
+      expect(mockSpawn).toHaveBeenCalledTimes(1);
     });
   });
 

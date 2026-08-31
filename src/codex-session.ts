@@ -189,6 +189,8 @@ export type CodexTurnRecoveryItem =
       isError: boolean;
     };
 
+type CodexThreadHistoryMode = "legacy" | "paginated";
+
 export interface CodexStatusDetails {
   account?: {
     type: string;
@@ -235,6 +237,7 @@ export interface CodexStatusDetails {
     total: number;
     authenticationRequired: number;
     unknownAuthentication: number;
+    runtimeStatusCounts: Record<CodexMcpServerRuntimeStatus, number>;
   };
   plugins?: {
     total: number;
@@ -274,7 +277,18 @@ export interface CodexPermissionProfile {
 export interface CodexMcpServerStatus {
   name: string;
   authStatus: string;
+  runtimeStatus: CodexMcpServerRuntimeStatus;
 }
+
+export type CodexMcpServerRuntimeStatus =
+  | "notStarted"
+  | "starting"
+  | "connected"
+  | "authenticationRequired"
+  | "failed"
+  | "cancelled"
+  | "disabled"
+  | "unknown";
 
 export interface CodexThreadSection {
   id: string;
@@ -499,34 +513,52 @@ export class CodexSessionService {
       throw new Error("Codex thread recovery snapshot is unavailable.");
     }
 
-    const paginatedTurns = await this.readPaginatedRecoveryTurns(client, this.currentThreadId, turnId);
+    const historyMode = readThreadHistoryMode(thread.historyMode);
+    if (thread.historyMode !== undefined && !historyMode) {
+      client.recordUnknownEvent("parse", "thread.historyMode");
+    }
+    const paginatedTurns = await this.readPaginatedRecoveryTurns(
+      client,
+      this.currentThreadId,
+      turnId,
+      historyMode === "paginated",
+    );
     let turns: Record<string, unknown>[];
     let newestFirst = true;
     if (paginatedTurns) {
       turns = paginatedTurns;
     } else {
-      const legacyResponse = await client.request(
-        "thread/read",
-        { threadId: this.currentThreadId, includeTurns: true },
-        10_000,
-      );
-      thread = readRecord(readRecord(legacyResponse)?.thread);
-      if (!thread) {
-        throw new Error("Codex thread recovery snapshot is unavailable.");
-      }
-      turns = Array.isArray(thread.turns)
-        ? thread.turns.map(readRecord).filter((turn): turn is Record<string, unknown> => Boolean(turn))
-        : [];
+      const legacy = await this.readLegacyRecoveryThread(client, this.currentThreadId);
+      thread = legacy.thread;
+      turns = legacy.turns;
       newestFirst = false;
     }
-    const turn = turnId
-      ? turns.find((candidate) => readString(candidate.id) === turnId)
-      : newestFirst
-        ? turns[0]
-        : turns.at(-1);
-    const items = Array.isArray(turn?.items)
+    let turn = selectRecoveryTurn(turns, turnId, newestFirst);
+    let items = Array.isArray(turn?.items)
       ? turn.items.map(readRecord).filter((item): item is Record<string, unknown> => Boolean(item))
       : [];
+    if (paginatedTurns && turn && !Array.isArray(turn.items)) {
+      const selectedTurnId = readString(turn.id);
+      if (selectedTurnId) {
+        const paginatedItems = await this.readPaginatedRecoveryItems(
+          client,
+          this.currentThreadId,
+          selectedTurnId,
+          historyMode === "paginated",
+        );
+        if (paginatedItems) {
+          items = paginatedItems;
+        } else {
+          const legacy = await this.readLegacyRecoveryThread(client, this.currentThreadId);
+          thread = legacy.thread;
+          turns = legacy.turns;
+          turn = selectRecoveryTurn(turns, turnId, false);
+          items = Array.isArray(turn?.items)
+            ? turn.items.map(readRecord).filter((item): item is Record<string, unknown> => Boolean(item))
+            : [];
+        }
+      }
+    }
     const recoveryItems = items
       .map((item, index) => toTurnRecoveryItem(item, index, readString(turn?.id)))
       .filter((item): item is CodexTurnRecoveryItem => Boolean(item));
@@ -555,6 +587,7 @@ export class CodexSessionService {
     client: CodexAppServerClient,
     threadId: string,
     targetTurnId?: string,
+    required = false,
   ): Promise<Record<string, unknown>[] | undefined> {
     const turns: Record<string, unknown>[] = [];
     const seenCursors = new Set<string>();
@@ -576,9 +609,14 @@ export class CodexSessionService {
         );
       } catch (error) {
         if (page === 0) {
-          return undefined;
+          if (required) {
+            throw new Error("Codex paginated thread history is unavailable.");
+          }
+          if (isUnsupportedAppServerRequest(error, "thread/turns/list")) {
+            return undefined;
+          }
         }
-        throw error;
+        throw new Error("Codex paginated thread history pagination failed.");
       }
 
       const result = readRecord(response);
@@ -602,6 +640,73 @@ export class CodexSessionService {
     }
 
     throw new Error("Codex thread history exceeded the recovery page limit.");
+  }
+
+  private async readPaginatedRecoveryItems(
+    client: CodexAppServerClient,
+    threadId: string,
+    turnId: string,
+    required: boolean,
+  ): Promise<Record<string, unknown>[] | undefined> {
+    const items: Record<string, unknown>[] = [];
+    const seenCursors = new Set<string>();
+    let cursor: string | undefined;
+
+    for (let page = 0; page < 20; page += 1) {
+      let response: unknown;
+      try {
+        response = await client.request(
+          "thread/items/list",
+          {
+            threadId,
+            turnId,
+            limit: 50,
+            sortDirection: "asc",
+            ...(cursor ? { cursor } : {}),
+          },
+          10_000,
+        );
+      } catch (error) {
+        if (page === 0 && !required && isUnsupportedAppServerRequest(error, "thread/items/list")) {
+          return undefined;
+        }
+        throw new Error("Codex paginated thread items are unavailable.");
+      }
+
+      const result = readRecord(response);
+      const pageItems = Array.isArray(result?.data)
+        ? result.data.map(readRecord).filter((item): item is Record<string, unknown> => Boolean(item))
+        : [];
+      items.push(...pageItems);
+      const nextCursor = readString(result?.nextCursor);
+      if (!nextCursor) return items;
+      if (seenCursors.has(nextCursor)) {
+        throw new Error("Codex thread items returned a repeated pagination cursor.");
+      }
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
+    }
+
+    throw new Error("Codex thread items exceeded the recovery page limit.");
+  }
+
+  private async readLegacyRecoveryThread(
+    client: CodexAppServerClient,
+    threadId: string,
+  ): Promise<{ thread: Record<string, unknown>; turns: Record<string, unknown>[] }> {
+    const response = await client.request(
+      "thread/read",
+      { threadId, includeTurns: true },
+      10_000,
+    );
+    const thread = readRecord(readRecord(response)?.thread);
+    if (!thread) {
+      throw new Error("Codex thread recovery snapshot is unavailable.");
+    }
+    const turns = Array.isArray(thread.turns)
+      ? thread.turns.map(readRecord).filter((turn): turn is Record<string, unknown> => Boolean(turn))
+      : [];
+    return { thread, turns };
   }
 
   getCurrentWorkspace(): string {
@@ -647,10 +752,24 @@ export class CodexSessionService {
       };
       details.config = parseConfigStatus(configResponse);
       if (Array.isArray(mcpResponse)) {
+        const runtimeStatusCounts: Record<CodexMcpServerRuntimeStatus, number> = {
+          notStarted: 0,
+          starting: 0,
+          connected: 0,
+          authenticationRequired: 0,
+          failed: 0,
+          cancelled: 0,
+          disabled: 0,
+          unknown: 0,
+        };
+        for (const status of mcpResponse) {
+          runtimeStatusCounts[status.runtimeStatus] += 1;
+        }
         details.mcp = {
           total: mcpResponse.length,
           authenticationRequired: mcpResponse.filter((status) => status.authStatus === "notLoggedIn").length,
           unknownAuthentication: mcpResponse.filter((status) => status.authStatus === "unknown").length,
+          runtimeStatusCounts,
         };
       }
       const pluginRecord = readRecord(pluginResponse);
@@ -934,7 +1053,10 @@ export class CodexSessionService {
 
     const effectiveWorkspace = workspace ?? this.currentWorkspace;
     const effectiveModel = model ?? this.currentModel;
-    this.thread = this.getCodex().startThread(this.buildThreadOptions(effectiveWorkspace, effectiveModel));
+    this.thread = this.getCodex().startThread({
+      ...this.buildThreadOptions(effectiveWorkspace, effectiveModel),
+      threadSource: "telecodex",
+    });
     this.activeThreadLaunchProfile = this.currentLaunchProfile;
     this.currentWorkspace = effectiveWorkspace;
     this.currentThreadId = this.thread.id ?? null;
@@ -1714,7 +1836,11 @@ export class CodexSessionService {
         const status = readRecord(value);
         const name = readString(status?.name);
         if (name) {
-          statuses.push({ name, authStatus: readString(status?.authStatus) ?? "unknown" });
+          statuses.push({
+            name,
+            authStatus: readString(status?.authStatus) ?? "unknown",
+            runtimeStatus: readMcpServerRuntimeStatus(status?.runtimeStatus),
+          });
         }
       }
 
@@ -2258,6 +2384,17 @@ export class CodexSessionService {
       request.method === "item/fileChange/requestApproval" ||
       request.method === "item/permissions/requestApproval"
     ) {
+      if (request.method === "item/commandExecution/requestApproval") {
+        const params = readRecord(request.params);
+        const kind = params?.kind;
+        if (kind !== undefined && kind !== "command" && kind !== "writeStdin") {
+          this.appServerClient?.recordUnknownEvent?.(
+            "request",
+            "item/commandExecution/requestApproval:unknown-kind",
+          );
+          return defaultApprovalResponse();
+        }
+      }
       console.log(`App-server approval request: ${request.method}`);
       const response = await callbacks?.onApprovalRequest?.({
         method: request.method,
@@ -2473,7 +2610,7 @@ export class CodexSessionService {
           this.emitAppServerToolStart(callbacks, `mcp:${readString(item?.server) ?? "unknown"}/${readString(item?.tool) ?? "tool"}`, id);
           const error = readRecord(item?.error);
           if (error) {
-            this.emitAppServerToolSnapshot(callbacks, id, readString(error?.message) ?? JSON.stringify(error));
+            this.emitAppServerToolSnapshot(callbacks, id, readString(error?.message) ?? "MCP tool call failed.");
           }
           this.emitAppServerToolEnd(callbacks, id, Boolean(error) || readString(item?.status) === "failed");
         } else if (type === "dynamicToolCall") {
@@ -2659,6 +2796,10 @@ export class CodexSessionService {
       case "mcp/server/status/updated":
       case "mcpServer/oauthLogin/completed":
       case "mcpServer/startupStatus/updated":
+      case "mcpServer/event/stream/notification":
+      case "thread/realtime/item/started":
+      case "thread/realtime/item/completed":
+      case "thread/realtime/item/transcript/delta":
         break;
       case "thread/project/updated": {
         if (!notificationThreadId || notificationThreadId === this.currentThreadId) {
@@ -2962,12 +3103,40 @@ function trimRecoveryDetail(value: string): string {
   return value.length > limit ? `${value.slice(0, limit)}\n...truncated` : value;
 }
 
+function selectRecoveryTurn(
+  turns: Record<string, unknown>[],
+  turnId: string | undefined,
+  newestFirst: boolean,
+): Record<string, unknown> | undefined {
+  if (turnId) return turns.find((turn) => readString(turn.id) === turnId);
+  return newestFirst ? turns[0] : turns.at(-1);
+}
+
+function readThreadHistoryMode(value: unknown): CodexThreadHistoryMode | undefined {
+  return value === "legacy" || value === "paginated" ? value : undefined;
+}
+
 function readRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : undefined;
 }
 
 function readString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
+}
+
+function readMcpServerRuntimeStatus(value: unknown): CodexMcpServerRuntimeStatus {
+  switch (value) {
+    case "notStarted":
+    case "starting":
+    case "connected":
+    case "authenticationRequired":
+    case "failed":
+    case "cancelled":
+    case "disabled":
+      return value;
+    default:
+      return "unknown";
+  }
 }
 
 function readNumber(value: unknown): number | undefined {
@@ -3606,6 +3775,7 @@ function isUnsupportedAppServerRequest(error: unknown, method: string): boolean 
   const normalized = message.toLowerCase();
   return normalized.includes(method.toLowerCase()) && (
     normalized.includes("unsupported") ||
+    normalized.includes("not supported") ||
     normalized.includes("unknown method") ||
     normalized.includes("method not found")
   );

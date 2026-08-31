@@ -9,6 +9,9 @@ import { fileURLToPath } from "node:url";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const manifest = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
 const version = option("--version") || manifest.version;
+if (version !== manifest.version) {
+  throw new Error(`Release version ${version} does not match package.json version ${manifest.version}`);
+}
 const outputRoot = path.resolve(option("--output") || path.join(root, "release"));
 const archiveName = `teleco-${version}.tar.gz`;
 const archivePath = path.join(outputRoot, archiveName);

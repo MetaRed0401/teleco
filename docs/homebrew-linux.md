@@ -7,14 +7,16 @@ Teleco's initial Homebrew target is Linuxbrew through a custom Tap. The Formula 
 ```bash
 pnpm install --frozen-lockfile
 pnpm package:homebrew
-HOMEBREW_NO_INSTALL_FROM_API=1 brew install --build-from-source ./release/Formula/teleco.rb
-brew test teleco
+brew tap-new --no-git teleco/local
+install -m 0644 release/Formula/teleco.rb "$(brew --repo teleco/local)/Formula/teleco.rb"
+HOMEBREW_NO_AUTO_UPDATE=1 brew install --build-from-source teleco/local/teleco
+brew test teleco/local/teleco
 ```
 
-The local Formula uses a checksummed `file://` release archive. For a Tap release, generate the same artifact with an immutable GitHub Release URL:
+Homebrew 6 requires local Formulae to be installed through a Tap. The `--no-git` local Tap avoids creating temporary commit metadata. The local Formula uses a checksummed `file://` release archive. For a published Tap release, generate the same artifact with an immutable GitHub Release URL:
 
 ```bash
-pnpm package:homebrew -- --url https://github.com/MetaRed0401/teleco/releases/download/v0.1.0/teleco-0.1.0.tar.gz
+pnpm package:homebrew -- --url https://github.com/MetaRed0401/teleco/releases/download/v0.1.1/teleco-0.1.1.tar.gz
 ```
 
 Upload the generated archive first, then copy `release/Formula/teleco.rb` to `MetaRed0401/homebrew-tap/Formula/teleco.rb`.

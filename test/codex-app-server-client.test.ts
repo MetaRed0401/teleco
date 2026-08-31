@@ -49,7 +49,7 @@ describe("CodexAppServerClient", () => {
     expect(client.isRunning()).toBe(false);
     expect(client.getClosedReason()).toContain("TELECODEX_LAUNCHD_PATH");
     expect(mockSpawn).toHaveBeenCalledWith(
-      expect.any(String),
+      expect.stringContaining("node_modules/.bin/codex"),
       ["app-server", "--listen", "stdio://"],
       expect.objectContaining({
         env: expect.objectContaining({
@@ -57,6 +57,7 @@ describe("CodexAppServerClient", () => {
         }),
       }),
     );
+    expect(mockSpawn.mock.calls[0]?.[2]?.env?.PATH).toContain("/home/linuxbrew/.linuxbrew/bin");
   });
 
   it("maps Codex-only proxy settings without mutating Telegram process settings", () => {

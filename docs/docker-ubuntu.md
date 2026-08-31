@@ -9,7 +9,7 @@ Docker provides two variants with the same TeleCodex app behavior:
 - `Dockerfile` + `docker-compose.yml`: normal image with Node, pnpm, Codex CLI, and required runtime dependencies.
 - `Dockerfile.local` + `docker-compose.local.yml`: operator image with the brew-parity toolset used in this environment.
 
-Both variants pin Codex CLI to the recommended 0.149.0 stable version by default. Teleco retains 0.144.1 as its minimum compatible baseline; that version supports the canonical app-server item protocol and includes the `0.142.5` WebSocket trace-log privacy fix. Override `CODEX_CLI_VERSION` only when you have tested the target Codex app-server version with TeleCodex.
+Both variants pin Codex CLI to the recommended 0.151.0 stable version by default. Teleco retains 0.144.1 as its minimum compatible baseline; that version supports the canonical app-server item protocol and includes the `0.142.5` WebSocket trace-log privacy fix. Override `CODEX_CLI_VERSION` only when you have tested the target Codex app-server version with TeleCodex.
 
 Use the normal image by default:
 
@@ -22,6 +22,15 @@ Use the tool-rich image when Codex should have common CLI tools available inside
 ```bash
 docker compose -f docker-compose.local.yml build
 ```
+
+For the existing `first`, `second`, and `third` instances, use the multi-instance file. It reads `.env.first`, `.env.second`, and `.env.third`, assigns an explicit instance name to each container, and mounts the repository workspace so their existing `.telecodex/<instance>` state remains available:
+
+```bash
+docker compose -f docker-compose.instances.yml build
+docker compose -f docker-compose.instances.yml up -d
+```
+
+The multi-instance file runs as host UID/GID 1000 by default so the local Codex home and workspace remain accessible. Override `TELECODEX_UID` and `TELECODEX_GID` when the host user has different IDs. Unlike the isolated single-container examples, this local migration file mounts the host Codex home without masking `auth.json`; use it only with a trusted locally built image.
 
 ## Auth And Workspace
 

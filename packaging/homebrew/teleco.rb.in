@@ -2,6 +2,7 @@ class Teleco < Formula
   desc "Telegram control plane for the OpenAI Codex CLI and app-server"
   homepage "https://github.com/MetaRed0401/teleco"
   url "@URL@"
+  version "@VERSION@"
   sha256 "@SHA256@"
   license "MIT"
 

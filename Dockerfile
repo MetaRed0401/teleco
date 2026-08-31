@@ -20,6 +20,7 @@ COPY codex-versions.json /tmp/codex-versions.json
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+      adduser \
       bash \
       ca-certificates \
       curl \
@@ -54,6 +55,7 @@ FROM base AS build
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY codex-versions.json ./codex-versions.json
+COPY scripts/fix-node-pty-spawn-helper.mjs scripts/prepare-codex-linux-sandbox.mjs ./scripts/
 RUN pnpm install --frozen-lockfile
 
 COPY tsconfig.json ./
@@ -67,7 +69,8 @@ ENV NODE_ENV=production \
     HOME=/home/telecodex \
     TELECODEX_WORKSPACE=/workspace
 
-RUN useradd --create-home --home-dir /home/telecodex --uid 1001 --shell /bin/bash telecodex \
+RUN /usr/sbin/adduser --disabled-password --gecos "" --home /home/telecodex --uid 1001 --shell /bin/bash telecodex \
+    && chmod 0755 /home/telecodex \
     && install -d -o telecodex -g telecodex /app /workspace /home/telecodex/.codex
 
 WORKDIR /app

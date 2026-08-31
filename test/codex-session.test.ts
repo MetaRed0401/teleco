@@ -88,6 +88,7 @@ const mockAppServerState = vi.hoisted(() => {
   let notifications: Array<{ method: string; params?: unknown }> = [];
   let requestHandler: ((method: string, params?: unknown) => unknown | Promise<unknown>) | undefined;
   let codexVersion = "0.146.0";
+  const recordUnknownEvent = vi.fn();
 
   const CodexAppServerClient = vi.fn().mockImplementation(function () {
     const listeners = new Set<(notification: { method: string; params?: unknown }) => void>();
@@ -97,6 +98,7 @@ const mockAppServerState = vi.hoisted(() => {
       getNotifications: vi.fn().mockReturnValue([]),
       getClosedReason: vi.fn().mockReturnValue(undefined),
       getCodexVersion: vi.fn(() => codexVersion),
+      recordUnknownEvent,
       close: vi.fn(),
       onNotification: vi.fn((listener: (notification: { method: string; params?: unknown }) => void) => {
         listeners.add(listener);
@@ -136,10 +138,12 @@ const mockAppServerState = vi.hoisted(() => {
     setCodexVersion: (version: string) => {
       codexVersion = version;
     },
+    recordUnknownEvent,
     reset: () => {
       notifications = [];
       requestHandler = undefined;
       codexVersion = "0.146.0";
+      recordUnknownEvent.mockReset();
       CodexAppServerClient.mockClear();
     },
   };
@@ -248,6 +252,7 @@ describe("CodexSessionService", () => {
     const codexInstance = mockState.codexInstances.at(-1);
     expect(codexInstance.startThread).toHaveBeenCalledWith({
       model: "o3",
+      threadSource: "telecodex",
       sandboxMode: "workspace-write",
       workingDirectory: "/workspace/base",
       approvalPolicy: "never",
@@ -758,12 +763,12 @@ describe("CodexSessionService", () => {
     );
   });
 
-  it("reads a target recovery turn through 0.146 pagination", async () => {
+  it("reads a target 0.151 paginated recovery turn across pages", async () => {
     const service = await createAppServerService();
     const requests = vi.fn(async (method: string, params?: unknown) => {
       const input = params as Record<string, unknown>;
       if (method === "thread/read") {
-        return { thread: { id: "thread-app-server", status: { type: "idle" } } };
+        return { thread: { id: "thread-app-server", historyMode: "paginated", status: { type: "idle" } } };
       }
       if (method === "thread/turns/list" && !input.cursor) {
         return {
@@ -798,9 +803,189 @@ describe("CodexSessionService", () => {
       "thread/turns/list",
       expect.objectContaining({ cursor: "page-2", itemsView: "full", sortDirection: "desc" }),
     );
+    expect(requests.mock.calls.some(([method]) => method === "thread/items/list")).toBe(false);
+    expect(requests.mock.calls.some(([method, params]) =>
+      method === "thread/read" && (params as Record<string, unknown>).includeTurns === true)).toBe(false);
   });
 
-  it("falls back to 0.145 thread/read history when pagination is unsupported", async () => {
+  it("uses paginated recovery when 0.150 history mode is omitted", async () => {
+    const service = await createAppServerService();
+    const requests = vi.fn(async (method: string) => {
+      if (method === "thread/read") {
+        return { thread: { id: "thread-app-server", status: { type: "idle" } } };
+      }
+      if (method === "thread/turns/list") {
+        return {
+          data: [{
+            id: "turn-150",
+            status: "completed",
+            items: [{ id: "agent-150", type: "agentMessage", text: "0.150 recovery" }],
+          }],
+          nextCursor: null,
+        };
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    mockAppServerState.setRequestHandler(requests);
+
+    await expect(service.getTurnRecoverySnapshot("turn-150")).resolves.toMatchObject({
+      turnId: "turn-150",
+      agentText: "0.150 recovery",
+    });
+    expect(requests.mock.calls.some(([method, params]) =>
+      method === "thread/read" && (params as Record<string, unknown>).includeTurns === true)).toBe(false);
+  });
+
+  it("does not full-hydrate 0.151 paginated history when turns pagination fails", async () => {
+    const service = await createAppServerService();
+    const requests = vi.fn(async (method: string, params?: unknown) => {
+      const input = params as Record<string, unknown>;
+      if (method === "thread/read" && input.includeTurns === false) {
+        return { thread: { id: "thread-app-server", historyMode: "paginated", status: { type: "idle" } } };
+      }
+      if (method === "thread/turns/list") {
+        throw new Error("pagination unavailable");
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    mockAppServerState.setRequestHandler(requests);
+
+    await expect(service.getTurnRecoverySnapshot()).rejects.toThrow(
+      "Codex paginated thread history is unavailable.",
+    );
+    expect(requests.mock.calls.some(([method, params]) =>
+      method === "thread/read" && (params as Record<string, unknown>).includeTurns === true)).toBe(false);
+  });
+
+  it("loads omitted 0.151 recovery items on demand without duplicating turns", async () => {
+    const service = await createAppServerService();
+    const requests = vi.fn(async (method: string, params?: unknown) => {
+      const input = params as Record<string, unknown>;
+      if (method === "thread/read") {
+        return { thread: { id: "thread-app-server", historyMode: "paginated", status: { type: "idle" } } };
+      }
+      if (method === "thread/turns/list") {
+        return { data: [{ id: "turn-target", status: "completed" }], nextCursor: null };
+      }
+      if (method === "thread/items/list" && !input.cursor) {
+        return {
+          data: [{ id: "tool-1", type: "commandExecution", command: "pwd", status: "completed" }],
+          nextCursor: "items-2",
+        };
+      }
+      if (method === "thread/items/list" && input.cursor === "items-2") {
+        return {
+          data: [{ id: "agent-1", type: "agentMessage", text: "recovered from items" }],
+          nextCursor: null,
+        };
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    mockAppServerState.setRequestHandler(requests);
+
+    const snapshot = await service.getTurnRecoverySnapshot("turn-target");
+
+    expect(snapshot.agentText).toBe("recovered from items");
+    expect(snapshot.items.map((item) => item.id)).toEqual(["tool-1", "agent-1"]);
+    expect(requests).toHaveBeenCalledWith(
+      "thread/items/list",
+      expect.objectContaining({
+        threadId: "thread-app-server",
+        turnId: "turn-target",
+        cursor: "items-2",
+        sortDirection: "asc",
+      }),
+    );
+  });
+
+  it("does not full-hydrate paginated history when 0.151 items listing is unavailable", async () => {
+    const service = await createAppServerService();
+    const requests = vi.fn(async (method: string, params?: unknown) => {
+      const input = params as Record<string, unknown>;
+      if (method === "thread/read" && input.includeTurns === false) {
+        return { thread: { id: "thread-app-server", historyMode: "paginated", status: { type: "idle" } } };
+      }
+      if (method === "thread/turns/list") {
+        return { data: [{ id: "turn-target", status: "completed" }], nextCursor: null };
+      }
+      if (method === "thread/items/list") {
+        throw new Error('thread/items/list: {"code":-32601,"message":"thread/items/list not supported yet"}');
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    mockAppServerState.setRequestHandler(requests);
+
+    await expect(service.getTurnRecoverySnapshot("turn-target")).rejects.toThrow(
+      "Codex paginated thread items are unavailable.",
+    );
+    expect(requests.mock.calls.some(([method, params]) =>
+      method === "thread/read" && (params as Record<string, unknown>).includeTurns === true)).toBe(false);
+  });
+
+  it("full-hydrates legacy history when 0.151 items listing is unavailable", async () => {
+    const service = await createAppServerService();
+    const requests = vi.fn(async (method: string, params?: unknown) => {
+      const input = params as Record<string, unknown>;
+      if (method === "thread/read" && input.includeTurns === false) {
+        return { thread: { id: "thread-app-server", historyMode: "legacy", status: { type: "idle" } } };
+      }
+      if (method === "thread/turns/list") {
+        return { data: [{ id: "turn-target", status: "completed" }], nextCursor: null };
+      }
+      if (method === "thread/items/list") {
+        throw new Error('thread/items/list: {"code":-32601,"message":"thread/items/list not supported yet"}');
+      }
+      if (method === "thread/read" && input.includeTurns === true) {
+        return {
+          thread: {
+            id: "thread-app-server",
+            status: { type: "idle" },
+            turns: [{
+              id: "turn-target",
+              status: "completed",
+              items: [{ id: "legacy-agent", type: "agentMessage", text: "legacy item fallback" }],
+            }],
+          },
+        };
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    mockAppServerState.setRequestHandler(requests);
+
+    await expect(service.getTurnRecoverySnapshot("turn-target")).resolves.toMatchObject({
+      agentText: "legacy item fallback",
+    });
+    expect(requests).toHaveBeenCalledWith(
+      "thread/read",
+      { threadId: "thread-app-server", includeTurns: true },
+    );
+  });
+
+  it("rejects repeated 0.151 recovery item cursors", async () => {
+    const service = await createAppServerService();
+    mockAppServerState.setRequestHandler(async (method: string, params?: unknown) => {
+      const input = params as Record<string, unknown>;
+      if (method === "thread/read") {
+        return { thread: { id: "thread-app-server", historyMode: "paginated", status: { type: "idle" } } };
+      }
+      if (method === "thread/turns/list") {
+        return { data: [{ id: "turn-target", status: "completed" }], nextCursor: null };
+      }
+      if (method === "thread/items/list") {
+        return { data: [], nextCursor: input.cursor || "same-items" };
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    });
+
+    await expect(service.getTurnRecoverySnapshot("turn-target")).rejects.toThrow(
+      "Codex thread items returned a repeated pagination cursor.",
+    );
+  });
+
+  it.each([
+    { name: "0.151 legacy", historyMode: "legacy" },
+    { name: "pre-0.151 missing", historyMode: undefined },
+  ])("falls back to thread/read history for $name mode", async ({ historyMode }) => {
     const service = await createAppServerService();
     const requests = vi.fn(async (method: string, params?: unknown) => {
       const input = params as Record<string, unknown>;
@@ -808,7 +993,13 @@ describe("CodexSessionService", () => {
         throw new Error("Unsupported app-server request: thread/turns/list");
       }
       if (method === "thread/read" && input.includeTurns === false) {
-        return { thread: { id: "thread-app-server", status: { type: "idle" } } };
+        return {
+          thread: {
+            id: "thread-app-server",
+            ...(historyMode ? { historyMode } : {}),
+            status: { type: "idle" },
+          },
+        };
       }
       if (method === "thread/read" && input.includeTurns === true) {
         return {
@@ -840,6 +1031,39 @@ describe("CodexSessionService", () => {
     );
   });
 
+  it("treats an unknown 0.151 history mode as legacy-compatible", async () => {
+    const service = await createAppServerService();
+    const requests = vi.fn(async (method: string, params?: unknown) => {
+      const input = params as Record<string, unknown>;
+      if (method === "thread/turns/list") {
+        throw new Error("Unsupported app-server request: thread/turns/list");
+      }
+      if (method === "thread/read" && input.includeTurns === false) {
+        return { thread: { id: "thread-app-server", historyMode: "future-mode", status: { type: "idle" } } };
+      }
+      if (method === "thread/read" && input.includeTurns === true) {
+        return {
+          thread: {
+            id: "thread-app-server",
+            status: { type: "idle" },
+            turns: [{
+              id: "legacy-turn",
+              status: "completed",
+              items: [{ id: "legacy-agent", type: "agentMessage", text: "legacy-compatible" }],
+            }],
+          },
+        };
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    mockAppServerState.setRequestHandler(requests);
+
+    await expect(service.getTurnRecoverySnapshot("legacy-turn")).resolves.toMatchObject({
+      agentText: "legacy-compatible",
+    });
+    expect(mockAppServerState.recordUnknownEvent).toHaveBeenCalledWith("parse", "thread.historyMode");
+  });
+
   it("uses native 0.146 thread metadata and MCP refresh requests", async () => {
     const service = await createAppServerService();
     const requests = vi.fn(async (method: string) => {
@@ -863,8 +1087,8 @@ describe("CodexSessionService", () => {
     await expect(service.refreshMcpServers()).resolves.toEqual({
       supported: true,
       statuses: [
-        { name: "docs", authStatus: "oAuth" },
-        { name: "local", authStatus: "unsupported" },
+        { name: "docs", authStatus: "oAuth", runtimeStatus: "unknown" },
+        { name: "local", authStatus: "unsupported", runtimeStatus: "unknown" },
       ],
     });
     await expect(service.getStatusDetails()).resolves.toMatchObject({
@@ -932,9 +1156,86 @@ describe("CodexSessionService", () => {
     await expect(service.refreshMcpServers()).resolves.toEqual({
       supported: true,
       statuses: [
-        { name: "first", authStatus: "unknown" },
-        { name: "second", authStatus: "oAuth" },
+        { name: "first", authStatus: "unknown", runtimeStatus: "unknown" },
+        { name: "second", authStatus: "oAuth", runtimeStatus: "unknown" },
       ],
+    });
+  });
+
+  it("parses 0.150 MCP runtime status without confusing it with authentication", async () => {
+    mockAppServerState.setCodexVersion("0.150.0");
+    const service = await createAppServerService();
+    mockAppServerState.setRequestHandler(async (method: string) => {
+      if (method === "config/mcpServer/reload") {
+        return {};
+      }
+      if (method === "mcpServerStatus/list") {
+        return {
+          data: [
+            { name: "ready", authStatus: "oAuth", runtimeStatus: "connected" },
+            { name: "auth", authStatus: "notLoggedIn", runtimeStatus: "authenticationRequired" },
+            { name: "failed", authStatus: "oAuth", runtimeStatus: "failed" },
+            { name: "nullable", authStatus: "unsupported", runtimeStatus: null },
+            { name: "missing", authStatus: "unknown" },
+            { name: "future", authStatus: "oAuth", runtimeStatus: "futureStatus" },
+          ],
+        };
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    });
+
+    await expect(service.refreshMcpServers()).resolves.toEqual({
+      supported: true,
+      statuses: [
+        { name: "ready", authStatus: "oAuth", runtimeStatus: "connected" },
+        { name: "auth", authStatus: "notLoggedIn", runtimeStatus: "authenticationRequired" },
+        { name: "failed", authStatus: "oAuth", runtimeStatus: "failed" },
+        { name: "nullable", authStatus: "unsupported", runtimeStatus: "unknown" },
+        { name: "missing", authStatus: "unknown", runtimeStatus: "unknown" },
+        { name: "future", authStatus: "oAuth", runtimeStatus: "unknown" },
+      ],
+    });
+    await expect(service.getStatusDetails()).resolves.toMatchObject({
+      mcp: {
+        total: 6,
+        authenticationRequired: 1,
+        unknownAuthentication: 1,
+        runtimeStatusCounts: {
+          connected: 1,
+          authenticationRequired: 1,
+          failed: 1,
+          unknown: 3,
+        },
+      },
+    });
+  });
+
+  it("keeps valid 0.151 workspace plugins when a project marketplace fails", async () => {
+    const service = await createAppServerService();
+    const requests = vi.fn(async (method: string) => {
+      if (method === "plugin/list") {
+        return {
+          marketplaces: [{
+            name: "workspace",
+            plugins: [
+              { name: "enabled", installed: true, enabled: true },
+              { name: "disabled", installed: false, enabled: false },
+            ],
+          }],
+          marketplaceLoadErrors: [{ path: "/workspace/base/.codex/plugins/broken.json" }],
+        };
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    });
+    mockAppServerState.setRequestHandler(requests);
+
+    await expect(service.getStatusDetails()).resolves.toMatchObject({
+      plugins: { total: 2, installed: 1, disabled: 1, loadErrors: 1 },
+    });
+    expect(requests).toHaveBeenCalledWith("plugin/list", {
+      cwds: ["/workspace/base"],
+      forceRefetch: false,
+      marketplaceKinds: ["local", "workspace-directory"],
     });
   });
 
@@ -1167,6 +1468,27 @@ describe("CodexSessionService", () => {
       configuredSandboxMode: "workspace-write",
       configuredApprovalPolicy: "never",
     });
+  });
+
+  it("keeps the selected 0.151 permission profile across consecutive turns", async () => {
+    const service = await createAppServerService();
+    const client = mockAppServerState.CodexAppServerClient.mock.results[0]?.value;
+    const callbacks = createCallbacks();
+    service.setPermissionProfile("managed-profile");
+    mockAppServerState.setNotifications([completedAppServerTurn]);
+
+    await service.prompt("first managed turn", callbacks);
+    await service.prompt("second managed turn", callbacks);
+
+    const turnStartParams = client.request.mock.calls
+      .filter(([method]: [string]) => method === "turn/start")
+      .map(([, params]: [string, Record<string, unknown>]) => params);
+    expect(turnStartParams).toHaveLength(2);
+    expect(turnStartParams).toEqual([
+      expect.objectContaining({ permissions: "managed-profile" }),
+      expect.objectContaining({ permissions: "managed-profile" }),
+    ]);
+    expect(turnStartParams.every((params: Record<string, unknown>) => !("sandboxPolicy" in params))).toBe(true);
   });
 
   it("invalidates canonical item state after a 0.148 thread revert", async () => {
@@ -1414,6 +1736,25 @@ describe("CodexSessionService", () => {
     expect(service.getInfo().contextWindowPending).toBeUndefined();
   });
 
+  it("invalidates stale context state after a 0.151 model reroute", async () => {
+    const service = await createAppServerService();
+    const callbacks = createCallbacks();
+
+    (service as any).handleAppServerNotification(
+      {
+        method: "model/rerouted",
+        params: { fromModel: "o3", toModel: "gpt-5.5" },
+      },
+      callbacks,
+    );
+
+    expect(service.getInfo()).toMatchObject({
+      model: "gpt-5.5",
+      contextWindowPending: true,
+    });
+    expect(service.getInfo().contextWindow).toBeUndefined();
+  });
+
   it("renders a canonical app-server completion without prior start or delta notifications", async () => {
     const service = await createAppServerService();
     const callbacks = createCallbacks();
@@ -1542,6 +1883,165 @@ describe("CodexSessionService", () => {
     expect(callbacks.onToolStart).not.toHaveBeenCalled();
     expect(callbacks.onToolUpdate).not.toHaveBeenCalled();
     expect(callbacks.onToolEnd).not.toHaveBeenCalled();
+  });
+
+  it("treats 0.150 MCP and realtime lifecycle notifications as passive", async () => {
+    const service = await createAppServerService();
+    const callbacks = createCallbacks();
+    mockAppServerState.setNotifications([
+      {
+        method: "mcpServer/event/stream/notification",
+        params: {
+          subscriptionId: "subscription-a",
+          notification: { method: "notifications/progress", params: { secret: "must-not-be-rendered" } },
+        },
+      },
+      {
+        method: "thread/realtime/item/started",
+        params: {
+          threadId: "thread-app-server",
+          item: { id: "realtime-a", realtimeSessionId: "session-a", type: "transcriptSegment", role: "user", text: "" },
+        },
+      },
+      {
+        method: "thread/realtime/item/transcript/delta",
+        params: { threadId: "thread-app-server", itemId: "realtime-a", delta: "private transcript" },
+      },
+      {
+        method: "thread/realtime/item/completed",
+        params: {
+          threadId: "thread-app-server",
+          item: {
+            id: "realtime-a",
+            realtimeSessionId: "session-a",
+            type: "transcriptSegment",
+            role: "user",
+            text: "private transcript",
+          },
+        },
+      },
+      completedAppServerTurn,
+    ]);
+
+    await expect(service.prompt("passive 0.150 events", callbacks)).resolves.toBeUndefined();
+    expect(callbacks.onTextDelta).not.toHaveBeenCalled();
+    expect(callbacks.onToolStart).not.toHaveBeenCalled();
+    expect(callbacks.onToolUpdate).not.toHaveBeenCalled();
+    expect(callbacks.onToolEnd).not.toHaveBeenCalled();
+    expect(mockAppServerState.recordUnknownEvent).not.toHaveBeenCalled();
+  });
+
+  it("renders only bounded 0.151 MCP error messages", async () => {
+    const service = await createAppServerService();
+    const callbacks = createCallbacks();
+    mockAppServerState.setNotifications([
+      {
+        method: "item/completed",
+        params: {
+          threadId: "thread-app-server",
+          item: {
+            id: "mcp-message-error",
+            type: "mcpToolCall",
+            server: "docs",
+            tool: "search",
+            status: "failed",
+            error: {
+              message: "MCP search failed",
+              data: { accessToken: "must-not-be-rendered" },
+            },
+          },
+        },
+      },
+      {
+        method: "item/completed",
+        params: {
+          threadId: "thread-app-server",
+          item: {
+            id: "mcp-structured-error",
+            type: "mcpToolCall",
+            server: "docs",
+            tool: "read",
+            status: "failed",
+            error: {
+              data: { accessToken: "must-not-be-rendered" },
+            },
+          },
+        },
+      },
+      completedAppServerTurn,
+    ]);
+
+    await service.prompt("safe MCP errors", callbacks);
+
+    expect(callbacks.onToolUpdate).toHaveBeenCalledWith(
+      "mcp-message-error",
+      "MCP search failed",
+      { kind: "output" },
+    );
+    expect(callbacks.onToolUpdate).toHaveBeenCalledWith(
+      "mcp-structured-error",
+      "MCP tool call failed.",
+      { kind: "output" },
+    );
+    expect(JSON.stringify(callbacks.onToolUpdate.mock.calls)).not.toContain("must-not-be-rendered");
+  });
+
+  it("handles 0.150 interrupt hooks and collaboration enum additions generically", async () => {
+    const service = await createAppServerService();
+    const callbacks = createCallbacks();
+    const collabTools = ["sendMessage", "followupTask", "interruptAgent", "listAgents"];
+    mockAppServerState.setNotifications([
+      {
+        method: "hook/started",
+        params: { threadId: "thread-app-server", run: { id: "interrupt-hook", eventName: "interrupt" } },
+      },
+      {
+        method: "hook/completed",
+        params: {
+          threadId: "thread-app-server",
+          run: { id: "interrupt-hook", eventName: "interrupt", status: "completed" },
+        },
+      },
+      ...collabTools.flatMap((tool, index) => {
+        const item = {
+          id: `collab-${index}`,
+          type: "collabAgentToolCall",
+          tool,
+          status: "completed",
+          receiverThreadIds: [],
+          agentsStates: {},
+        };
+        return [
+          { method: "item/started", params: { threadId: "thread-app-server", item } },
+          { method: "item/completed", params: { threadId: "thread-app-server", item } },
+        ];
+      }),
+      {
+        method: "item/started",
+        params: {
+          threadId: "thread-app-server",
+          item: { id: "subagent-completed", type: "subAgentActivity", kind: "completed", status: "completed" },
+        },
+      },
+      {
+        method: "item/completed",
+        params: {
+          threadId: "thread-app-server",
+          item: { id: "subagent-completed", type: "subAgentActivity", kind: "completed", status: "completed" },
+        },
+      },
+      completedAppServerTurn,
+    ]);
+
+    await service.prompt("0.150 enum compatibility", callbacks);
+
+    expect(callbacks.onToolStart).toHaveBeenCalledWith("hook:interrupt", "hook-interrupt-hook");
+    for (const [index, tool] of collabTools.entries()) {
+      expect(callbacks.onToolStart).toHaveBeenCalledWith(`subagent:${tool}`, `collab-${index}`);
+    }
+    expect(callbacks.onToolStart).toHaveBeenCalledWith("subagent:completed", "subagent-completed");
+    expect(callbacks.onToolEnd).toHaveBeenCalledTimes(6);
+    expect(mockAppServerState.recordUnknownEvent).not.toHaveBeenCalled();
   });
 
   it("releases canonical item lifecycle state between app-server turns", async () => {
@@ -1722,6 +2222,7 @@ describe("CodexSessionService", () => {
     expect(codexInstance.startThread).toHaveBeenCalledTimes(2);
     expect(codexInstance.startThread).toHaveBeenLastCalledWith({
       model: "o3",
+      threadSource: "telecodex",
       sandboxMode: "workspace-write",
       workingDirectory: "/workspace/other",
       approvalPolicy: "never",
@@ -1849,6 +2350,7 @@ describe("CodexSessionService", () => {
 
     expect(codexInstance.startThread).toHaveBeenLastCalledWith({
       model: "gpt-5.4",
+      threadSource: "telecodex",
       sandboxMode: "workspace-write",
       workingDirectory: "/workspace/base",
       approvalPolicy: "never",
@@ -1869,6 +2371,7 @@ describe("CodexSessionService", () => {
 
     expect(codexInstance.startThread).toHaveBeenLastCalledWith({
       model: "o3",
+      threadSource: "telecodex",
       sandboxMode: "workspace-write",
       workingDirectory: "/workspace/base",
       approvalPolicy: "never",
@@ -2154,6 +2657,46 @@ describe("CodexSessionService", () => {
         params: { threadId: "thread-app-server", permissions: { network: { enabled: true } } },
       }),
     ).resolves.toEqual({ permissions: {}, scope: "turn" });
+  });
+
+  it("fails closed for unknown 0.150 command approval kinds", async () => {
+    const service = await createAppServerService();
+    const onApprovalRequest = vi.fn().mockResolvedValue({ decision: "accept" });
+    const callbacks = { ...createCallbacks(), onApprovalRequest };
+
+    await expect(
+      (service as any).handleAppServerRequest(
+        {
+          method: "item/commandExecution/requestApproval",
+          params: { threadId: "thread-app-server", itemId: "legacy-command" },
+        },
+        callbacks,
+      ),
+    ).resolves.toEqual({ decision: "accept" });
+    await expect(
+      (service as any).handleAppServerRequest(
+        {
+          method: "item/commandExecution/requestApproval",
+          params: { threadId: "thread-app-server", itemId: "stdin-command", kind: "writeStdin" },
+        },
+        callbacks,
+      ),
+    ).resolves.toEqual({ decision: "accept" });
+    await expect(
+      (service as any).handleAppServerRequest(
+        {
+          method: "item/commandExecution/requestApproval",
+          params: { threadId: "thread-app-server", itemId: "future-command", kind: "futureKind" },
+        },
+        callbacks,
+      ),
+    ).resolves.toEqual({ decision: "decline" });
+
+    expect(onApprovalRequest).toHaveBeenCalledTimes(2);
+    expect(mockAppServerState.recordUnknownEvent).toHaveBeenCalledWith(
+      "request",
+      "item/commandExecution/requestApproval:unknown-kind",
+    );
   });
 
   it("marks a recovered response item as already delivered after live delivery", () => {

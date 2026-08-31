@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -15,6 +15,7 @@ describe("loadConfig", () => {
     process.env = { ...originalEnv };
     delete process.env.TELEGRAM_BOT_TOKEN;
     delete process.env.TELEGRAM_ALLOWED_USER_IDS;
+    delete process.env.TELECODEX_WORKSPACE;
     delete process.env.CODEX_API_KEY;
     delete process.env.CODEX_MODEL;
     delete process.env.CODEX_SANDBOX_MODE;
@@ -83,7 +84,7 @@ describe("loadConfig", () => {
       telegramBotToken: "bot-token",
       telegramAllowedUserIds: [123, 456],
       telegramAllowedUserIdSet: new Set([123, 456]),
-      workspace: process.cwd(),
+      workspace: existsSync("/.dockerenv") ? "/workspace" : process.cwd(),
       maxFileSize: 20 * 1024 * 1024,
       codexApiKey: "secret-key",
       codexModel: "o3",
@@ -163,7 +164,7 @@ describe("loadConfig", () => {
     expect(config.enableTelegramLogin).toBe(true);
     expect(config.enableTelegramReactions).toBe(false);
     expect(config.enableLifecycleNotifications).toBe(false);
-    expect(config.workspace).toBe(process.cwd());
+    expect(config.workspace).toBe(existsSync("/.dockerenv") ? "/workspace" : process.cwd());
   });
 
   it("throws when a user id is invalid", () => {

@@ -3,6 +3,7 @@ import { accessSync, constants, existsSync, statSync } from "node:fs";
 import path from "node:path";
 
 import { checkAuthStatus, type AuthStatus } from "./codex-auth.js";
+import { resolveCodexCliPath } from "./codex-cli-path.js";
 import { getTelecoConfigRoot, isHomebrewInstall } from "./install-layout.js";
 import { listInstanceConfigs } from "./instance-config.js";
 import { getTelecoVersion } from "./version.js";
@@ -18,18 +19,25 @@ interface CommandResult {
   output: string;
 }
 
+type CommandRunner = (
+  command: string,
+  args: string[],
+  environment?: NodeJS.ProcessEnv,
+) => CommandResult;
+
 interface InstallDoctorOptions {
   offline: boolean;
   environment?: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
-  runCommand?: (command: string, args: string[]) => CommandResult;
-  checkAuth?: (apiKey?: string) => Promise<AuthStatus>;
+  runCommand?: CommandRunner;
+  checkAuth?: (apiKey?: string, environment?: NodeJS.ProcessEnv) => Promise<AuthStatus>;
 }
 
 export async function collectInstallDoctor(options: InstallDoctorOptions): Promise<InstallDoctorCheck[]> {
   const environment = options.environment ?? process.env;
   const platform = options.platform ?? process.platform;
-  const runCommand = options.runCommand ?? ((command, args) => run(command, args, environment));
+  const runCommand: CommandRunner = options.runCommand
+    ?? ((command, args, commandEnvironment = environment) => run(command, args, commandEnvironment));
   const checks: InstallDoctorCheck[] = [];
   const nodeMajor = Number(process.versions.node.split(".")[0]);
   const version = getTelecoVersion();
@@ -58,11 +66,17 @@ export async function collectInstallDoctor(options: InstallDoctorOptions): Promi
 
   if (options.offline) return checks;
 
-  const codexVersion = runCommand("codex", ["--version"]);
-  checks.push({ name: "Codex CLI", ok: codexVersion.ok, detail: codexVersion.ok ? codexVersion.output : "not available" });
-  const appServer = runCommand("codex", ["app-server", "--help"]);
+  const resolvedCodexCli = resolveCodexCliPath(environment);
+  const codexEnvironment = { ...environment, PATH: resolvedCodexCli.path };
+  const codexVersion = runCommand(resolvedCodexCli.command, ["--version"], codexEnvironment);
+  checks.push({
+    name: "Codex CLI",
+    ok: codexVersion.ok,
+    detail: codexVersion.ok ? `${codexVersion.output} (${resolvedCodexCli.command})` : "not available",
+  });
+  const appServer = runCommand(resolvedCodexCli.command, ["app-server", "--help"], codexEnvironment);
   checks.push({ name: "Codex app-server", ok: appServer.ok, detail: appServer.ok ? "available" : "unavailable" });
-  const auth = await (options.checkAuth ?? checkAuthStatus)(environment.CODEX_API_KEY);
+  const auth = await (options.checkAuth ?? checkAuthStatus)(environment.CODEX_API_KEY, codexEnvironment);
   checks.push({
     name: "Codex auth",
     ok: auth.authenticated,

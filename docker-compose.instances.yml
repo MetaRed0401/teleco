@@ -1,0 +1,50 @@
+name: teleco
+
+x-telecodex-environment: &telecodex-environment
+  CODEX_HOME: /home/telecodex/.codex
+  TELECODEX_WORKSPACE: /workspace
+
+x-telecodex-service: &telecodex-service
+  build:
+    context: .
+    dockerfile: Dockerfile.local
+  image: telecodex:local
+  restart: unless-stopped
+  user: "${TELECODEX_UID:-1000}:${TELECODEX_GID:-1000}"
+  volumes:
+    - ${CODEX_HOME_DIR:-${HOME}/.codex}:/home/telecodex/.codex:rw
+    - ${TELECODEX_WORKSPACE_DIR:-.}:/workspace:rw
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  mem_limit: 2g
+  cpus: 2.0
+
+services:
+  first:
+    <<: *telecodex-service
+    container_name: telecodex-first
+    env_file:
+      - .env.first
+    environment:
+      <<: *telecodex-environment
+      TELECODEX_INSTANCE: first
+
+  second:
+    <<: *telecodex-service
+    container_name: telecodex-second
+    env_file:
+      - .env.second
+    environment:
+      <<: *telecodex-environment
+      TELECODEX_INSTANCE: second
+
+  third:
+    <<: *telecodex-service
+    container_name: telecodex-third
+    env_file:
+      - .env.third
+    environment:
+      <<: *telecodex-environment
+      TELECODEX_INSTANCE: third

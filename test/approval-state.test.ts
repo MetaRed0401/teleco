@@ -10,7 +10,7 @@ import {
   finishPersistedApproval,
   persistPendingApproval,
 } from "../src/approval-state.js";
-import { fingerprintApprovalRequest } from "../src/bot.js";
+import { fingerprintApprovalRequest, renderApprovalRequest } from "../src/bot.js";
 import type { TeleCodexConfig } from "../src/config.js";
 import type { TelegramContextKey } from "../src/context-key.js";
 
@@ -64,6 +64,47 @@ describe("approval state isolation", () => {
       fingerprintApprovalRequest({ ...base, params: { ...base.params, turnId: "turn-b" } }, "first"),
     );
     expect(fingerprintApprovalRequest(base, "first")).not.toBe(fingerprintApprovalRequest(base, "second"));
+  });
+
+  it("separates terminal input approvals from command approvals", () => {
+    const base = {
+      method: "item/commandExecution/requestApproval",
+      params: {
+        threadId: "thread-a",
+        turnId: "turn-a",
+        itemId: "item-a",
+        approvalId: "approval-a",
+        command: "pnpm test",
+        cwd: "/workspace/a",
+      },
+    };
+
+    const legacyFingerprint = fingerprintApprovalRequest(base, "first");
+    const commandFingerprint = fingerprintApprovalRequest(
+      { ...base, params: { ...base.params, kind: "command" } },
+      "first",
+    );
+    const writeStdinRequest = {
+      ...base,
+      params: { ...base.params, kind: "writeStdin", environmentId: "terminal-a" },
+    };
+
+    expect(legacyFingerprint).toBe(commandFingerprint);
+    expect(fingerprintApprovalRequest(writeStdinRequest, "first")).not.toBe(commandFingerprint);
+    expect(renderApprovalRequest(writeStdinRequest)).toEqual({
+      html: [
+        "<b>Codex approval requested: terminal input</b>",
+        "<b>cwd:</b> <code>/workspace/a</code>",
+        "<b>terminal:</b> <code>terminal-a</code>",
+        "<b>terminal command:</b>\n<pre>pnpm test</pre>",
+      ].join("\n"),
+      plain: [
+        "Codex approval requested: terminal input",
+        "cwd: /workspace/a",
+        "terminal: terminal-a",
+        "terminal command: pnpm test",
+      ].join("\n"),
+    });
   });
 
   it("keeps persisted records scoped to their Telegram context", () => {

@@ -140,6 +140,7 @@ type TelegramReaction = NonNullable<Parameters<Context["api"]["setMessageReactio
 type TelegramReactionEmoji = Extract<TelegramReaction, { type: "emoji" }>["emoji"];
 type KeyboardItem = { label: string; callbackData: string };
 type PermissionProfilePick = { id: string | null; label: string; description?: string };
+type CodexCommandApprovalKind = "command" | "writeStdin";
 type PendingApproval = {
   resolve: (response: CodexApprovalResponse) => void;
   timeout: NodeJS.Timeout;
@@ -189,6 +190,17 @@ function getAvailableApprovalDecisions(request: CodexApprovalRequest): CodexAppr
       value === "accept" || value === "acceptForSession" || value === "decline" || value === "cancel",
   );
   return decisions.length > 0 ? decisions : ["cancel"];
+}
+
+function readCommandApprovalKind(request: CodexApprovalRequest): CodexCommandApprovalKind | undefined {
+  if (request.method !== "item/commandExecution/requestApproval") {
+    return undefined;
+  }
+  const kind = readUnknownRecord(request.params)?.kind;
+  if (kind === undefined || kind === "command") {
+    return "command";
+  }
+  return kind === "writeStdin" ? kind : undefined;
 }
 type PendingMcpElicitation = {
   resolve: (response: CodexMcpElicitationResponse) => void;
@@ -1009,6 +1021,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     messageThreadId: number | undefined,
     request: CodexApprovalRequest,
   ): Promise<CodexApprovalResponse> => {
+    if (
+      request.method === "item/commandExecution/requestApproval"
+      && readCommandApprovalKind(request) === undefined
+    ) {
+      return { decision: "decline" };
+    }
     const approvalContextKey = contextKeyFromCtx(ctx);
     const fingerprint = fingerprintApprovalRequest(request, instanceName);
     const interrupted = findInterruptedApproval(config, fingerprint, approvalContextKey);
@@ -6971,12 +6989,26 @@ function renderMobileStatus(options: {
   const appServer = summarizeAppServerStatus(options.appServerStatus);
   const approvals = summarizeApprovalBridge(options.approvalBridge, info.approvalPolicy);
   const agents = formatAgentsSummary(details.thread?.instructionSources ?? []);
+  const mcpRuntime = details.mcp
+    ? ([
+        ["connected", details.mcp.runtimeStatusCounts.connected],
+        ["starting", details.mcp.runtimeStatusCounts.starting],
+        ["not started", details.mcp.runtimeStatusCounts.notStarted],
+        ["auth required", details.mcp.runtimeStatusCounts.authenticationRequired],
+        ["failed", details.mcp.runtimeStatusCounts.failed],
+        ["cancelled", details.mcp.runtimeStatusCounts.cancelled],
+        ["disabled", details.mcp.runtimeStatusCounts.disabled],
+        ["unknown", details.mcp.runtimeStatusCounts.unknown],
+      ] satisfies Array<[string, number]>)
+        .filter(([, count]) => count > 0)
+        .map(([status, count]) => `${count} ${status}`)
+    : [];
   const mcp = details.mcp
     ? `${details.mcp.total} server${details.mcp.total === 1 ? "" : "s"}${
         details.mcp.authenticationRequired > 0 ? ` · ${details.mcp.authenticationRequired} auth required` : ""
       }${
         details.mcp.unknownAuthentication > 0 ? ` · ${details.mcp.unknownAuthentication} auth unknown` : ""
-      }`
+      }${mcpRuntime.length > 0 ? ` · runtime ${mcpRuntime.join(", ")}` : ""}`
     : undefined;
   const plugins = details.plugins
     ? `${details.plugins.total} found · ${details.plugins.installed} installed${
@@ -7724,7 +7756,7 @@ function renderApprovalBridgeStatus(
 
 export function fingerprintApprovalRequest(request: CodexApprovalRequest, instanceName: string): string {
   const params = readUnknownRecord(request.params) ?? {};
-  const identity = {
+  const identity: Record<string, unknown> = {
     threadId: params.threadId,
     turnId: params.turnId,
     itemId: params.itemId,
@@ -7746,6 +7778,9 @@ export function fingerprintApprovalRequest(request: CodexApprovalRequest, instan
     proposedExecpolicyAmendment: params.proposedExecpolicyAmendment,
     proposedNetworkPolicyAmendments: params.proposedNetworkPolicyAmendments,
   };
+  if (request.method === "item/commandExecution/requestApproval") {
+    identity.kind = readCommandApprovalKind(request) ?? "unknown";
+  }
   return createHash("sha256")
     .update(instanceName)
     .update("\0")
@@ -7837,8 +7872,10 @@ function approvalMethodLabel(method: string): string {
   return "approval";
 }
 
-function renderApprovalRequest(request: CodexApprovalRequest): { html: string; plain: string } {
+export function renderApprovalRequest(request: CodexApprovalRequest): { html: string; plain: string } {
   const params = readUnknownRecord(request.params);
+  const commandApprovalKind = readCommandApprovalKind(request);
+  const isWriteStdin = commandApprovalKind === "writeStdin";
   const command = readUnknownString(params?.command);
   const commandActions = summarizeApprovalCommandActions(params?.commandActions);
   const cwd = readUnknownString(params?.cwd);
@@ -7847,9 +7884,12 @@ function renderApprovalRequest(request: CodexApprovalRequest): { html: string; p
   const networkContext = readUnknownRecord(params?.networkApprovalContext);
   const networkHost = readUnknownString(networkContext?.host);
   const networkProtocol = readUnknownString(networkContext?.protocol);
+  const terminalId = readUnknownString(params?.environmentId) ?? readUnknownString(params?.itemId);
   const title =
     request.method === "item/commandExecution/requestApproval"
-      ? "Codex approval requested: command"
+      ? isWriteStdin
+        ? "Codex approval requested: terminal input"
+        : "Codex approval requested: command"
       : request.method === "item/fileChange/requestApproval"
         ? "Codex approval requested: file change"
         : request.method === "item/permissions/requestApproval"
@@ -7860,9 +7900,10 @@ function renderApprovalRequest(request: CodexApprovalRequest): { html: string; p
   const plain = [
     title,
     cwd ? `cwd: ${cwd}` : undefined,
+    isWriteStdin && terminalId ? `terminal: ${terminalId}` : undefined,
     reason ? `reason: ${redactPotentialSecrets(reason)}` : undefined,
     networkHost ? `network: ${networkProtocol ? `${networkProtocol}://` : ""}${networkHost}` : undefined,
-    detail ? `request: ${detail}` : undefined,
+    detail ? `${isWriteStdin ? "terminal command" : "request"}: ${detail}` : undefined,
   ]
     .filter((line): line is string => Boolean(line))
     .join("\n");
@@ -7870,11 +7911,14 @@ function renderApprovalRequest(request: CodexApprovalRequest): { html: string; p
   const html = [
     `<b>${escapeHTML(title)}</b>`,
     cwd ? `<b>cwd:</b> <code>${escapeHTML(cwd)}</code>` : undefined,
+    isWriteStdin && terminalId ? `<b>terminal:</b> <code>${escapeHTML(terminalId)}</code>` : undefined,
     reason ? `<b>reason:</b> <code>${escapeHTML(redactPotentialSecrets(reason))}</code>` : undefined,
     networkHost
       ? `<b>network:</b> <code>${escapeHTML(`${networkProtocol ? `${networkProtocol}://` : ""}${networkHost}`)}</code>`
       : undefined,
-    detail ? `<b>request:</b>\n<pre>${escapeHTML(truncateForTelegramPre(detail, 1200))}</pre>` : undefined,
+    detail
+      ? `<b>${isWriteStdin ? "terminal command" : "request"}:</b>\n<pre>${escapeHTML(truncateForTelegramPre(detail, 1200))}</pre>`
+      : undefined,
   ]
     .filter((line): line is string => Boolean(line))
     .join("\n");
@@ -7935,6 +7979,7 @@ function summarizeApprovalRequestForList(request: CodexApprovalRequest): {
   detail: string;
 } {
   const params = readUnknownRecord(request.params);
+  const isWriteStdin = readCommandApprovalKind(request) === "writeStdin";
   const command = readUnknownString(params?.command);
   const commandActions = summarizeApprovalCommandActions(params?.commandActions);
   const cwd = readUnknownString(params?.cwd);
@@ -7942,7 +7987,9 @@ function summarizeApprovalRequestForList(request: CodexApprovalRequest): {
   const grantRoot = readUnknownString(params?.grantRoot);
   const type =
     request.method === "item/commandExecution/requestApproval"
-      ? "command"
+      ? isWriteStdin
+        ? "terminal input"
+        : "command"
       : request.method === "item/fileChange/requestApproval"
         ? "file change"
         : request.method === "item/permissions/requestApproval"

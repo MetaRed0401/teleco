@@ -20,11 +20,15 @@ App-server approval server requests are connection-scoped. Teleco persists a bou
 
 The legacy SDK fallback is kept only as a compatibility path. New operation should use `ENABLE_CODEX_APP_SERVER_RUNTIME=true`.
 
-The minimum compatible Codex CLI/app-server version for this branch is 0.144.1, and the recommended stable version is 0.149.0. The minimum baseline uses canonical app-server items for tool activity and includes the `0.142.5` protection against full `Responses` WebSocket request payloads being written to trace logs. Codex CLI and SDK versions are reported separately and are not required to match exactly.
+The minimum compatible Codex CLI/app-server version for this branch is 0.144.1, and the recommended stable version is 0.151.0. The minimum baseline uses canonical app-server items for tool activity and includes the `0.142.5` protection against full `Responses` WebSocket request payloads being written to trace logs. Codex CLI and SDK versions are reported separately and are not required to match exactly.
 
 TeleCodex keeps app-server handling conservative across Codex releases. Canonical command, file change, MCP, dynamic tool, collaboration, sub-agent, web search, review, hook, and compact activity is normalized into one item-ID lifecycle. Aggregated completion output contributes only the suffix not already received through delta notifications. Unknown MCP/plugin/status notifications are ignored unless they are useful and safe to show on mobile.
 
 Codex 0.149 project assignments remain metadata and never replace workspace or thread ownership checks. Async agent messages are committed as non-terminal live items, while strict-review notifications are informational activity rather than actionable Telegram approvals.
+
+Codex 0.150 distinguishes a new command from input sent to an existing terminal through the command approval `kind`. Teleco includes that normalized kind in approval fingerprints, renders terminal input as a separate approval type, and declines unknown kinds without showing an allow button. MCP authentication state remains separate from the nullable runtime connection state shown in `/status`. MCP event streams and realtime thread timelines are not Teleco features yet, so their notifications are handled passively without retaining payloads or starting subscriptions.
+
+Codex 0.151 marks thread history as either `legacy` or `paginated`. Teleco never falls back to deprecated full-history hydration for a paginated thread; it uses bounded turn pagination and requests a target turn's items only when the turn page omits them. Codex 0.151.0 advertises `thread/items/list` in the stable schema but may return `-32601` at runtime, which Teleco reports as an unavailable paginated recovery path instead of exposing or duplicating partial history. Internal raw-response usage metadata is not added to token totals; `thread/tokenUsage/updated` remains the canonical usage source.
 
 MCP URL elicitations are scoped to the originating Telegram context. Only credential-free HTTPS URLs receive an authentication button, and the user must explicitly confirm completion or cancel. Structured form elicitations fail closed until Teleco provides a schema-aware form UI. Authentication prompts are never mirrored to notification channels.
 
@@ -67,7 +71,7 @@ Dynamic tools and MCP servers are discovered by Codex at runtime. Do not assume 
 
 When the selected launch profile uses an approval policy that asks for review, app-server approval requests are forwarded to Telegram inline buttons.
 
-Supported approval families include command execution, file changes, and permission profile requests. For unattended personal service operation, `CODEX_APPROVAL_POLICY=never` avoids approval prompts.
+Supported approval families include command execution, existing-terminal input, file changes, and permission profile requests. Existing-terminal input uses its own label and approval identity even when it belongs to the same command item. For unattended personal service operation, `CODEX_APPROVAL_POLICY=never` avoids approval prompts.
 
 ## Compact Flow
 

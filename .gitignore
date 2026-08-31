@@ -62,3 +62,8 @@ docker-compose.local.yml
 !Dockerfile.local
 !docker-compose.local.yml
 !.telecodex/docker-empty-auth.json
+
+packaging
+node_modules
+.pnpm-store
+.github

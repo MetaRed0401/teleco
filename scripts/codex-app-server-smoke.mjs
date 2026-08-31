@@ -9,6 +9,7 @@ const root = mkdtempSync(path.join(tmpdir(), "telecodex-app-server-smoke-"));
 const codexHome = path.join(root, "codex-home");
 const workspace = path.join(root, "workspace");
 const schemaDir = path.join(root, "schema");
+const stableSchemaDir = path.join(root, "schema-stable");
 const configuredCodexBinary = process.env.CODEX_BIN?.trim() || "codex";
 const codexBinary = configuredCodexBinary.includes(path.sep)
   ? path.resolve(configuredCodexBinary)
@@ -19,6 +20,8 @@ const expect0146 = compatMinor !== undefined && compatMinor >= 146;
 const expect0147 = compatMinor !== undefined && compatMinor >= 147;
 const expect0148 = compatMinor !== undefined && compatMinor >= 148;
 const expect0149 = compatMinor !== undefined && compatMinor >= 149;
+const expect0150 = compatMinor !== undefined && compatMinor >= 150;
+const expect0151 = compatMinor !== undefined && compatMinor >= 151;
 mkdirSync(codexHome, { recursive: true });
 mkdirSync(workspace, { recursive: true });
 let stage = "schema generation";
@@ -116,6 +119,47 @@ try {
       if (!schemaText.includes(protocolName)) throw new Error("0.149 schema contract");
     }
   }
+  if (expect0150) {
+    for (const protocolName of [
+      "CommandExecutionApprovalKind",
+      "writeStdin",
+      "McpServerConnectionStatus",
+      "runtimeStatus",
+      "mcpServer/event/stream/start",
+      "mcpServer/event/stream/stop",
+      "mcpServer/event/stream/notification",
+      "ThreadRealtimeItem",
+      "thread/realtime/item/started",
+      "thread/realtime/item/completed",
+      "thread/realtime/item/transcript/delta",
+      "ThreadTimelineEntry",
+      "thread/timeline/list",
+    ]) {
+      if (!schemaText.includes(protocolName)) throw new Error("0.150 schema contract");
+    }
+  }
+  if (expect0151) {
+    stage = "0.151 stable schema generation";
+    const stableSchema = spawnSync(codexBinary, ["app-server", "generate-json-schema", "--out", stableSchemaDir], {
+      env: { ...process.env, CODEX_HOME: codexHome },
+      stdio: "ignore",
+      timeout: 15_000,
+    });
+    if (stableSchema.status !== 0) throw new Error("0.151 stable schema");
+    assertSchemaFileContains(stableSchemaDir, "ClientRequest.json", [
+      "thread/turns/list",
+      "thread/items/list",
+      "thread/revert",
+    ]);
+    assertSchemaFileContains(stableSchemaDir, "v2/ThreadReadResponse.json", ["ThreadHistoryMode", "historyMode"]);
+    assertSchemaFileContains(stableSchemaDir, "v2/ThreadResumeParams.json", ["excludeTurns"]);
+    assertSchemaFileContains(stableSchemaDir, "v2/ThreadForkParams.json", ["excludeTurns"]);
+    assertSchemaFileContains(stableSchemaDir, "v2/RawResponseCompletedNotification.json", [
+      "ResponseUsageMetadata",
+      "usageMetadata",
+    ]);
+    assertSchemaFileContains(schemaDir, "v2/TurnSettingsUpdateParams.json", ["TurnSettingsUpdateParams"]);
+  }
 
   stage = "initialize";
   client = createClient(codexHome, workspace);
@@ -158,7 +202,40 @@ try {
     }
     stage = "native MCP refresh";
     await client.request("config/mcpServer/reload", {});
-    await client.request("mcpServerStatus/list", {});
+    const mcpStatus = await client.request("mcpServerStatus/list", {});
+    if (expect0150) {
+      const knownRuntimeStatuses = new Set([
+        "notStarted",
+        "starting",
+        "connected",
+        "authenticationRequired",
+        "failed",
+        "cancelled",
+        "disabled",
+      ]);
+      for (const status of Array.isArray(mcpStatus?.data) ? mcpStatus.data : []) {
+        if (
+          status?.runtimeStatus !== undefined
+          && status.runtimeStatus !== null
+          && !knownRuntimeStatuses.has(status.runtimeStatus)
+        ) {
+          throw new Error("0.150 MCP runtime status contract");
+        }
+      }
+    }
+  }
+  if (expect0151) {
+    stage = "0.151 thread items";
+    try {
+      await client.request("thread/items/list", {
+        threadId,
+        limit: 10,
+        sortDirection: "desc",
+      });
+    } catch (error) {
+      // 0.151.0 advertises the stable schema before enabling this runtime method.
+      if (error?.rpcCode !== -32601) throw error;
+    }
   }
   if (expect0147) {
     stage = "0.147 thread search";
@@ -302,6 +379,13 @@ function readSchemaTree(directory) {
       return entry.isDirectory() ? readSchemaTree(entryPath) : entry.name.endsWith(".json") ? readFileSync(entryPath, "utf8") : "";
     })
     .join("\n");
+}
+
+function assertSchemaFileContains(rootDirectory, relativePath, expectedValues) {
+  const content = readFileSync(path.join(rootDirectory, relativePath), "utf8");
+  for (const expected of expectedValues) {
+    if (!content.includes(expected)) throw new Error(`0.151 schema contract: ${relativePath}`);
+  }
 }
 
 function readCodexMinor(version) {

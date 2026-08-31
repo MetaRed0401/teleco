@@ -1,9 +1,10 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { accessSync, constants, existsSync, realpathSync } from "node:fs";
-import path from "node:path";
+import { realpathSync } from "node:fs";
 
 import { recordUnknownAppServerEvent, type UnknownAppServerEventKind } from "./app-server-observability.js";
+import { resolveCodexCliPath, type ResolvedCodexCli } from "./codex-cli-path.js";
 import { redactPotentialSecrets } from "./secret-redaction.js";
+import { getTelecoVersion } from "./version.js";
 
 export type AppServerMessage = Record<string, unknown>;
 export type AppServerNotification = { method: string; params?: unknown };
@@ -183,7 +184,7 @@ export class CodexAppServerClient {
       clientInfo: {
         name: "telecodex",
         title: "TeleCodex",
-        version: "0.1.0",
+        version: getTelecoVersion(),
       },
       capabilities: {
         experimentalApi: true,
@@ -492,79 +493,9 @@ function extractCodexVersion(value: unknown): string {
   return userAgent.match(/\b\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?\b/)?.[0] ?? "unknown";
 }
 
-function resolveCodexCliPath(): { command: string; path: string; checked: string[] } {
-  const pathValue = buildCodexCliPath();
-  const checked: string[] = [];
-
-  for (const dir of pathValue.split(path.delimiter)) {
-    if (!dir) {
-      continue;
-    }
-    const candidate = path.join(dir, "codex");
-    checked.push(candidate);
-    if (isExecutable(candidate)) {
-      return { command: resolveRealPath(candidate), path: pathValue, checked };
-    }
-  }
-
-  return { command: "codex", path: pathValue, checked };
-}
-
-function buildCodexCliPath(): string {
-  const home = process.env.HOME;
-  const candidates = [
-    path.join(process.cwd(), "node_modules", ".bin"),
-    process.env.PATH,
-    "/opt/homebrew/bin",
-    "/opt/homebrew/sbin",
-    "/usr/local/bin",
-    "/usr/bin",
-    "/bin",
-    "/usr/sbin",
-    "/sbin",
-    home ? path.join(home, ".local", "bin") : undefined,
-    home ? path.join(home, "bin") : undefined,
-    home ? path.join(home, ".bun", "bin") : undefined,
-    home ? path.join(home, ".npm-global", "bin") : undefined,
-  ];
-
-  const seen = new Set<string>();
-  const parts: string[] = [];
-  for (const candidate of candidates) {
-    for (const dir of (candidate ?? "").split(path.delimiter)) {
-      if (!dir || seen.has(dir)) {
-        continue;
-      }
-      seen.add(dir);
-      parts.push(dir);
-    }
-  }
-  return parts.join(path.delimiter);
-}
-
-function resolveRealPath(filePath: string): string {
-  try {
-    return realpathSync(filePath);
-  } catch {
-    return filePath;
-  }
-}
-
-function isExecutable(filePath: string): boolean {
-  try {
-    if (!existsSync(filePath)) {
-      return false;
-    }
-    accessSync(filePath, constants.X_OK);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function formatSpawnFailure(
   error: unknown,
-  resolved: { command: string; path: string; checked: string[] },
+  resolved: ResolvedCodexCli,
   cwd: string,
 ): string {
   const message = error instanceof Error ? error.message : String(error);

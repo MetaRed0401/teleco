@@ -1,6 +1,6 @@
 {
   "name": "teleco",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Telegram control plane for the OpenAI Codex CLI and app-server",
   "license": "MIT",
   "author": "Benedict Evert",
@@ -44,8 +44,8 @@
   },
   "dependencies": {
     "@grammyjs/auto-retry": "^2.0.2",
-    "@openai/codex": "0.149.0",
-    "@openai/codex-sdk": "0.149.0",
+    "@openai/codex": "0.151.0",
+    "@openai/codex-sdk": "0.151.0",
     "grammy": "^1.44.0",
     "node-pty": "^1.1.0"
   },

@@ -1,7 +1,7 @@
 import * as pty from "node-pty";
-import { accessSync, constants, existsSync, realpathSync } from "node:fs";
-import path from "node:path";
+import { realpathSync } from "node:fs";
 
+import { resolveCodexCliPath, type ResolvedCodexCli } from "./codex-cli-path.js";
 import type { CodexSessionInfo } from "./codex-session.js";
 
 const CLI_COMPACT_TIMEOUT_MS = 20 * 60 * 1000;
@@ -240,68 +240,7 @@ function stripTerminalControlSequences(value: string): string {
     .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "");
 }
 
-function resolveCodexCliPath(): { command: string; path: string; checked: string[] } {
-  const pathValue = buildCodexCliPath();
-  const checked: string[] = [];
-
-  for (const dir of pathValue.split(path.delimiter)) {
-    if (!dir) {
-      continue;
-    }
-    const candidate = path.join(dir, "codex");
-    checked.push(candidate);
-    if (isExecutable(candidate)) {
-      return { command: candidate, path: pathValue, checked };
-    }
-  }
-
-  return { command: "codex", path: pathValue, checked };
-}
-
-function buildCodexCliPath(): string {
-  const home = process.env.HOME;
-  const candidates = [
-    process.env.PATH,
-    "/opt/homebrew/bin",
-    "/opt/homebrew/sbin",
-    "/usr/local/bin",
-    "/usr/bin",
-    "/bin",
-    "/usr/sbin",
-    "/sbin",
-    home ? path.join(home, ".local", "bin") : undefined,
-    home ? path.join(home, "bin") : undefined,
-    home ? path.join(home, ".bun", "bin") : undefined,
-    home ? path.join(home, ".npm-global", "bin") : undefined,
-  ];
-
-  const seen = new Set<string>();
-  const parts: string[] = [];
-  for (const candidate of candidates) {
-    for (const dir of (candidate ?? "").split(path.delimiter)) {
-      if (!dir || seen.has(dir)) {
-        continue;
-      }
-      seen.add(dir);
-      parts.push(dir);
-    }
-  }
-  return parts.join(path.delimiter);
-}
-
-function isExecutable(filePath: string): boolean {
-  try {
-    if (!existsSync(filePath)) {
-      return false;
-    }
-    accessSync(filePath, constants.X_OK);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function formatSpawnFailure(error: unknown, resolved: { command: string; path: string; checked: string[] }): string {
+function formatSpawnFailure(error: unknown, resolved: ResolvedCodexCli): string {
   const message = error instanceof Error ? error.message : String(error);
   const checked = resolved.checked.slice(0, 20).map((item) => {
     try {
